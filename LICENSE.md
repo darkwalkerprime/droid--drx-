@@ -12,4 +12,4 @@ SOFTWARE JE POSKYTOVÁN „TAK, JAK JE“, BEZ JAKÝCHKOLI VÝSLOVNÝCH NEBO PŘ
 
 Název „Droid“, ticker „DRX“ a veškerá loga a vizuální identita projektu jsou ochrannou známkou projektu Droid a vlastní je darkwalkerprime.
 
-Forky, mody a klony mohou používat kód pod MIT licencí, ale nesmí používat název „Droid“, ticker „DRX“ ani je zaměnitelně podobné názvy.
+Forky, mody a klony mohou používat kód pod MIT licencí, ale nesmí používat název „Droid“, ticker „DRX“ ani zaměnitelně podobné názvy.
