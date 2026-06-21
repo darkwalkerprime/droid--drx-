@@ -1,4 +1,4 @@
-﻿import hashlib
+import hashlib
 import json
 import time
 import ecdsa
@@ -98,7 +98,6 @@ def get_ntp_time(server):
 
 def sync_time_with_ntp():
     global time_offset
- 
     available_servers = []
     if not ALLOW_NTP_SERVERS:
         print(f"{Fore.YELLOW}NTP synchronizace je vypnuta (ALLOW_NTP_SERVERS = False).{Style.RESET_ALL}")
@@ -315,7 +314,7 @@ class Block:
 
 class Blockchain:
     def __init__(self, create_genesis=True):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()  # OPRAVA 1: Reentrant Lock zabrání deadlocku u sirotků
         self.chain = []  # Nyní drží jen posledních LAST_BLOCKS_TO_KEEP bloků
         self.max_block_index = 0
         self.unconfirmed_transactions = []
@@ -474,6 +473,11 @@ class Blockchain:
             print(f"{Fore.RED}System is busy (lock timeout). Try again later.{Style.RESET_ALL}")
             return False
         try:
+            # OPRAVA 2: Bezpečnostní trhlina mempoolu - zabránit vložení COINBASE
+            if transaction.from_address == "COINBASE":
+                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} COINBASE transakci nelze přidat do mempoolu ručně ani přes síť.")
+                return False
+
             if transaction.from_address != "COINBASE" and transaction.data is not None:
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nepovolená zpráva v ne-coinbase transakci.")
                 return False
@@ -503,10 +507,6 @@ class Blockchain:
                 if transaction.nonce in nonce_set:
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Duplicitní nonce {transaction.nonce} pro adresu {transaction.from_address} v mempoolu.")
                     return False
-
-            if transaction.from_address == "COINBASE" and transaction.amount > 0:
-                self.unconfirmed_transactions.append(transaction)
-                return True
 
             if transaction.amount <= 0:
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Částka transakce musí být větší než 0.")
@@ -584,7 +584,7 @@ class Blockchain:
         first_index = new_block_index - DIFFICULTY_ADJUSTMENT_INTERVAL
         first_block = self.get_block(first_index)
         if not first_block:
-            return FIXED_TARGET  # Chyba, ale fallback
+            return FIXED_TARGET # Chyba, ale fallback
         time_elapsed = last_block.timestamp - first_block.timestamp
 
         if time_elapsed <= 0:
@@ -850,13 +850,16 @@ class Blockchain:
                     else:
                         nonce_map[tx.from_address] = {tx.nonce}
 
-            # Globální kontrola nonce pro transakce v bloku
-            for tx in block.transactions:
-                if tx.from_address != "COINBASE":
-                    max_nonce = self.nonce_map.get(tx.from_address, -1)
-                    if tx.nonce <= max_nonce:
-                        p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Neplatná nebo duplicitní nonce {tx.nonce} pro adresu {tx.from_address} (očekáváno vyšší než {max_nonce}).{Style.RESET_ALL}")
+            # Globální kontrola matematické posloupnosti nonce pro transakce v bloku.
+            # Nová adresa musí mít vždy nonce 0 a každá další nonce musí navazovat přesně o +1,
+            # jinak by podvodný uzel mohl protlačit nonce s mezerou (např. 5000 po posledních 60).
+            for sender, nonces_in_block in nonce_map.items():
+                expected_nonce = self.nonce_map.get(sender, -1) + 1
+                for tx_nonce in sorted(nonces_in_block):
+                    if tx_nonce != expected_nonce:
+                        p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Neplatná posloupnost nonce {tx_nonce} pro adresu {sender} (očekávána přesně {expected_nonce}).{Style.RESET_ALL}")
                         return False
+                    expected_nonce += 1
 
             for tx in block.transactions:
                 if not tx.verify_sender_identity() and tx.from_address != "COINBASE":
@@ -979,8 +982,9 @@ class Blockchain:
 
     def mine(self, miner_address):
         try:
-            # Vypočítat odměnu a poplatky
-            halvings = self.max_block_index // HALVING_INTERVAL_BLOCKS
+            # Vypočítat odměnu a poplatky (podle indexu NOVÉHO bloku, ne posledního existujícího)
+            new_block_index = self.max_block_index + 1
+            halvings = new_block_index // HALVING_INTERVAL_BLOCKS
             current_reward = BLOCK_REWARD // (2 ** halvings)
             
             # Vytvořit coinbase transakci jako první
@@ -1257,19 +1261,25 @@ class Blockchain:
                     else:
                         block_nonce_map[tx.from_address] = {tx.nonce}
 
-                    # Globální kontrola nonce sekvence v řetězci (musí být vzestupné a bez duplicit)
-                    if tx.from_address in nonce_maps:
-                        if tx.nonce <= max(nonce_maps[tx.from_address]):
-                            p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Neplatná nebo duplicitní nonce {tx.nonce} pro adresu {tx.from_address} (očekáváno vyšší než {max(nonce_maps[tx.from_address])}).{Style.RESET_ALL}")
-                            return False
-                        nonce_maps[tx.from_address].add(tx.nonce)
-                    else:
-                        nonce_maps[tx.from_address] = {tx.nonce}
-
                 if not tx.verify_sender_identity() and tx.from_address != "COINBASE":
                     return False
                 if not tx.verify_signature() and tx.from_address != "COINBASE":
                     return False
+
+            # Globální kontrola matematické posloupnosti nonce napříč celým řetězcem.
+            # Nová adresa musí mít vždy nonce 0 a každá další nonce musí navazovat přesně o +1,
+            # jinak by bylo možné protlačit nonce s mezerou (např. 5000 po posledních 60).
+            for sender, nonces_in_block in block_nonce_map.items():
+                expected_nonce = (max(nonce_maps[sender]) if sender in nonce_maps else -1) + 1
+                for tx_nonce in sorted(nonces_in_block):
+                    if tx_nonce != expected_nonce:
+                        p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Neplatná posloupnost nonce {tx_nonce} pro adresu {sender} v bloku #{current_block.index} (očekávána přesně {expected_nonce}).{Style.RESET_ALL}")
+                        return False
+                    expected_nonce += 1
+                if sender in nonce_maps:
+                    nonce_maps[sender].update(nonces_in_block)
+                else:
+                    nonce_maps[sender] = set(nonces_in_block)
 
         return True
 
@@ -1342,7 +1352,7 @@ class Blockchain:
                     if tx.from_address != "COINBASE" and tx.tx_id not in new_tx_ids:
                         orphaned_transactions.append(tx)
 
-            p2p_node.add_log(f"{Fore.YELLOW}Nalezen lepší řetězec (kumulativní práce). Nahrazuji svůj řetězec...{Style.RESET_ALL}")
+            p2p_node.add_log(f"{Fore.YELLOW}Nalezen lepší řetězec (kumulativní práce/délka). Nahrazuji svůj řetězec...{Style.RESET_ALL}")
 
             # Aktualizovat DB s novým chainem
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
@@ -1788,35 +1798,41 @@ class P2PNode:
             self.add_log(f"{Fore.YELLOW}Přijat požadavek na info o řetězci, odesílám...{Style.RESET_ALL}")
             local_length = self.blockchain.max_block_index + 1
             local_last_hash = self.blockchain.get_last_block().hash
-            local_work = self.blockchain.get_cumulative_work()
-            self.send_data_to_peers({'type': 'response_chain_info', 'data': {'length': local_length, 'last_hash': local_last_hash, 'work': local_work}})
+            local_cum_work = self.blockchain.get_cumulative_work() # OPRAVA 3: Přidána odesílaná kumulativní práce
+            self.send_data_to_peers({'type': 'response_chain_info', 'data': {'length': local_length, 'last_hash': local_last_hash, 'cum_work': local_cum_work}})
 
         elif message['type'] == 'response_chain_info':
             data = message['data']
-            remote_length = data['length']
-            remote_last_hash = data['last_hash']
-            remote_work = data['work']
+            remote_length = data.get('length', 0)
+            remote_last_hash = data.get('last_hash', "")
+            remote_cum_work = data.get('cum_work', 0) # OPRAVA 3: Získání přijaté kumulativní práce
+            
             local_length = self.blockchain.max_block_index + 1
             local_last_hash = self.blockchain.get_last_block().hash
-            local_work = self.blockchain.get_cumulative_work()
+            local_cum_work = self.blockchain.get_cumulative_work()
 
-            if remote_work > local_work:
-                self.add_log(f"{Fore.YELLOW}Detekován řetězec s vyšší kumulativní prací, žádám o celý řetězec...{Style.RESET_ALL}")
-                self.send_data_to_peers({'type': 'request_full_chain'})
-            elif remote_work == local_work:
+            # OPRAVA 3: Nová logika upřednostňující kumulativní práci před délkou
+            if remote_cum_work > local_cum_work:
                 if remote_length > local_length:
-                    self.add_log(f"{Fore.YELLOW}Stejná kumulativní práce, ale delší řetězec, žádám o chybějící bloky...{Style.RESET_ALL}")
+                    self.add_log(f"{Fore.YELLOW}Detekován řetězec s větší prací, žádám o chybějící bloky (inkrementální sync)...{Style.RESET_ALL}")
+                    self.send_data_to_peers({'type': 'request_blocks', 'data': {'start_index': local_length}})
+                else:
+                    self.add_log(f"{Fore.YELLOW}Detekován těžší, ale kratší/stejně dlouhý řetězec (fork), žádám o plný řetězec...{Style.RESET_ALL}")
+                    self.send_data_to_peers({'type': 'request_full_chain'})
+            elif remote_cum_work == local_cum_work:
+                if remote_length > local_length:
+                    self.add_log(f"{Fore.YELLOW}Stejná práce, ale delší řetězec, žádám o chybějící bloky (inkrementální sync)...{Style.RESET_ALL}")
                     self.send_data_to_peers({'type': 'request_blocks', 'data': {'start_index': local_length}})
                 elif remote_length == local_length:
                     if remote_last_hash < local_last_hash:
-                        self.add_log(f"{Fore.YELLOW}Stejná práce a délka, ale lepší hash (tie-breaker), žádám o celý řetězec...{Style.RESET_ALL}")
+                        self.add_log(f"{Fore.YELLOW}Stejná práce i délka, ale lepší hash (tie-breaker), žádám o celý řetězec...{Style.RESET_ALL}")
                         self.send_data_to_peers({'type': 'request_full_chain'})
                     else:
-                        self.add_log(f"{Fore.GREEN}Řetězce synchronizovány (stejná práce, délka i hash).{Style.RESET_ALL}")
+                        self.add_log(f"{Fore.GREEN}Řetězce synchronizovány (stejná práce i délka, náš hash je lepší nebo stejný).{Style.RESET_ALL}")
                 else:
-                    self.add_log(f"{Fore.GREEN}Náš řetězec je stejně silný nebo lepší (stejná práce, kratší délka).{Style.RESET_ALL}")
+                    self.add_log(f"{Fore.GREEN}Náš řetězec má stejnou práci, ale je delší (nebo jsme synchronizováni).{Style.RESET_ALL}")
             else:
-                self.add_log(f"{Fore.GREEN}Náš řetězec má vyšší kumulativní práci – ignoruji slabší řetězec.{Style.RESET_ALL}")
+                self.add_log(f"{Fore.GREEN}Náš řetězec má větší práci. Ignoruji vzdálený.{Style.RESET_ALL}")
 
         elif message['type'] == 'request_blocks':
             start_index = message['data']['start_index']
@@ -1890,7 +1906,7 @@ class P2PNode:
                 save_data(self.blockchain, wallets, password, self.peers)
                 self.add_log(f"{Fore.GREEN}Řetězec byl úspěšně synchronizován a uložen.{Style.RESET_ALL}")
             else:
-                self.add_log(f"{Fore.YELLOW}Přijatý řetězec není delší nebo platný, odmítám ho.{Style.RESET_ALL}")
+                self.add_log(f"{Fore.YELLOW}Přijatý řetězec není lepší nebo platný, odmítám ho.{Style.RESET_ALL}")
 
         elif message['type'] == 'new_block':
             new_block_data = message['data']
@@ -2022,8 +2038,7 @@ class P2PNode:
     # --- NOVÁ METODA PRO ZÍSKÁNÍ SEZNAMU ONLINE PEERŮ ---
     def get_online_peers(self):
         """
-        Ověří konektivitu všech známých peerů a vrátí seznam těch, které jsou online.
-        Používá vlákna pro paralelní a efektivní kontrolu.
+        Ověří konektivitu všech známých peerů a vrátí seznam těch, které jsou online. Používá vlákna pro paralelní a efektivní kontrolu.
         """
         online_peers = []
         threads = []
@@ -2648,6 +2663,7 @@ def main():
                         print(f" Velikost bloku: {Fore.CYAN}{block.get_size() / 1024:.2f} KB{Style.RESET_ALL}")
                         print(f" Počet potvrzení: {Fore.CYAN}{droid_chain.get_confirmations(block.hash)}{Style.RESET_ALL}")
                         print(f" Počet transakcí: {len(block.transactions)}")
+                        
                         if block.transactions:
                             print(f" {Fore.YELLOW}Transakce:{Style.RESET_ALL}")
                             
