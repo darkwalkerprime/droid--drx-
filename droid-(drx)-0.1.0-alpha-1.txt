@@ -823,6 +823,13 @@ class Blockchain:
             if not self.meets_difficulty(proof, block.target):
                 return False
 
+            # OPRAVA bezpečnosti 1: Ověření, že hash skutečně odpovídá obsahu bloku.
+            # Bez této kontroly může útočník poslat libovolný hash splňující difficulty
+            # bez reálného PoW hledání nonce.
+            if proof != block.compute_hash():
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Hash bloku neodpovídá jeho obsahu (možný útok bez reálného PoW).{Style.RESET_ALL}")
+                return False
+
             if block.index > 0 and any(tx.data is not None for tx in block.transactions):
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nepovolená zpráva v bloku mimo genesis.{Style.RESET_ALL}")
                 return False
@@ -1158,6 +1165,7 @@ class Blockchain:
         seen_tx_ids = set()
         nonce_maps = {}
         total_supply = 0
+        balance_map = {}  # OPRAVA bezpečnosti 2: Průběžná mapa zůstatků pro validaci transakcí
 
         # Kontrola genesis bloku
         genesis_block = chain[0]
@@ -1178,6 +1186,8 @@ class Blockchain:
             p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nesprávná zpráva v genesis coinbase.{Style.RESET_ALL}")
             return False
         total_supply += GENESIS_AMOUNT
+        # OPRAVA bezpečnosti 2: Inicializace zůstatku z genesis bloku
+        balance_map[genesis_tx.to_address] = balance_map.get(genesis_tx.to_address, 0) + genesis_tx.amount
 
         for i in range(1, len(chain)):
             current_block = chain[i]
@@ -1280,6 +1290,25 @@ class Blockchain:
                     nonce_maps[sender].update(nonces_in_block)
                 else:
                     nonce_maps[sender] = set(nonces_in_block)
+
+            # OPRAVA bezpečnosti 2: Validace zůstatků odesílatelů v bloku.
+            # Používáme temp_balance_changes pro kumulativní útrátu v rámci jednoho bloku
+            # (stejný vzor jako v add_block), aby více TX od stejného odesílatele
+            # v jednom bloku správně sdílelo zbývající zůstatek.
+            temp_balance_changes = defaultdict(int)
+            for tx in current_block.transactions:
+                if tx.from_address != "COINBASE":
+                    current_balance = balance_map.get(tx.from_address, 0) + temp_balance_changes[tx.from_address]
+                    if current_balance < tx.amount + tx.fee:
+                        p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nedostatečný zůstatek pro transakci {tx.tx_id} od {tx.from_address} v bloku #{current_block.index}.{Style.RESET_ALL}")
+                        return False
+                    temp_balance_changes[tx.from_address] -= (tx.amount + tx.fee)
+                    temp_balance_changes[tx.to_address] += tx.amount
+                else:
+                    temp_balance_changes[tx.to_address] += tx.amount
+            # Aktualizovat balance_map po úspěšné validaci celého bloku
+            for addr, change in temp_balance_changes.items():
+                balance_map[addr] = balance_map.get(addr, 0) + change
 
         return True
 
