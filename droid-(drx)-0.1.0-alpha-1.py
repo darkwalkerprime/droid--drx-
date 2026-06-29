@@ -67,6 +67,8 @@ ALLOW_EMPTY_BLOCKS = True
 TX_RATE_LIMIT = 100
 TX_RATE_WINDOW = 60
 ALLOW_NTP_SERVERS = True
+SOFTWARE_VERSION = "0.1.0-alpha-1"
+PROTOCOL_VERSION = 1
 
 # Checkpointy pro kanonický blockchain (ručně upravitelné: přidej {index: 'očekávaný_hash'})
 CHECKPOINTS = {
@@ -976,8 +978,6 @@ class Blockchain:
     def recycle_orphan_transactions(self, orphaned_blocks):
         orphaned_transactions = []
         for block in orphaned_blocks:
-            if self.get_confirmations(block.hash) >= CONFIRMATIONS_THRESHOLD:
-                continue  # Nepřepisovat staré
             for tx in block.transactions:
                 if tx.from_address != "COINBASE" and not self.is_tx_id_in_chain(tx.tx_id):
                     orphaned_transactions.append(tx)
@@ -1360,12 +1360,14 @@ class Blockchain:
                     break
                 fork_index = i
 
-            # Kontrola pevných bloků
             if fork_index >= 0:
-                fork_confirmations = self.get_confirmations(self.get_block_from_db(fork_index).hash)
-                if fork_confirmations >= CONFIRMATIONS_THRESHOLD:
-                    p2p_node.add_log(f"{Fore.RED}Odmítnutí nového řetězce: Pokus o přepsání bloku s {fork_confirmations} potvrzeními.{Style.RESET_ALL}")
-                    return False
+                reorg_depth = self.max_block_index - fork_index
+                if reorg_depth > 0:
+                    p2p_node.add_log(
+                        f"{Fore.MAGENTA}REORG: hloubka {reorg_depth} bloků "
+                        f"(fork od bloku #{fork_index + 1}, "
+                        f"opouštím bloky #{fork_index + 1}–#{self.max_block_index}).{Style.RESET_ALL}"
+                    )
 
             # Sbírat všechny tx_ids v novém řetězci
             new_tx_ids = set()
@@ -1992,6 +1994,16 @@ class P2PNode:
             if new_peer_addr not in self.peers and new_peer_addr != (self.host, self.port) and self.is_peer_valid(new_peer_addr):
                 self.connect_to_peer(new_peer_addr)
 
+        elif message['type'] == 'handshake':
+            remote_protocol_version = message.get('protocol_version')
+            remote_software_version = message.get('software_version', 'neznámá')
+            if remote_protocol_version != PROTOCOL_VERSION:
+                if addr:
+                    self.blacklist.add(addr[0])
+                self.add_log(f"{Fore.RED}Handshake selhal od uzlu {ip_port}: nekompatibilní protocol_version {remote_protocol_version} (očekáváno {PROTOCOL_VERSION}). Uzel blacklistován.{Style.RESET_ALL}")
+            else:
+                self.add_log(f"{Fore.GREEN}Handshake úspěšný od uzlu {ip_port}: software_version={remote_software_version}, protocol_version={remote_protocol_version}.{Style.RESET_ALL}")
+
     def connect_to_peer(self, peer_addr):
         if peer_addr not in self.peers:
             try:
@@ -2000,6 +2012,7 @@ class P2PNode:
                 client_socket.connect(peer_addr)
                 self.peers.append(peer_addr)
                 self.add_log(f"{Fore.GREEN}Úspěšně připojeno k uzlu {peer_addr}{Style.RESET_ALL}")
+                self.send_data_to_peers({'type': 'handshake', 'protocol_version': PROTOCOL_VERSION, 'software_version': SOFTWARE_VERSION})
                 self.send_data_to_peers({'type': 'request_mempool'})
                 self.send_data_to_peers({'type': 'request_chain_info'})
                 save_peers(self.peers)
@@ -2557,7 +2570,7 @@ def main():
                 conn.close()
                 
                 if not tx_found:
-                    print(f"{Fore.CYAN}Žádné transakce nebyly nalezeny.{Style.RESET_ALL}")
+                    print(f"{Fore.CYAN}Žádné potvrzené transakce nebyly nalezeny.{Style.RESET_ALL}")
                 else:
                     # Seřadit podle timestampu vzestupně
                     tx_list.sort(key=lambda x: x[0])
@@ -2567,7 +2580,10 @@ def main():
                             direction = f"{Fore.RED}Odesláno{Style.RESET_ALL}"
                         else:
                             direction = f"{Fore.GREEN}Přijato{Style.RESET_ALL}"
-                        confirmations = droid_chain.max_block_index - block_index + 1
+                        
+                        # OPRAVA: Odstraněno '+ 1' pro správný výpočet potvrzení
+                        confirmations = droid_chain.max_block_index - block_index
+                        
                         print(f"TX ID: {Fore.CYAN}{tx.tx_id}{Style.RESET_ALL}")
                         print(f" Blok: #{block_index}")
                         print(f" Potvrzení: {Fore.CYAN}{confirmations}{Style.RESET_ALL}")
@@ -2577,6 +2593,31 @@ def main():
                         print(f" Částka: {format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
                         if tx.from_address != "COINBASE":
                             print(f" Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
+                        print(f" Čas: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}")
+                        print("-" * 20)
+                
+                # --- Nepotvrzené transakce z mempoolu ---
+                pending_list = [
+                    tx for tx in droid_chain.unconfirmed_transactions
+                    if tx.from_address == address or tx.to_address == address
+                ]
+                
+                if pending_list:
+                    print(f"\n{Fore.YELLOW}--- Čekající transakce (mempool) ---{Style.RESET_ALL}")
+                    for tx in pending_list:
+                        if tx.from_address == address:
+                            direction = f"{Fore.RED}Odesláno{Style.RESET_ALL}"
+                        else:
+                            direction = f"{Fore.GREEN}Přijato{Style.RESET_ALL}"
+                        
+                        print(f"TX ID: {Fore.CYAN}{tx.tx_id}{Style.RESET_ALL}")
+                        print(f" Blok: {Fore.YELLOW}čekající{Style.RESET_ALL}")
+                        print(f" Potvrzení: {Fore.YELLOW}čekající{Style.RESET_ALL}")
+                        print(f" Směr: {direction}")
+                        print(f" Od: {tx.from_address}")
+                        print(f" Komu: {tx.to_address}")
+                        print(f" Částka: {format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
+                        print(f" Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
                         print(f" Čas: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}")
                         print("-" * 20)
                 
@@ -2599,6 +2640,8 @@ def main():
                 print(f"Odeslané transakce: {Fore.RED}{sent_count}{Style.RESET_ALL}")
                 print(f"Přijaté transakce: {Fore.GREEN}{received_count}{Style.RESET_ALL}")
                 print(f"Celkový počet: {Fore.CYAN}{total_count}{Style.RESET_ALL}")
+                if pending_list:
+                    print(f"Čekající transakce: {Fore.YELLOW}{len(pending_list)}{Style.RESET_ALL}")
             
             elif choice == "14":
                 show_p2p_log()
@@ -2612,7 +2655,10 @@ def main():
                     
                     if "Blok #" in location:
                         block_index = int(location.split("#")[1])
-                        confirmations = droid_chain.max_block_index - block_index + 1
+                        
+                        # OPRAVA: Odstraněno '+ 1' pro správný výpočet potvrzení
+                        confirmations = droid_chain.max_block_index - block_index
+                        
                         print(f" Potvrzení: {Fore.CYAN}{confirmations}{Style.RESET_ALL}")
                     else:
                         print(f" Potvrzení: {Fore.CYAN}0 (v mempoolu){Style.RESET_ALL}")
