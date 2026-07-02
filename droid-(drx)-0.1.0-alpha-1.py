@@ -224,7 +224,7 @@ class Transaction:
             vk = ecdsa.VerifyingKey.from_string(binascii.unhexlify(self.public_key), curve=ecdsa.SECP256k1, hashfunc=hashlib.sha3_256)
             message = json.dumps(self.to_dict_for_signing(), sort_keys=True).encode()
             return vk.verify(binascii.unhexlify(self.signature), message)
-        except (ecdsa.BadSignatureError, binascii.Error):
+        except (ecdsa.BadSignatureError, binascii.Error, ecdsa.MalformedPointError):
             return False
 
     def verify_sender_identity(self):
@@ -235,13 +235,9 @@ class Transaction:
         try:
             public_key_bytes = binascii.unhexlify(self.public_key)
             generated_address = Wallet.public_key_to_address(public_key_bytes)
-            if len(self.from_address) == 67:
-                base_generated = generated_address[:-4]
-                return self.from_address == base_generated
-            elif len(self.from_address) == 71:
-                return self.from_address == generated_address
-            else:
+            if len(self.from_address) != 71:
                 return False
+            return self.from_address == generated_address
         except binascii.Error:
             return False
 
@@ -798,6 +794,15 @@ class Blockchain:
             print(f"{Fore.RED}System is busy (lock timeout). Try again later.{Style.RESET_ALL}")
             return False
         try:
+            # OPRAVA bezpečnosti 3: Kontrola velikosti bloku hned na začátku, PŘED veškerou
+            # další (nákladnější) validací. Bez této kontroly mohl útočník poslat libovolně
+            # velký blok (např. 50 MB spamu) - uzel by ho bez omezení zpracoval a uložil do DB,
+            # což by rychle vyčerpalo paměť i místo na disku (DoS útok).
+            block_size = block.get_size()
+            if block_size > MAX_BLOCK_SIZE_BYTES:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Velikost bloku ({block_size} bajtů) překračuje maximální povolenou velikost {MAX_BLOCK_SIZE_BYTES} bajtů.{Style.RESET_ALL}")
+                return False
+
             previous_block = self.get_last_block()
             previous_hash = previous_block.hash
 
@@ -994,9 +999,11 @@ class Blockchain:
             halvings = new_block_index // HALVING_INTERVAL_BLOCKS
             current_reward = BLOCK_REWARD // (2 ** halvings)
             
-            # Vytvořit coinbase transakci jako první
+            # Vytvořit DOČASNOU coinbase transakci jako první (amount=0). Slouží jen k odhadu
+            # velikosti bloku před výběrem tx z mempoolu - do bloku se nakonec neuloží, viz OPRAVA
+            # u final_reward níže, kde se nahradí novou transakcí s finální částkou.
             mining_reward = Transaction("COINBASE", miner_address, 0, nonce=0, public_key="COINBASE", signature="COINBASE", data=None)
-            new_block_transactions = [mining_reward] # Coinbase je nyní první
+            new_block_transactions = [mining_reward] # Coinbase je nyní první (dočasně)
 
             current_block_size = 0
             dummy_block = Block(self.max_block_index + 1, [], self.get_last_block().hash, self.get_target())
@@ -1074,8 +1081,13 @@ class Blockchain:
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Maximální nabídka dosažena, nelze vytěžit další blok.")
                 return False
                 
-            # Aktualizovat částku v coinbase transakci, která je již v seznamu
-            new_block_transactions[0].amount = final_reward
+            # OPRAVA: Coinbase transakce se vytváří ZNOVU jako nový objekt, místo mutace .amount
+            # na již existující transakci. tx_id se počítá v Transaction.__init__ z amount, takže
+            # pouhá mutace .amount po vytvoření by ponechala tx_id (a tedy i merkle_root bloku)
+            # spočítaný ze starého obsahu (amount=0), neodpovídající skutečné částce final_reward.
+            # Ostatní pole (nonce, public_key, signature, timestamp, data) jsou zachována shodná
+            # s dočasnou coinbase transakcí výše, mění se pouze amount (a tedy i tx_id).
+            new_block_transactions[0] = Transaction("COINBASE", miner_address, final_reward, nonce=0, public_key="COINBASE", signature="COINBASE", timestamp=mining_reward.timestamp, data=None)
 
             last_block = self.get_last_block()
             target = self.get_target()
@@ -1193,6 +1205,16 @@ class Blockchain:
             current_block = chain[i]
             previous_block = chain[i-1]
 
+            # OPRAVA bezpečnosti 3: Kontrola velikosti bloku hned na začátku validace,
+            # PŘED veškerou další (nákladnější) validací. Bez této kontroly mohl útočník
+            # protlačit libovolně velký blok (např. 50 MB spamu) přes validaci celého
+            # řetězce (např. při synchronizaci/replace_chain), což by vedlo k vyčerpání
+            # paměti i místa na disku (DoS útok).
+            current_block_size = current_block.get_size()
+            if current_block_size > MAX_BLOCK_SIZE_BYTES:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Velikost bloku #{current_block.index} ({current_block_size} bajtů) překračuje maximální povolenou velikost {MAX_BLOCK_SIZE_BYTES} bajtů.{Style.RESET_ALL}")
+                return False
+
             if not current_block.is_valid_timestamp(previous_block.timestamp):
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Timestamp bloku #{current_block.index} v řetězci je neplatný.{Style.RESET_ALL}")
                 return False
@@ -1201,6 +1223,10 @@ class Blockchain:
                 return False
 
             if current_block.previous_hash != previous_block.hash:
+                return False
+
+            if current_block.index != previous_block.index + 1:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Návaznost indexů přerušena u bloku #{current_block.index}.{Style.RESET_ALL}")
                 return False
 
             if current_block.target != self.calculate_expected_target(current_block.index, chain=chain):
@@ -2102,12 +2128,11 @@ class P2PNode:
 def is_valid_address(address):
     if not isinstance(address, str) or not address.startswith(TICKER):
         return False
-    if len(address) == 67:
-        return all(c in '0123456789abcdef' for c in address[3:])
-    elif len(address) == 71:
-        base = address[:-4]
-        expected_checksum = hashlib.sha3_256(base.encode()).hexdigest()[:4]
-        return address[-4:] == expected_checksum and all(c in '0123456789abcdef' for c in address[3:])
+    if len(address) != 71:
+        return False
+    base = address[:-4]
+    expected_checksum = hashlib.sha3_256(base.encode()).hexdigest()[:4]
+    return address[-4:] == expected_checksum and all(c in '0123456789abcdef' for c in address[3:])
 
 def is_valid_private_key(key_hex):
     if not isinstance(key_hex, str):
@@ -2117,7 +2142,7 @@ def is_valid_private_key(key_hex):
     try:
         ecdsa.SigningKey.from_string(binascii.unhexlify(key_hex), curve=ecdsa.SECP256k1)
         return True
-    except (binascii.Error, ecdsa.BadSignatureError):
+    except (binascii.Error, ecdsa.BadSignatureError, ecdsa.MalformedPointError):
         return False
 
 def show_p2p_log():
