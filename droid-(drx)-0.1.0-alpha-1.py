@@ -323,8 +323,8 @@ class Block:
         block.merkle_root = data.get('merkle_root', compute_merkle_root(transactions))
         return block
 
-    def is_valid_timestamp(self, previous_block_timestamp):
-        return self.timestamp > previous_block_timestamp and self.timestamp <= (get_time() + 600) and self.timestamp >= GENESIS_TIMESTAMP
+    def is_valid_timestamp(self, median_time_past):
+        return self.timestamp > median_time_past and self.timestamp <= (get_time() + 600) and self.timestamp >= GENESIS_TIMESTAMP
 
 class Blockchain:
     def __init__(self, create_genesis=True):
@@ -644,6 +644,22 @@ class Blockchain:
             
         return new_target
 
+    def get_median_time_past(self, new_block_index, chain=None):
+        MTP_SPAN = 11
+        first_index = max(0, new_block_index - MTP_SPAN)
+
+        if chain is None:
+            timestamps = [b.timestamp for b in (self.get_block(i) for i in range(first_index, new_block_index)) if b is not None]
+        else:
+            timestamps = [chain[i].timestamp for i in range(first_index, new_block_index)]
+
+        timestamps.sort()
+        count = len(timestamps)
+        mid = count // 2
+        if count % 2 == 1:
+            return timestamps[mid]
+        return (timestamps[mid - 1] + timestamps[mid]) // 2
+
     def calculate_expected_target(self, new_block_index, chain=None):
         if not DYNAMIC_DIFFICULTY_ADJUSTMENT:
             return FIXED_TARGET
@@ -881,7 +897,8 @@ class Blockchain:
             if block.index != previous_block.index + 1:
                 return False
 
-            if not block.is_valid_timestamp(previous_block.timestamp):
+            median_time_past = self.get_median_time_past(block.index)
+            if not block.is_valid_timestamp(median_time_past):
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku:{Style.RESET_ALL} Timestamp bloku je neplatný.")
                 return False
 
@@ -1300,10 +1317,6 @@ class Blockchain:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Velikost bloku #{current_block.index} ({current_block_size} bajtů) překračuje maximální povolenou velikost {MAX_BLOCK_SIZE_BYTES} bajtů.{Style.RESET_ALL}")
                 return False
                 
-            if not current_block.is_valid_timestamp(previous_block.timestamp):
-                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Timestamp bloku #{current_block.index} v řetězci je neplatný.{Style.RESET_ALL}")
-                return False
-                
             if current_block.hash != current_block.compute_hash():
                 return False
                 
@@ -1312,6 +1325,11 @@ class Blockchain:
                 
             if current_block.index != previous_block.index + 1:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Návaznost indexů přerušena u bloku #{current_block.index}.{Style.RESET_ALL}")
+                return False
+                
+            median_time_past = self.get_median_time_past(current_block.index, chain=chain)
+            if not current_block.is_valid_timestamp(median_time_past):
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Timestamp bloku #{current_block.index} v řetězci je neplatný.{Style.RESET_ALL}")
                 return False
                 
             if current_block.target != self.calculate_expected_target(current_block.index, chain=chain):
