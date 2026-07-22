@@ -5,10 +5,9 @@ Droid (DRX) je experimentální kryptoměna napsaná v programovacím jazyce Pyt
 
 Požadované závislosti:
 
-pkg update && pkg upgrade    
-pkg install python-cryptography    
+pkg update && pkg upgrade -y
+pkg install python-cryptography -y
 pip install ecdsa colorama
-
 
 Současný stav projektu:
 
