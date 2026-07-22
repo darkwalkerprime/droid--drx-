@@ -27,6 +27,8 @@ from decimal import Decimal, ROUND_HALF_UP
 
 init(autoreset=True)
 
+# ----------------- GLOBÁLNÍ KONSTANTY -----------------
+CHAIN_ID = 1
 PROJECT_NAME = "Droid"
 TICKER = "DRX"
 DECIMALS = 8
@@ -51,10 +53,10 @@ ADDRESS_BOOK_FILE = 'address_book.json'
 
 P2P_HOST = '0.0.0.0'
 
-GENESIS_ADDRESS = "DRXfc3d428153b2c71be82e84a04c8b70b3d5153c75cc7c75edc3323d6e9c7cb8d5d063"
-GENESIS_ADDRESS_EXPECTED_HASH = "be2a18b752ca5804e83a2e2b2fd182654284d95a1bb51893ce5bcdf8f199bd42"
-GENESIS_TIMESTAMP = 1767297600
-GENESIS_BLOCK_EXPECTED_HASH = "00000b96e6ed7211e538e047307f7a5df3f07863bf1c4be9e1f6ea2b1eac8525"
+GENESIS_ADDRESS = "DRX5eed3a1ebfcda2a258e09af660d5cc056cd3c57cbe164bd312000762bc7368ce4026"
+GENESIS_ADDRESS_EXPECTED_HASH = "804e96365ba33513ad0d5065c751448eab3a285f23e97c6de6d36b7d7a7cf887"
+GENESIS_TIMESTAMP = 1784541600
+GENESIS_BLOCK_EXPECTED_HASH = "0000074548b5d2c3dd2d33111628e982ec714a44efae49373eac421cb48e2a4c"
 GENESIS_AMOUNT = 50 * (10 ** DECIMALS)
 
 MAX_BLOCK_SIZE_BYTES = 1 * 1024 * 1024
@@ -73,6 +75,7 @@ TX_RATE_WINDOW = 60
 ALLOW_NTP_SERVERS = True
 SOFTWARE_VERSION = "0.1.0-alpha.1"
 PROTOCOL_VERSION = 1
+BLOCK_VERSION = 1
 
 CHECKPOINTS = {
     0: GENESIS_BLOCK_EXPECTED_HASH,
@@ -90,7 +93,10 @@ def get_ntp_time(server):
         data, _ = client.recvfrom(1024)
         if data:
             t = struct.unpack('!12I', data)
-            secs = t[10] - TIME1970
+            ntp_seconds = t[10]
+            if ntp_seconds < TIME1970:
+                ntp_seconds += 2**32
+            secs = ntp_seconds - TIME1970
             frac = t[11] / 2**32
             return secs + frac
     except Exception:
@@ -125,7 +131,7 @@ def sync_time_with_ntp():
         read_only = True
 
 def get_time():
-    return time.time() + time_offset
+    return int(time.time() + time_offset)
 
 def is_valid_private_key(key_hex):
     if not isinstance(key_hex, str):
@@ -143,7 +149,7 @@ class Wallet:
         if private_key:
             if not is_valid_private_key(private_key):
                 raise ValueError("Neplatný privátní klíč")
-            self.private_key = ecdsa.SigningKey.from_string(binascii.unhexlify(private_key), curve=ecdsa.SECP256k1, hashfunc= hashlib.sha3_256)
+            self.private_key = ecdsa.SigningKey.from_string(binascii.unhexlify(private_key), curve=ecdsa.SECP256k1, hashfunc=hashlib.sha3_256)
         else:
             self.private_key = self.generate_private_key()
         self.public_key = self.private_key.get_verifying_key()
@@ -167,7 +173,7 @@ class Wallet:
         return binascii.hexlify(self.private_key.sign(message)).decode()
 
 class Transaction:
-    def __init__(self, from_address, to_address, amount, fee=0, nonce=0, public_key=None, signature=None, timestamp=None, tx_id=None, data=None):
+    def __init__(self, from_address, to_address, amount, fee=0, nonce=0, public_key=None, signature=None, timestamp=None, tx_id=None, data=None, chain_id=CHAIN_ID):
         self.from_address = from_address
         self.to_address = to_address
         self.amount = amount
@@ -177,16 +183,20 @@ class Transaction:
         self.public_key = public_key
         self.signature = signature
         self.data = data
+        self.chain_id = chain_id
         self.tx_id = tx_id or self.compute_hash()
 
     def to_dict_for_signing(self):
         return {
+            'chain_id': self.chain_id,
             'from_address': self.from_address,
             'to_address': self.to_address,
             'amount': self.amount,
             'fee': self.fee,
             'timestamp': self.timestamp,
-            'nonce': self.nonce
+            'nonce': self.nonce,
+            'public_key': self.public_key,
+            'data': self.data
         }
 
     def compute_hash(self):
@@ -196,6 +206,7 @@ class Transaction:
 
     def to_dict(self):
         return {
+            'chain_id': self.chain_id,
             'from_address': self.from_address,
             'to_address': self.to_address,
             'amount': self.amount,
@@ -218,8 +229,9 @@ class Transaction:
             nonce=data.get('nonce', 0),
             public_key=data.get('public_key'),
             signature=data.get('signature'),
-            timestamp=data.get('timestamp'),
-            data=data.get('data')
+            timestamp=int(data['timestamp']) if data.get('timestamp') is not None else None,
+            data=data.get('data'),
+            chain_id=data.get('chain_id', CHAIN_ID)
         )
         tx.tx_id = data.get('tx_id') or tx.compute_hash()
         return tx
@@ -272,7 +284,9 @@ def compute_merkle_root(transactions):
     return tx_hashes[0]
 
 class Block:
-    def __init__(self, index, transactions, previous_hash, target, nonce=0, timestamp=None):
+    def __init__(self, index, transactions, previous_hash, target, nonce=0, timestamp=None, version=BLOCK_VERSION, chain_id=CHAIN_ID):
+        self.version = version
+        self.chain_id = chain_id
         self.index = index
         self.timestamp = timestamp or get_time()
         self.transactions = transactions
@@ -284,6 +298,8 @@ class Block:
 
     def compute_hash(self):
         block_dict = {
+            'version': self.version,
+            'chain_id': self.chain_id,
             'index': self.index,
             'timestamp': self.timestamp,
             'merkle_root': self.merkle_root,
@@ -299,6 +315,8 @@ class Block:
 
     def to_dict(self):
         return {
+            'version': self.version,
+            'chain_id': self.chain_id,
             'index': self.index,
             'timestamp': self.timestamp,
             'transactions': [tx.to_dict() for tx in self.transactions],
@@ -313,12 +331,18 @@ class Block:
     def from_dict(data):
         transactions = [Transaction.from_dict(tx_data) for tx_data in data['transactions']]
         target = int(data['target'], 16)
-        ts = data['timestamp']
+        ts = int(data['timestamp'])
         
-        if data['index'] == 0:
-            ts = int(ts)
-            
-        block = Block(data['index'], transactions, data['previous_hash'], target, data['nonce'], timestamp=ts)
+        block = Block(
+            index=data['index'], 
+            transactions=transactions, 
+            previous_hash=data['previous_hash'], 
+            target=target, 
+            nonce=data.get('nonce', 0), 
+            timestamp=ts,
+            version=data.get('version', BLOCK_VERSION),
+            chain_id=data.get('chain_id', CHAIN_ID)
+        )
         block.hash = data['hash']
         block.merkle_root = data.get('merkle_root', compute_merkle_root(transactions))
         return block
@@ -347,6 +371,16 @@ class Blockchain:
         if create_genesis:
             self.create_genesis_block()
 
+    def cleanup_mempool(self):
+        current_time = get_time()
+        original_count = len(self.unconfirmed_transactions)
+        self.unconfirmed_transactions = [
+            tx for tx in self.unconfirmed_transactions
+            if (current_time - tx.timestamp) <= 86400
+        ]
+        if len(self.unconfirmed_transactions) < original_count:
+            save_mempool(self.unconfirmed_transactions)
+
     def create_genesis_block(self):
         genesis_tx = Transaction(
             from_address="COINBASE",
@@ -357,9 +391,9 @@ class Blockchain:
             public_key=None,
             signature=None,
             timestamp=GENESIS_TIMESTAMP,
-            data="BTC: 00000000000000000000c6f7f5be25ea8f1f034b3bc7cf3c152f93289ebb33e0"
+            data="Darkwalker"
         )
-        genesis_block = Block(0, [genesis_tx], "0", FIXED_TARGET, nonce=665682, timestamp=GENESIS_TIMESTAMP)
+        genesis_block = Block(0, [genesis_tx], "0", FIXED_TARGET, nonce=2555259, timestamp=GENESIS_TIMESTAMP, version=BLOCK_VERSION, chain_id=CHAIN_ID)
         
         self.chain.append(genesis_block)
         self.max_block_index = 0
@@ -389,7 +423,7 @@ class Blockchain:
     def rebuild_state(self):
         conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
         c = conn.cursor()
-        c.execute("SELECT * FROM blocks ORDER BY block_index")
+        c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index")
         
         self.balance_map = {}
         self.nonce_map = {}
@@ -406,7 +440,9 @@ class Blockchain:
                 'target': row[4],
                 'nonce': row[5],
                 'hash': row[6],
-                'merkle_root': row[7]
+                'merkle_root': row[7],
+                'version': row[8],
+                'chain_id': row[9]
             }
             block = Block.from_dict(block_data)
             self.update_state_with_block(block)
@@ -416,7 +452,7 @@ class Blockchain:
     def get_block_from_db(self, index):
         conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
         c = conn.cursor()
-        c.execute("SELECT * FROM blocks WHERE block_index = ?", (index,))
+        c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index = ?", (index,))
         row = c.fetchone()
         conn.close()
         
@@ -429,7 +465,9 @@ class Blockchain:
                 'target': row[4],
                 'nonce': row[5],
                 'hash': row[6],
-                'merkle_root': row[7]
+                'merkle_root': row[7],
+                'version': row[8],
+                'chain_id': row[9]
             }
             return Block.from_dict(block_data)
         return None
@@ -501,6 +539,10 @@ class Blockchain:
             return False
             
         try:
+            if transaction.chain_id != CHAIN_ID:
+                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Transakce patří jiné síti (nesprávné chain_id).")
+                return False
+
             if transaction.from_address == "COINBASE":
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} COINBASE transakci nelze přidat do mempoolu ručně ani přes síť.")
                 return False
@@ -599,13 +641,19 @@ class Blockchain:
         conn.close()
         return False
 
-    def get_target(self):
+    def get_target(self, new_timestamp=None):
         if not DYNAMIC_DIFFICULTY_ADJUSTMENT:
             return FIXED_TARGET
             
         last_block = self.get_last_block()
         new_block_index = last_block.index + 1
         
+        current_ts = new_timestamp if new_timestamp is not None else get_time()
+        time_diff = current_ts - last_block.timestamp
+        if time_diff > 3600:
+            eda_target = last_block.target + (last_block.target // 4)
+            return min(eda_target, FIXED_TARGET)
+            
         if new_block_index < DIFFICULTY_ADJUSTMENT_INTERVAL:
             return FIXED_TARGET
             
@@ -618,7 +666,9 @@ class Blockchain:
         if not first_block:
             return FIXED_TARGET
             
-        time_elapsed = last_block.timestamp - first_block.timestamp
+        mtp_last = self.get_median_time_past(new_block_index)
+        mtp_first = self.get_median_time_past(first_index)
+        time_elapsed = mtp_last - mtp_first
         if time_elapsed <= 0:
             time_elapsed = 1
             
@@ -628,7 +678,7 @@ class Blockchain:
         old_target = last_block.target
         new_target = int(old_target * adjustment_factor)
         new_target = max(1, new_target)
-        new_target = min(new_target, (1 << 256) - 1)
+        new_target = min(new_target, FIXED_TARGET)
         
         if not hasattr(self, 'last_target_log_idx'):
             self.last_target_log_idx = -1
@@ -653,6 +703,9 @@ class Blockchain:
         else:
             timestamps = [chain[i].timestamp for i in range(first_index, new_block_index)]
 
+        if not timestamps:
+            return GENESIS_TIMESTAMP
+
         timestamps.sort()
         count = len(timestamps)
         mid = count // 2
@@ -660,32 +713,42 @@ class Blockchain:
             return timestamps[mid]
         return (timestamps[mid - 1] + timestamps[mid]) // 2
 
-    def calculate_expected_target(self, new_block_index, chain=None):
+    def calculate_expected_target(self, new_block_index, chain=None, new_timestamp=None):
         if not DYNAMIC_DIFFICULTY_ADJUSTMENT:
             return FIXED_TARGET
             
+        if chain is None:
+            last_block = self.get_block(new_block_index - 1)
+        else:
+            last_block = chain[new_block_index - 1]
+            
+        if not last_block:
+            return FIXED_TARGET
+            
+        if new_timestamp is not None:
+            time_diff = new_timestamp - last_block.timestamp
+            if time_diff > 3600:
+                eda_target = last_block.target + (last_block.target // 4)
+                return min(eda_target, FIXED_TARGET)
+                
         if new_block_index < DIFFICULTY_ADJUSTMENT_INTERVAL:
             return FIXED_TARGET
             
         if new_block_index % DIFFICULTY_ADJUSTMENT_INTERVAL != 0:
-            if chain is None:
-                last_block = self.get_block(new_block_index - 1)
-            else:
-                last_block = chain[new_block_index - 1]
             return last_block.target
             
         first_index = new_block_index - DIFFICULTY_ADJUSTMENT_INTERVAL
         if chain is None:
             first_block = self.get_block(first_index)
-            last_block = self.get_block(new_block_index - 1)
         else:
              first_block = chain[first_index]
-             last_block = chain[new_block_index - 1]
             
-        if not first_block or not last_block:
+        if not first_block:
             return FIXED_TARGET
             
-        time_elapsed = last_block.timestamp - first_block.timestamp
+        mtp_last = self.get_median_time_past(new_block_index, chain=chain)
+        mtp_first = self.get_median_time_past(first_index, chain=chain)
+        time_elapsed = mtp_last - mtp_first
         if time_elapsed <= 0:
             time_elapsed = 1
             
@@ -695,7 +758,7 @@ class Blockchain:
         old_target = last_block.target
         new_target = int(old_target * adjustment_factor)
         new_target = max(1, new_target)
-        new_target = min(new_target, (1 << 256) - 1)
+        new_target = min(new_target, FIXED_TARGET)
         return new_target
 
     @staticmethod
@@ -705,25 +768,41 @@ class Blockchain:
         merkle_root = block_data['merkle_root']
         previous_hash = block_data['previous_hash']
         target_hex = block_data['target']
-        target = int(target_hex, 16)
-        nonce = start_nonce
+        version = block_data.get('version', BLOCK_VERSION)
+        chain_id = block_data.get('chain_id', CHAIN_ID)
         
+        original_target = int(target_hex, 16)
+        previous_target = block_data.get('previous_target', FIXED_TARGET)
+        previous_timestamp = block_data.get('previous_timestamp', timestamp)
+        target = original_target
+        
+        nonce = start_nonce
         hashes_calculated = 0
         last_update_time = time.time()
         
         while not stop_event.is_set():
             current_time = time.time()
             if current_time - timestamp > 60:
-                timestamp = current_time
+                timestamp = int(current_time)
                 nonce = start_nonce
+                
+                time_diff = timestamp - previous_timestamp
+                if time_diff > 3600:
+                    eda_target = previous_target + (previous_target // 4)
+                    target = min(eda_target, FIXED_TARGET)
+                else:
+                    target = original_target
+                    
                 if worker_id == 0:
                     formatted_time = time.strftime("%d.%m.%Y %H:%M:%S UTC+00:00", time.gmtime(timestamp))
                     sys.stdout.write(f"\n{Fore.YELLOW}Reset PoW Nonce{Style.RESET_ALL}\n")
                     sys.stdout.write(f"{Fore.CYAN}Nový timestamp:{Style.RESET_ALL} {formatted_time}\n")
-                    sys.stdout.write(f"{Fore.MAGENTA}Cílový target (hex):{Style.RESET_ALL} {hex(target)[2:]}\n\n")
+                    sys.stdout.write(f"{Fore.MAGENTA}Target:{Style.RESET_ALL} {hex(target)[2:]}\n\n")
                     sys.stdout.flush()
                     
             block_dict = {
+                'version': version,
+                'chain_id': chain_id,
                 'index': index,
                 'timestamp': timestamp,
                 'merkle_root': merkle_root,
@@ -758,12 +837,17 @@ class Blockchain:
             self.mining_in_progress = True
             
             sys.stdout.write(f"\n{Fore.YELLOW}Začínám těžit blok na zvolený počet CPU jader: {num_cores}{Style.RESET_ALL}\n")
+            last_block = self.get_last_block()
             block_data = {
                 'index': block.index,
                 'timestamp': block.timestamp,
                 'merkle_root': block.merkle_root,
                 'previous_hash': block.previous_hash,
-                'target': hex(block.target)[2:]
+                'target': hex(block.target)[2:],
+                'version': block.version,
+                'chain_id': block.chain_id,
+                'previous_timestamp': last_block.timestamp,
+                'previous_target': last_block.target
             }
             
             result_queue = multiprocessing.Queue()
@@ -860,6 +944,14 @@ class Blockchain:
             return False
             
         try:
+            if block.chain_id != CHAIN_ID:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Zjištěno cizí chain_id.{Style.RESET_ALL}")
+                return False
+                
+            if block.version != BLOCK_VERSION:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Neplatná verze bloku.{Style.RESET_ALL}")
+                return False
+
             block_size = block.get_size()
             if block_size > MAX_BLOCK_SIZE_BYTES:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Velikost bloku ({block_size} bajtů) překračuje maximální povolenou velikost {MAX_BLOCK_SIZE_BYTES} bajtů.{Style.RESET_ALL}")
@@ -902,10 +994,10 @@ class Blockchain:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku:{Style.RESET_ALL} Timestamp bloku je neplatný.")
                 return False
 
-            if block.target != self.get_target():
+            if block.target != self.get_target(new_timestamp=block.timestamp):
                 return False
 
-            if block.target != self.calculate_expected_target(block.index):
+            if block.target != self.calculate_expected_target(block.index, new_timestamp=block.timestamp):
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nesprávný target bloku.{Style.RESET_ALL}")
                 return False
 
@@ -927,6 +1019,10 @@ class Blockchain:
             for tx in block.transactions:
                 if not isinstance(tx.amount, int) or not isinstance(tx.fee, int) or not isinstance(tx.nonce, int):
                     p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Hodnoty amount, fee a nonce musí být celá čísla.{Style.RESET_ALL}")
+                    return False
+
+                if tx.chain_id != CHAIN_ID:
+                    p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku:{Style.RESET_ALL} Transakce patří k jinému chain_id.")
                     return False
 
                 if self.is_tx_id_in_chain(tx.tx_id):
@@ -1026,9 +1122,9 @@ class Blockchain:
             transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
             target_hex = hex(block.target)[2:]
             c.execute('''
-                INSERT OR REPLACE INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root))
+                INSERT OR REPLACE INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id))
             conn.commit()
             conn.close()
             
@@ -1077,7 +1173,6 @@ class Blockchain:
                 elif not self.is_tx_id_in_chain(tx.tx_id):
                     orphaned_transactions.append(tx)
                     
-        # Seřazení podle odesílatele a následně podle nonce pro bezpečné postupné přidávání
         orphaned_transactions.sort(key=lambda x: (x.from_address, x.nonce))
         
         for tx in orphaned_transactions:
@@ -1098,16 +1193,17 @@ class Blockchain:
                 p2p_node.add_log(f"{Fore.RED}Osiřelá uživatelská transakce {tx.tx_id} zamítnuta z mempoolu. Důvod: {reason}.{Style.RESET_ALL}")
 
     def mine(self, miner_address):
+        self.cleanup_mempool()
         try:
             new_block_index = self.max_block_index + 1
             halvings = new_block_index // HALVING_INTERVAL_BLOCKS
             current_reward = BLOCK_REWARD // (2 ** halvings)
             
-            mining_reward = Transaction("COINBASE", miner_address, 0, nonce=0, public_key=None, signature=None, data=None)
+            mining_reward = Transaction("COINBASE", miner_address, 0, nonce=0, public_key=None, signature=None, data=None, chain_id=CHAIN_ID)
             new_block_transactions = [mining_reward]
             current_block_size = 0
             
-            dummy_block = Block(self.max_block_index + 1, [], self.get_last_block().hash, self.get_target())
+            dummy_block = Block(self.max_block_index + 1, [], self.get_last_block().hash, self.get_target(new_timestamp=mining_reward.timestamp), version=BLOCK_VERSION, chain_id=CHAIN_ID)
             current_block_size += dummy_block.get_size()
             current_block_size += mining_reward.get_size()
             
@@ -1176,14 +1272,16 @@ class Blockchain:
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Maximální nabídka dosažena, nelze vytěžit další blok.")
                 return False
                 
-            new_block_transactions[0] = Transaction("COINBASE", miner_address, final_reward, nonce=0, public_key=None, signature=None, timestamp=mining_reward.timestamp, data=None)
+            new_block_transactions[0] = Transaction("COINBASE", miner_address, final_reward, nonce=0, public_key=None, signature=None, timestamp=mining_reward.timestamp, data=None, chain_id=CHAIN_ID)
             last_block = self.get_last_block()
-            target = self.get_target()
+            target = self.get_target(new_timestamp=mining_reward.timestamp)
             new_block = Block(
                 index=last_block.index + 1,
                 transactions=new_block_transactions,
                 previous_hash=last_block.hash,
-                target=target
+                target=target,
+                version=BLOCK_VERSION,
+                chain_id=CHAIN_ID
             )
             
             if self.get_last_block().hash != last_block.hash:
@@ -1215,7 +1313,7 @@ class Blockchain:
                     return False
                     
                 if self.add_block(new_block, proof):
-                    print(f"{Fore.GREEN}Blok {new_block.index} byl vytěžen a přidán do řetězce!{Style.RESET_ALL} (Target (hex): {hex(target)[2:]})")
+                    print(f"{Fore.GREEN}Blok {new_block.index} byl vytěžen a přidán do řetězce!{Style.RESET_ALL} (Target: {hex(target)[2:]})")
                     print(f"  Datum: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(new_block.timestamp))}")
                     print(f"  Velikost bloku: {Fore.CYAN}{new_block.get_size() / 1024:.2f} KB{Style.RESET_ALL}")
                     print(f"  Odměna za blok: {Fore.CYAN}{format(current_reward / (10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
@@ -1250,7 +1348,7 @@ class Blockchain:
         if chain is None:
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             c = conn.cursor()
-            c.execute("SELECT * FROM blocks ORDER BY block_index")
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index")
             rows = c.fetchall()
             conn.close()
             chain = [Block.from_dict({
@@ -1261,7 +1359,9 @@ class Blockchain:
                 'target': row[4],
                 'nonce': row[5],
                 'hash': row[6],
-                'merkle_root': row[7]
+                'merkle_root': row[7],
+                'version': row[8],
+                'chain_id': row[9]
             }) for row in rows]
             
         for checkpoint_index, expected_hash in CHECKPOINTS.items():
@@ -1275,12 +1375,16 @@ class Blockchain:
         total_supply = 0
         balance_map = {}
         genesis_block = chain[0]
+
+        if genesis_block.get_size() > MAX_BLOCK_SIZE_BYTES:
+            p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Velikost Genesis bloku překračuje maximální povolenou velikost.{Style.RESET_ALL}")
+            return False
         
         if genesis_block.hash != genesis_block.compute_hash():
             p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Hash genesis bloku neodpovídá jeho obsahu (podvržený genesis).{Style.RESET_ALL}")
             return False
             
-        if genesis_block.index != 0 or genesis_block.previous_hash != "0" or genesis_block.target != FIXED_TARGET:
+        if genesis_block.index != 0 or genesis_block.previous_hash != "0" or genesis_block.target != FIXED_TARGET or genesis_block.chain_id != CHAIN_ID or genesis_block.version != BLOCK_VERSION:
             p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nesprávné vlastnosti genesis bloku.{Style.RESET_ALL}")
             return False
 
@@ -1301,7 +1405,7 @@ class Blockchain:
             p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nesprávný Merkle root v genesis bloku.{Style.RESET_ALL}")
             return False
             
-        if genesis_tx.data != "BTC: 00000000000000000000c6f7f5be25ea8f1f034b3bc7cf3c152f93289ebb33e0":
+        if genesis_tx.data != "Darkwalker":
             p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nesprávná zpráva v genesis coinbase.{Style.RESET_ALL}")
             return False
             
@@ -1315,6 +1419,14 @@ class Blockchain:
             
             if current_block_size > MAX_BLOCK_SIZE_BYTES:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Velikost bloku #{current_block.index} ({current_block_size} bajtů) překračuje maximální povolenou velikost {MAX_BLOCK_SIZE_BYTES} bajtů.{Style.RESET_ALL}")
+                return False
+
+            if current_block.chain_id != CHAIN_ID:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Neplatné chain_id u bloku #{current_block.index}.{Style.RESET_ALL}")
+                return False
+                
+            if current_block.version != BLOCK_VERSION:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Neplatná verze bloku #{current_block.index}.{Style.RESET_ALL}")
                 return False
                 
             if current_block.hash != current_block.compute_hash():
@@ -1332,7 +1444,7 @@ class Blockchain:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Timestamp bloku #{current_block.index} v řetězci je neplatný.{Style.RESET_ALL}")
                 return False
                 
-            if current_block.target != self.calculate_expected_target(current_block.index, chain=chain):
+            if current_block.target != self.calculate_expected_target(current_block.index, chain=chain, new_timestamp=current_block.timestamp):
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nesprávný target bloku #{current_block.index}.{Style.RESET_ALL}")
                 return False
                 
@@ -1376,6 +1488,9 @@ class Blockchain:
             for tx in current_block.transactions:
                 if not isinstance(tx.amount, int) or not isinstance(tx.fee, int) or not isinstance(tx.nonce, int):
                     p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Hodnoty amount, fee a nonce musí být celá čísla.{Style.RESET_ALL}")
+                    return False
+                if tx.chain_id != CHAIN_ID:
+                    p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Transakce má nesprávné chain_id.{Style.RESET_ALL}")
                     return False
 
                 if tx.tx_id in seen_tx_ids:
@@ -1524,8 +1639,8 @@ class Blockchain:
                 for block in new_chain:
                     transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
                     target_hex = hex(block.target)[2:]
-                    c.execute("INSERT INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                              (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root))
+                    c.execute("INSERT INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id))
                 conn.commit()
             finally:
                 conn.close()
@@ -1535,7 +1650,6 @@ class Blockchain:
             self.chain = new_chain[-LAST_BLOCKS_TO_KEEP:] if len(new_chain) > LAST_BLOCKS_TO_KEEP else new_chain
             self.unconfirmed_transactions = []
             
-            # Změněno řazení: primárně podle adresy, pak podle nonce
             orphaned_transactions.sort(key=lambda x: (x.from_address, x.nonce))
             
             for tx in orphaned_transactions:
@@ -1611,22 +1725,24 @@ def save_data(droid_chain, wallets, password, peers):
         c.execute('''
             CREATE TABLE IF NOT EXISTS blocks (
                 block_index INTEGER PRIMARY KEY,
-                timestamp REAL,
+                timestamp INTEGER,
                 transactions TEXT,
                 previous_hash TEXT,
                 target_hex TEXT,
                 nonce INTEGER,
                 block_hash TEXT,
-                merkle_root TEXT
+                merkle_root TEXT,
+                version INTEGER,
+                chain_id INTEGER
             )
         ''')
         for block in droid_chain.chain:
             transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
             target_hex = hex(block.target)[2:]
             c.execute('''
-                INSERT OR REPLACE INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root))
+                INSERT OR REPLACE INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id))
         conn.commit()
         conn.close()
         
@@ -1680,17 +1796,18 @@ def save_mempool(unconfirmed_transactions):
                 amount INTEGER,
                 fee INTEGER,
                 nonce INTEGER,
-                timestamp REAL,
+                timestamp INTEGER,
                 public_key TEXT,
-                signature TEXT
+                signature TEXT,
+                chain_id INTEGER
             )
         ''')
         c.execute('DELETE FROM transactions')
         for tx in unconfirmed_transactions:
             c.execute('''
-                INSERT INTO transactions (tx_id, from_address, to_address, amount, fee, nonce, timestamp, public_key, signature)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (tx.tx_id, tx.from_address, tx.to_address, tx.amount, tx.fee, tx.nonce, tx.timestamp, tx.public_key, tx.signature))
+                INSERT INTO transactions (tx_id, from_address, to_address, amount, fee, nonce, timestamp, public_key, signature, chain_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (tx.tx_id, tx.from_address, tx.to_address, tx.amount, tx.fee, tx.nonce, tx.timestamp, tx.public_key, tx.signature, tx.chain_id))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1710,7 +1827,11 @@ def load_data():
     password = None
     
     if os.path.exists(WALLETS_FILE):
-        password = getpass.getpass(f"{Fore.BLUE}Zadejte heslo: {Style.RESET_ALL}")
+        try:
+            password = getpass.getpass(f"{Fore.BLUE}Zadejte heslo: {Style.RESET_ALL}")
+        except KeyboardInterrupt:
+            print("\nUkončeno uživatelem.")
+            sys.exit(0)
         try:
             with open(WALLETS_FILE, 'rb') as f:
                 data = f.read()
@@ -1743,16 +1864,20 @@ def load_data():
     else:
         print(f"{Fore.YELLOW}Žádný šifrovaný soubor peněženek nenalezen. Vytvářím nový.{Style.RESET_ALL}")
         while True:
-            pwd1 = getpass.getpass(f"{Fore.BLUE}Vytvořte heslo (8-20 znaků): {Style.RESET_ALL}")
-            if not 8 <= len(pwd1) <= 20:
-                print(f"{Fore.RED}Délka hesla musí být mezi 8 a 20 znaky.{Style.RESET_ALL}")
-                continue
-            pwd2 = getpass.getpass(f"{Fore.BLUE}Potvrďte heslo: {Style.RESET_ALL}")
-            if pwd1 == pwd2:
-                password = pwd1
-                break
-            else:
-                print(f"{Fore.RED}Hesla se neshodují.{Style.RESET_ALL}")
+            try:
+                pwd1 = getpass.getpass(f"{Fore.BLUE}Vytvořte heslo (8-20 znaků): {Style.RESET_ALL}")
+                if not 8 <= len(pwd1) <= 20:
+                    print(f"{Fore.RED}Délka hesla musí být mezi 8 a 20 znaky.{Style.RESET_ALL}")
+                    continue
+                pwd2 = getpass.getpass(f"{Fore.BLUE}Potvrďte heslo: {Style.RESET_ALL}")
+                if pwd1 == pwd2:
+                    password = pwd1
+                    break
+                else:
+                    print(f"{Fore.RED}Hesla se neshodují.{Style.RESET_ALL}")
+            except KeyboardInterrupt:
+                print("\nUkončeno uživatelem.")
+                sys.exit(0)
         wallets = {}
         save_wallets_enc(wallets, password)
         print(f"{Fore.GREEN}Nový šifrovaný soubor peněženek vytvořen. Zálohujte si své privátní klíče odděleně pro případ obnovy.{Style.RESET_ALL}")
@@ -1765,19 +1890,21 @@ def load_data():
             c.execute('''
                 CREATE TABLE IF NOT EXISTS blocks (
                     block_index INTEGER PRIMARY KEY,
-                    timestamp REAL,
+                    timestamp INTEGER,
                     transactions TEXT,
                     previous_hash TEXT,
                     target_hex TEXT,
                     nonce INTEGER,
                     block_hash TEXT,
-                    merkle_root TEXT
+                    merkle_root TEXT,
+                    version INTEGER,
+                    chain_id INTEGER
                 )
              ''')
             c.execute("SELECT MAX(block_index) FROM blocks")
             droid_chain.max_block_index = c.fetchone()[0] or 0
             
-            c.execute("SELECT * FROM blocks WHERE block_index > ? ORDER BY block_index", (droid_chain.max_block_index - LAST_BLOCKS_TO_KEEP,))
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index > ? ORDER BY block_index", (droid_chain.max_block_index - LAST_BLOCKS_TO_KEEP,))
             rows = c.fetchall()
             droid_chain.chain = [Block.from_dict({
                 'index': row[0],
@@ -1787,7 +1914,9 @@ def load_data():
                 'target': row[4],
                 'nonce': row[5],
                 'hash': row[6],
-                'merkle_root': row[7]
+                'merkle_root': row[7],
+                'version': row[8],
+                'chain_id': row[9]
             }) for row in rows]
             
             droid_chain.rebuild_state()
@@ -1836,12 +1965,13 @@ def load_mempool(droid_chain):
                     amount INTEGER,
                     fee INTEGER,
                     nonce INTEGER,
-                    timestamp REAL,
+                    timestamp INTEGER,
                     public_key TEXT,
-                    signature TEXT
+                    signature TEXT,
+                    chain_id INTEGER
                 )
             ''')
-            c.execute("SELECT * FROM transactions")
+            c.execute("SELECT tx_id, from_address, to_address, amount, fee, nonce, timestamp, public_key, signature, chain_id FROM transactions")
             rows = c.fetchall()
             conn.close()
             
@@ -1855,7 +1985,8 @@ def load_mempool(droid_chain):
                     'nonce': row[5],
                     'timestamp': row[6],
                     'public_key': row[7],
-                    'signature': row[8]
+                    'signature': row[8],
+                    'chain_id': row[9]
                 }
                 tx = Transaction.from_dict(tx_data)
                 if not droid_chain.add_transaction(tx):
@@ -1882,7 +2013,6 @@ class P2PNode:
         self.awaiting_full_chain = False
 
     def get_locator_hashes(self):
-        """Vrátí seznam posledních 50 hashů bloků pro nalezení bodu forku."""
         locator = []
         try:
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
@@ -1924,7 +2054,13 @@ class P2PNode:
     def start_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((self.host, self.port))
+        try:
+            server_socket.bind((self.host, self.port))
+        except OSError:
+            print(f"\n{Fore.RED}Chyba: Port {self.port} je již obsazen jiným procesem. Vypínám uzel.{Style.RESET_ALL}")
+            self.running = False
+            return
+            
         server_socket.listen()
         self.add_log(f"{Fore.CYAN}Poslouchám na {self.host}:{self.port}...{Style.RESET_ALL}")
         server_socket.settimeout(1)
@@ -2092,7 +2228,7 @@ class P2PNode:
                         break
 
             self.add_log(f"{Fore.YELLOW}Přijat požadavek na bloky, odesílám od indexu {start_index}...{Style.RESET_ALL}")
-            c.execute("SELECT * FROM blocks WHERE block_index >= ? ORDER BY block_index", (start_index,))
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index >= ? ORDER BY block_index", (start_index,))
             rows = c.fetchall()
             conn.close()
 
@@ -2106,7 +2242,9 @@ class P2PNode:
                     'target': row[4],
                     'nonce': row[5],
                     'hash': row[6],
-                    'merkle_root': row[7]
+                    'merkle_root': row[7],
+                    'version': row[8],
+                    'chain_id': row[9]
                 })
             self.send_data_to_peers({'type': 'response_blocks', 'data': blocks_data})
 
@@ -2147,7 +2285,7 @@ class P2PNode:
 
                 conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                 c = conn.cursor()
-                c.execute("SELECT * FROM blocks WHERE block_index < ? ORDER BY block_index", (first_block_index,))
+                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index < ? ORDER BY block_index", (first_block_index,))
                 prefix_rows = c.fetchall()
                 conn.close()
 
@@ -2167,7 +2305,9 @@ class P2PNode:
                         'target': row[4],
                         'nonce': row[5],
                         'hash': row[6],
-                        'merkle_root': row[7]
+                        'merkle_root': row[7],
+                        'version': row[8],
+                        'chain_id': row[9]
                     })
                 full_new_chain_data.extend(blocks_data)
 
@@ -2181,7 +2321,7 @@ class P2PNode:
             self.add_log(f"{Fore.YELLOW}Přijat požadavek na celý řetězec, odesílám...{Style.RESET_ALL}")
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             c = conn.cursor()
-            c.execute("SELECT * FROM blocks ORDER BY block_index")
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index")
             rows = c.fetchall()
             chain_data = [Block.from_dict({
                 'index': row[0],
@@ -2191,7 +2331,9 @@ class P2PNode:
                 'target': row[4],
                 'nonce': row[5],
                 'hash': row[6],
-                'merkle_root': row[7]
+                'merkle_root': row[7],
+                'version': row[8],
+                'chain_id': row[9]
             }).to_dict() for row in rows]
             conn.close()
             self.send_data_to_peers({'type': 'response_full_chain', 'data': chain_data})
@@ -2272,12 +2414,18 @@ class P2PNode:
         elif msg_type == 'handshake':
             remote_protocol_version = message.get('protocol_version')
             remote_software_version = message.get('software_version', 'neznámá')
-            if remote_protocol_version != PROTOCOL_VERSION:
+            remote_chain_id = message.get('chain_id')
+            
+            if remote_chain_id != CHAIN_ID:
+                if addr:
+                    self.blacklist.add(addr[0])
+                self.add_log(f"{Fore.RED}Handshake selhal od uzlu {ip_port}: nesprávné chain_id {remote_chain_id} (očekáváno {CHAIN_ID}). Uzel blacklistován.{Style.RESET_ALL}")
+            elif remote_protocol_version != PROTOCOL_VERSION:
                 if addr:
                     self.blacklist.add(addr[0])
                 self.add_log(f"{Fore.RED}Handshake selhal od uzlu {ip_port}: nekompatibilní protocol_version {remote_protocol_version} (očekáváno {PROTOCOL_VERSION}). Uzel blacklistován.{Style.RESET_ALL}")
             else:
-                self.add_log(f"{Fore.GREEN}Handshake úspěšný od uzlu {ip_port}: software_version={remote_software_version}, protocol_version={remote_protocol_version}.{Style.RESET_ALL}")
+                self.add_log(f"{Fore.GREEN}Handshake úspěšný od uzlu {ip_port}: software_version={remote_software_version}, protocol_version={remote_protocol_version}, chain_id={remote_chain_id}.{Style.RESET_ALL}")
                 
     def connect_to_peer(self, peer_addr):
         if peer_addr not in self.peers:
@@ -2288,7 +2436,7 @@ class P2PNode:
                 self.peers.append(peer_addr)
                 self.add_log(f"{Fore.GREEN}Úspěšně připojeno k uzlu {peer_addr}{Style.RESET_ALL}")
                 
-                self.send_data_to_peers({'type': 'handshake', 'protocol_version': PROTOCOL_VERSION, 'software_version': SOFTWARE_VERSION})
+                self.send_data_to_peers({'type': 'handshake', 'protocol_version': PROTOCOL_VERSION, 'software_version': SOFTWARE_VERSION, 'chain_id': CHAIN_ID})
                 self.send_data_to_peers({'type': 'request_mempool'})
                 self.send_data_to_peers({'type': 'request_chain_info'})
                 
@@ -2326,6 +2474,7 @@ class P2PNode:
     def sync_chain_periodically(self):
         while self.running:
             time.sleep(10)
+            self.blockchain.cleanup_mempool()
             if self.peers:
                 self.add_log(f"{Fore.YELLOW}Synchronizuji blockchain a mempool se sousedními uzly...{Style.RESET_ALL}")
                 self.send_data_to_peers({'type': 'request_chain_info'})
@@ -2401,7 +2550,7 @@ def print_menu():
     print(f"{Fore.GREEN}20{Style.RESET_ALL} - Zobrazit blok")
 
 def verify_genesis_address():
-    current_hash = hashlib.sha256(GENESIS_ADDRESS.encode()).hexdigest()
+    current_hash = hashlib.sha3_256(GENESIS_ADDRESS.encode()).hexdigest()
     if current_hash != GENESIS_ADDRESS_EXPECTED_HASH:
         print(f"{Fore.RED}Chyba: Genesis adresa byla změněna! Program se ukončuje.{Style.RESET_ALL}")
         sys.exit(1)
@@ -2435,6 +2584,10 @@ def main():
     p2p_node = P2PNode(droid_chain, P2P_HOST, p2p_port, peers)
     p2p_node.server_thread.daemon = True
     p2p_node.server_thread.start()
+    
+    if not p2p_node.running:
+        return
+        
     p2p_node.sync_thread.start()
     
     print(f"\n{Fore.GREEN} Vítejte v {PROJECT_NAME} ({TICKER}) v{SOFTWARE_VERSION} {Style.RESET_ALL}")
@@ -2447,6 +2600,10 @@ def main():
                 choice = input(f"\n{Fore.BLUE}Zadejte číslo volby: {Style.RESET_ALL}").strip()
             except EOFError:
                 choice = "12"
+                
+            if choice.lower() == 'clear':
+                os.system('cls' if os.name == 'nt' else 'clear')
+                continue
                 
             if read_only and choice in ["1", "2"]:
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Operace není povolena v read-only režimu.")
@@ -2585,14 +2742,14 @@ def main():
                         if tx.signature:
                             print(f" Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
                         else:
-                            print(f" Podpis: {Fore.RED}žádný (chybí){Style.RESET_ALL}")
+                            print(f" Podpis: {Fore.RED}žádný{Style.RESET_ALL}")
                         print("-" * 20)
                     
             elif choice == "4":
                 print(f"\n{Fore.YELLOW}--- Blockchain ---{Style.RESET_ALL}")
                 conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                 c = conn.cursor()
-                c.execute("SELECT * FROM blocks ORDER BY block_index")
+                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index")
                 rows = c.fetchall()
                 conn.close()
                 
@@ -2608,7 +2765,9 @@ def main():
                         'target': row[4],
                         'nonce': row[5],
                         'hash': row[6],
-                        'merkle_root': row[7]
+                        'merkle_root': row[7],
+                        'version': row[8],
+                        'chain_id': row[9]
                     }
                     block = Block.from_dict(block_data)
                     total_size += block.get_size()
@@ -2620,9 +2779,11 @@ def main():
                         
                     target_hex = hex(block.target)[2:]
                     print(f"Blok #{block.index}")
+                    print(f" Verze: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
+                    print(f" Chain ID: {Fore.CYAN}{block.chain_id}{Style.RESET_ALL}")
                     print(f" Hash: {Fore.MAGENTA}{block.hash}{Style.RESET_ALL}")
                     print(f" Merkle root: {Fore.CYAN}{block.merkle_root}{Style.RESET_ALL}")
-                    print(f" Cílový target (hex): {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
+                    print(f" Cílový target: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
                     print(f" Předchozí hash: {Fore.MAGENTA}{block.previous_hash}{Style.RESET_ALL}")
                     print(f" PoW Nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
                     print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(block.timestamp))}{Style.RESET_ALL}")
@@ -2643,7 +2804,7 @@ def main():
                             if tx.signature:
                                 print(f"   Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
                             else:
-                                print(f"   Podpis: {Fore.RED}žádný (chybí){Style.RESET_ALL}")
+                                print(f"   Podpis: {Fore.RED}žádný{Style.RESET_ALL}")
                             if tx.data:
                                 print(f"   Zpráva: {Fore.YELLOW}{tx.data}{Style.RESET_ALL}")
                     print("=" * 40)
@@ -2938,7 +3099,7 @@ def main():
                 block_hash = input("Zadejte hash bloku: ").strip()
                 conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                 c = conn.cursor()
-                c.execute("SELECT * FROM blocks WHERE block_hash = ?", (block_hash,))
+                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_hash = ?", (block_hash,))
                 row = c.fetchone()
                 conn.close()
                 
@@ -2951,15 +3112,19 @@ def main():
                         'target': row[4],
                         'nonce': row[5],
                         'hash': row[6],
-                        'merkle_root': row[7]
+                        'merkle_root': row[7],
+                        'version': row[8],
+                        'chain_id': row[9]
                     }
                     block = Block.from_dict(block_data)
                     target_hex = hex(block.target)[2:]
                     print(f"\n{Fore.GREEN}Blok nalezen!{Style.RESET_ALL}")
                     print(f"Blok #{block.index}")
+                    print(f" Verze: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
+                    print(f" Chain ID: {Fore.CYAN}{block.chain_id}{Style.RESET_ALL}")
                     print(f" Hash: {Fore.MAGENTA}{block.hash}{Style.RESET_ALL}")
                     print(f" Merkle root: {Fore.CYAN}{block.merkle_root}{Style.RESET_ALL}")
-                    print(f" Cílový target (hex): {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
+                    print(f" Cílový target: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
                     print(f" Předchozí hash: {Fore.MAGENTA}{block.previous_hash}{Style.RESET_ALL}")
                     print(f" PoW Nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
                     print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(block.timestamp))}{Style.RESET_ALL}")
@@ -2980,7 +3145,7 @@ def main():
                             if tx.signature:
                                 print(f"   Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
                             else:
-                                print(f"   Podpis: {Fore.RED}žádný (chybí){Style.RESET_ALL}")
+                                print(f"   Podpis: {Fore.RED}žádný{Style.RESET_ALL}")
                             if tx.data:
                                 print(f"   Zpráva: {Fore.YELLOW}{tx.data}{Style.RESET_ALL}")
                     print("=" * 40)
@@ -3029,9 +3194,11 @@ def main():
                         block = droid_chain.get_block(block_index)
                         target_hex = hex(block.target)[2:]
                         print(f"Blok #{block.index}")
+                        print(f" Verze: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
+                        print(f" Chain ID: {Fore.CYAN}{block.chain_id}{Style.RESET_ALL}")
                         print(f" Hash: {Fore.MAGENTA}{block.hash}{Style.RESET_ALL}")
                         print(f" Merkle root: {Fore.CYAN}{block.merkle_root}{Style.RESET_ALL}")
-                        print(f" Cílový target (hex): {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
+                        print(f" Cílový target: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
                         print(f" Předchozí hash: {Fore.MAGENTA}{block.previous_hash}{Style.RESET_ALL}")
                         print(f" PoW Nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
                         print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(block.timestamp))}{Style.RESET_ALL}")
@@ -3052,7 +3219,7 @@ def main():
                                 if tx.signature:
                                     print(f"   Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
                                 else:
-                                    print(f"   Podpis: {Fore.RED}žádný (chybí){Style.RESET_ALL}")
+                                    print(f"   Podpis: {Fore.RED}žádný{Style.RESET_ALL}")
                                 if tx.data:
                                     print(f"   Zpráva: {Fore.YELLOW}{tx.data}{Style.RESET_ALL}")
                         print("=" * 40)
