@@ -7,6 +7,7 @@ import os
 import threading
 import socket
 import sys
+import subprocess
 import queue
 from colorama import Fore, Style, init
 import struct
@@ -24,6 +25,7 @@ import math
 import signal
 import ipaddress
 from decimal import Decimal, ROUND_HALF_UP
+import platform
 
 init(autoreset=True)
 
@@ -49,7 +51,8 @@ BLOCKCHAIN_DB = 'blockchain.db'
 WALLETS_FILE = 'wallets.json.enc'
 MEMPOOL_DB = 'mempool.db'
 PEERS_FILE = 'peers.json'
-ADDRESS_BOOK_FILE = 'address_book.json'
+ADDRESS_BOOK_FILE = 'address_book.json.enc'
+BLACKLIST_FILE = 'blacklist.json'
 
 P2P_HOST = '0.0.0.0'
 
@@ -76,6 +79,7 @@ ALLOW_NTP_SERVERS = True
 SOFTWARE_VERSION = "0.1.0-alpha.1"
 PROTOCOL_VERSION = 1
 BLOCK_VERSION = 1
+MEMPOOL_TX_EXPIRATION = 86400
 
 CHECKPOINTS = {
     0: GENESIS_BLOCK_EXPECTED_HASH,
@@ -240,7 +244,7 @@ class Transaction:
         return len(json.dumps(self.to_dict()).encode('utf-8'))
 
     def is_valid_timestamp(self):
-        return (get_time() - 86400) <= self.timestamp <= (get_time() + 600)
+        return (get_time() - MEMPOOL_TX_EXPIRATION) <= self.timestamp <= (get_time() + 600)
 
     def verify_signature(self):
         if self.from_address == "COINBASE":
@@ -373,13 +377,25 @@ class Blockchain:
 
     def cleanup_mempool(self):
         current_time = get_time()
-        original_count = len(self.unconfirmed_transactions)
-        self.unconfirmed_transactions = [
-            tx for tx in self.unconfirmed_transactions
-            if (current_time - tx.timestamp) <= 86400
-        ]
-        if len(self.unconfirmed_transactions) < original_count:
+        
+        valid_transactions = []
+        expired_transactions = []
+        
+        for tx in self.unconfirmed_transactions:
+            if (current_time - tx.timestamp) <= MEMPOOL_TX_EXPIRATION:
+                valid_transactions.append(tx)
+            else:
+                expired_transactions.append(tx)
+                
+        self.unconfirmed_transactions = valid_transactions
+        
+        if expired_transactions:
             save_mempool(self.unconfirmed_transactions)
+            
+            global p2p_node
+            if 'p2p_node' in globals() and p2p_node is not None:
+                for tx in expired_transactions:
+                    p2p_node.add_log(f"{Fore.YELLOW}Upozornění: Transakce {tx.tx_id} vypršela a byla odstraněna z mempoolu.{Style.RESET_ALL}")
 
     def create_genesis_block(self):
         genesis_tx = Transaction(
@@ -652,7 +668,22 @@ class Blockchain:
         time_diff = current_ts - last_block.timestamp
         if time_diff > 3600:
             eda_target = last_block.target + (last_block.target // 4)
-            return min(eda_target, FIXED_TARGET)
+            new_target = min(eda_target, FIXED_TARGET)
+            
+            # --- NOVÝ KÓD PRO ZÁPIS EDA DO LOGU ---
+            if not hasattr(self, 'last_eda_log_idx'):
+                self.last_eda_log_idx = -1
+                
+            if new_block_index != self.last_eda_log_idx:
+                p2p_node.add_log(
+                    f"{Fore.RED}NOUZOVÁ ÚPRAVA TARGETU (EDA) na bloku #{new_block_index}:{Style.RESET_ALL}\n"
+                    f"  Čas od předchozího bloku: {time_diff}s (Limit: 3600s)\n"
+                    f"  Starý target (hex): {hex(last_block.target)[2:]} -> Nový target (hex): {hex(new_target)[2:]}"
+                )
+                self.last_eda_log_idx = new_block_index
+            # --------------------------------------
+            
+            return new_target
             
         if new_block_index < DIFFICULTY_ADJUSTMENT_INTERVAL:
             return FIXED_TARGET
@@ -795,7 +826,7 @@ class Blockchain:
                     
                 if worker_id == 0:
                     formatted_time = time.strftime("%d.%m.%Y %H:%M:%S UTC+00:00", time.gmtime(timestamp))
-                    sys.stdout.write(f"\n{Fore.YELLOW}Reset PoW Nonce{Style.RESET_ALL}\n")
+                    sys.stdout.write(f"\n{Fore.YELLOW}Reset PoW nonce{Style.RESET_ALL}\n")
                     sys.stdout.write(f"{Fore.CYAN}Nový timestamp:{Style.RESET_ALL} {formatted_time}\n")
                     sys.stdout.write(f"{Fore.MAGENTA}Target:{Style.RESET_ALL} {hex(target)[2:]}\n\n")
                     sys.stdout.flush()
@@ -1702,21 +1733,93 @@ def format_confirmations(count):
     else:
         return f"{Fore.GREEN}{count}{Style.RESET_ALL}"
 
-def load_address_book():
-    if os.path.exists(ADDRESS_BOOK_FILE):
+def load_address_book(password):
+    old_file = 'address_book.json'
+    
+    if os.path.exists(old_file) and password:
         try:
-            with open(ADDRESS_BOOK_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            pass
+            with open(old_file, 'r') as f:
+                address_book = json.load(f)
+            save_address_book(address_book, password)
+            os.remove(old_file)
+            print(f"{Fore.GREEN}Adresář byl úspěšně migrován a zašifrován.{Style.RESET_ALL}")
+            return address_book
+        except Exception as e:
+            print(f"{Fore.RED}Chyba při migraci starého adresáře: {e}{Style.RESET_ALL}")
+            return {}
+
+    if os.path.exists(ADDRESS_BOOK_FILE) and password:
+        try:
+            with open(ADDRESS_BOOK_FILE, 'rb') as f:
+                data = f.read()
+            salt = data[:16]
+            nonce = data[16:28]
+            ciphertext_and_tag = data[28:]
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=200000,
+                backend=default_backend()
+            )
+            key = kdf.derive(password.encode())
+            aesgcm = AESGCM(key)
+            decrypted = aesgcm.decrypt(nonce, ciphertext_and_tag, None)
+            return json.loads(decrypted.decode())
+        except Exception as e:
+            print(f"{Fore.RED}Chyba při dešifrování adresáře (špatné heslo nebo poškozený soubor).{Style.RESET_ALL}")
+            return {}
+            
     return {}
 
-def save_address_book(address_book):
+def save_address_book(address_book, password):
     try:
-        with open(ADDRESS_BOOK_FILE, 'w') as f:
-            json.dump(address_book, f, indent=4)
+        data_json = json.dumps(address_book, indent=4).encode()
+        salt = os.urandom(16)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=200000,
+            backend=default_backend()
+        )
+        key = kdf.derive(password.encode())
+        nonce = os.urandom(12)
+        aesgcm = AESGCM(key)
+        ciphertext_and_tag = aesgcm.encrypt(nonce, data_json, None)
+        
+        temp_file = ADDRESS_BOOK_FILE + '.tmp'
+        with open(temp_file, 'wb') as f:
+            f.write(salt + nonce + ciphertext_and_tag)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, ADDRESS_BOOK_FILE)
     except Exception as e:
         print(f"{Fore.RED}Chyba při ukládání adresáře: {e}{Style.RESET_ALL}")
+        if os.path.exists(ADDRESS_BOOK_FILE + '.tmp'):
+            os.remove(ADDRESS_BOOK_FILE + '.tmp')
+
+def load_blacklist():
+    if os.path.exists(BLACKLIST_FILE):
+        try:
+            with open(BLACKLIST_FILE, 'r') as f:
+                return set(json.load(f))
+        except Exception as e:
+            print(f"{Fore.RED}Chyba při načítání blacklistu:{Style.RESET_ALL} {e}")
+    return set()
+
+def save_blacklist(blacklist):
+    temp_file = BLACKLIST_FILE + '.tmp'
+    try:
+        with open(temp_file, 'w') as f:
+            json.dump(list(blacklist), f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, BLACKLIST_FILE)
+    except Exception as e:
+        print(f"{Fore.RED}Chyba při ukládání blacklistu:{Style.RESET_ALL} {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
 
 def save_data(droid_chain, wallets, password, peers):
     try:
@@ -1814,11 +1917,17 @@ def save_mempool(unconfirmed_transactions):
         print(f"{Fore.RED}Chyba při ukládání mempoolu:{Style.RESET_ALL} {e}")
 
 def save_peers(peers):
+    temp_file = PEERS_FILE + '.tmp'
     try:
-        with open(PEERS_FILE, 'w') as f:
+        with open(temp_file, 'w') as f:
             json.dump(peers, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, PEERS_FILE)
     except Exception as e:
         print(f"{Fore.RED}Chyba při ukládání peers:{Style.RESET_ALL} {e}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
 
 def load_data():
     wallets = {}
@@ -1882,6 +1991,15 @@ def load_data():
         save_wallets_enc(wallets, password)
         print(f"{Fore.GREEN}Nový šifrovaný soubor peněženek vytvořen. Zálohujte si své privátní klíče odděleně pro případ obnovy.{Style.RESET_ALL}")
 
+    if os.path.exists(PEERS_FILE):
+        try:
+            with open(PEERS_FILE, 'r') as f:
+                peers_data = json.load(f)
+                peers = [tuple(p) for p in peers_data]
+                print(f"{Fore.GREEN}Peers byly načteny ze souboru.{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}Chyba při načítání peers:{Style.RESET_ALL} {e}")
+
     droid_chain = Blockchain(create_genesis=False)
     if os.path.exists(BLOCKCHAIN_DB):
         try:
@@ -1940,15 +2058,6 @@ def load_data():
         
     print(f"{Fore.GREEN}Blockchain validován úspěšně.{Style.RESET_ALL}")
     droid_chain.unconfirmed_transactions = load_mempool(droid_chain)
-    
-    if os.path.exists(PEERS_FILE):
-        try:
-            with open(PEERS_FILE, 'r') as f:
-                peers_data = json.load(f)
-                peers = [tuple(p) for p in peers_data]
-                print(f"{Fore.GREEN}Peers byly načteny ze souboru.{Style.RESET_ALL}")
-        except Exception as e:
-            print(f"{Fore.RED}Chyba při načítání peers:{Style.RESET_ALL} {e}")
             
     return droid_chain, wallets, peers, password
 
@@ -2008,7 +2117,7 @@ class P2PNode:
         self.sync_thread.daemon = True
         self.p2p_log = queue.Queue()
         self.rate_limit = defaultdict(list)
-        self.blacklist = set()
+        self.blacklist = load_blacklist()
         self.tx_rate_limit = defaultdict(list)
         self.awaiting_full_chain = False
 
@@ -2017,7 +2126,7 @@ class P2PNode:
         try:
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             c = conn.cursor()
-            c.execute("SELECT block_hash FROM blocks ORDER BY block_index DESC LIMIT 50")
+            c.execute("SELECT block_hash FROM blocks ORDER BY block_index DESC LIMIT 60")
             for row in c.fetchall():
                 locator.append(row[0])
             conn.close()
@@ -2038,6 +2147,7 @@ class P2PNode:
         
         if len(self.rate_limit[addr[0]]) >= RATE_LIMIT_REQUESTS:
             self.blacklist.add(addr[0])
+            save_blacklist(self.blacklist)
             return True
             
         self.rate_limit[addr[0]].append(now)
@@ -2095,6 +2205,7 @@ class P2PNode:
                  if msglen > MAX_MESSAGE_SIZE:
                      self.add_log(f"{Fore.RED}Přijatá zpráva příliš velká od {addr}: {msglen} bajtů. Odmítnuto.{Style.RESET_ALL}")
                      self.blacklist.add(addr[0])
+                     save_blacklist(self.blacklist)
                      return
                      
                  data_buffer = b''
@@ -2124,6 +2235,7 @@ class P2PNode:
                      if max_depth_exceeded:
                          self.add_log(f"{Fore.RED}Přijatá zpráva má příliš hluboké vnoření. Odmítnuto.{Style.RESET_ALL}")
                          self.blacklist.add(addr[0])
+                         save_blacklist(self.blacklist)
                          return
                          
                      message = json.loads(data_buffer.decode('utf-8'))
@@ -2164,6 +2276,7 @@ class P2PNode:
             self.tx_rate_limit[addr[0]] = [t for t in self.tx_rate_limit[addr[0]] if now - t < TX_RATE_WINDOW]
             if len(self.tx_rate_limit[addr[0]]) >= TX_RATE_LIMIT:
                 self.blacklist.add(addr[0])
+                save_blacklist(self.blacklist)
                 self.add_log(f"{Fore.RED}Překročen limit transakcí od {addr}. Uzel blacklistován.{Style.RESET_ALL}")
                 return
                 
@@ -2419,15 +2532,21 @@ class P2PNode:
             if remote_chain_id != CHAIN_ID:
                 if addr:
                     self.blacklist.add(addr[0])
+                    save_blacklist(self.blacklist)
                 self.add_log(f"{Fore.RED}Handshake selhal od uzlu {ip_port}: nesprávné chain_id {remote_chain_id} (očekáváno {CHAIN_ID}). Uzel blacklistován.{Style.RESET_ALL}")
             elif remote_protocol_version != PROTOCOL_VERSION:
                 if addr:
                     self.blacklist.add(addr[0])
+                    save_blacklist(self.blacklist)
                 self.add_log(f"{Fore.RED}Handshake selhal od uzlu {ip_port}: nekompatibilní protocol_version {remote_protocol_version} (očekáváno {PROTOCOL_VERSION}). Uzel blacklistován.{Style.RESET_ALL}")
             else:
                 self.add_log(f"{Fore.GREEN}Handshake úspěšný od uzlu {ip_port}: software_version={remote_software_version}, protocol_version={remote_protocol_version}, chain_id={remote_chain_id}.{Style.RESET_ALL}")
                 
     def connect_to_peer(self, peer_addr):
+        if self.is_blacklisted(peer_addr):
+            self.add_log(f"{Fore.YELLOW}Spojení zrušeno: Uzel {peer_addr[0]} je na blacklistu.{Style.RESET_ALL}")
+            return False
+            
         if peer_addr not in self.peers:
             try:
                 client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2454,6 +2573,9 @@ class P2PNode:
             self.connect_to_peer(peer)
 
     def _send_to_single_peer(self, peer, data):
+        if self.is_blacklisted(peer):
+            return
+            
         try:
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             client_socket.settimeout(5)
@@ -2462,8 +2584,25 @@ class P2PNode:
             message_length = struct.pack('!I', len(message))
             client_socket.sendall(message_length + message)
             client_socket.close()
+            
+            # Pokud spojení prošlo a uzel byl veden jako offline, ohlásíme návrat
+            if hasattr(self, 'offline_peers') and peer in self.offline_peers:
+                self.offline_peers.remove(peer)
+                self.add_log(f"{Fore.GREEN}Uzel {peer[0]}:{peer[1]} je online{Style.RESET_ALL}")
+                
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            # Vytvoření seznamu offline uzlů, pokud ještě neexistuje
+            if not hasattr(self, 'offline_peers'):
+                self.offline_peers = set()
+                
+            # Pokud spojení selhalo POPRVÉ, zapíšeme to do logu a přidáme ho na seznam
+            if peer not in self.offline_peers:
+                self.offline_peers.add(peer)
+                self.add_log(f"{Fore.RED}Uzel {peer[0]}:{peer[1]} je offline{Style.RESET_ALL}")
+                
         except Exception as e:
-            self.add_log(f"{Fore.RED}Chyba při odesílání dat uzlu {peer}: {e}{Style.RESET_ALL}")
+            # Ostatní divné a nečekané chyby do logu pustíme vždy
+            self.add_log(f"{Fore.RED}Neočekávaná chyba u uzlu {peer[0]}:{peer[1]} - {e}{Style.RESET_ALL}")
 
     def send_data_to_peers(self, data):
         for peer in self.peers:
@@ -2481,6 +2620,9 @@ class P2PNode:
                 self.send_data_to_peers({'type': 'request_mempool'})
 
     def check_peer_connectivity(self, peer, online_peers_list, lock):
+        if self.is_blacklisted(peer):
+            return
+            
         try:
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             client_socket.settimeout(2)
@@ -2561,7 +2703,52 @@ def verify_genesis_block(chain):
         print(f"{Fore.RED}Chyba: Genesis blok byl změněn (timestamp nebo hash nesouhlasí)! Program se ukončuje.{Style.RESET_ALL}")
         sys.exit(1)
 
+def enforce_mobile_environment():
+    machine = platform.machine().lower()
+    is_arm = 'arm' in machine or 'aarch' in machine
+    is_termux = 'TERMUX_VERSION' in os.environ or '/com.termux/' in os.environ.get('PREFIX', '')
+
+    if not (is_arm and is_termux):
+        print(f"\n{Fore.RED}======================================================{Style.RESET_ALL}")
+        print(f"{Fore.RED} CHYBA: Nepovolené prostředí pro běh uzlu!{Style.RESET_ALL}")
+        print(f"{Fore.RED}======================================================{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Tento projekt je navržen výhradně pro mobilní zařízení.{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Podporované prostředí: Termux (ARM/AArch64).{Style.RESET_ALL}")
+        print(f"\nDetekovaná architektura: {machine}")
+        print(f"Detekován Termux: {'Ano' if is_termux else 'Ne'}\n")
+        sys.exit(1)
+
+    try:
+        def getprop(prop):
+            try:
+                return subprocess.check_output(['getprop', prop], stderr=subprocess.DEVNULL).decode('utf-8').strip()
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                return ""
+
+        ro_kernel_qemu = getprop('ro.kernel.qemu')
+        ro_hardware = getprop('ro.hardware').lower()
+        ro_build_characteristics = getprop('ro.build.characteristics').lower()
+
+        is_emulator = False
+        if ro_kernel_qemu == '1':
+            is_emulator = True
+        if ro_hardware in ['ranchu', 'goldfish', 'vbox86', 'nox']:
+            is_emulator = True
+        if 'emulator' in ro_build_characteristics:
+            is_emulator = True
+
+        if is_emulator:
+            print(f"\n{Fore.RED}======================================================{Style.RESET_ALL}")
+            print(f"{Fore.RED} CHYBA: Detekován emulátor!{Style.RESET_ALL}")
+            print(f"{Fore.RED}======================================================{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Spuštění uzlu na Android emulátorech je zablokováno.{Style.RESET_ALL}")
+            sys.exit(1)
+    except Exception:
+        pass
+
 def main():
+    enforce_mobile_environment()
+    
     global wallets
     global p2p_node
     global password
@@ -2578,7 +2765,7 @@ def main():
         p2p_port = 5001
         
     droid_chain, wallets, peers, password = load_data()
-    address_book = load_address_book()
+    address_book = load_address_book(password)
     verify_genesis_block(droid_chain)
     
     p2p_node = P2PNode(droid_chain, P2P_HOST, p2p_port, peers)
@@ -2590,7 +2777,7 @@ def main():
         
     p2p_node.sync_thread.start()
     
-    print(f"\n{Fore.GREEN} Vítejte v {PROJECT_NAME} ({TICKER}) v{SOFTWARE_VERSION} {Style.RESET_ALL}")
+    print(f"\n{Fore.GREEN}Vítejte v {PROJECT_NAME} ({TICKER}) v{SOFTWARE_VERSION} {Style.RESET_ALL}")
     print(f"{Fore.CYAN}Tento uzel běží na portu {p2p_port} | Protokol v{PROTOCOL_VERSION} {Style.RESET_ALL}")
     
     while True:
@@ -2603,6 +2790,8 @@ def main():
                 
             if choice.lower() == 'clear':
                 os.system('cls' if os.name == 'nt' else 'clear')
+                print(f"\n{Fore.GREEN}Vítejte v {PROJECT_NAME} ({TICKER}) v{SOFTWARE_VERSION} {Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Tento uzel běží na portu {p2p_port} | Protokol v{PROTOCOL_VERSION} {Style.RESET_ALL}")
                 continue
                 
             if read_only and choice in ["1", "2"]:
@@ -2644,7 +2833,10 @@ def main():
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Peněženka s adresou '{from_address}' neexistuje. Nejdříve ji vytvořte nebo importujte.")
                     continue
                     
-                to_address = input(f"Zadejte ADRESU příjemce: ")
+                to_address = input(f"Zadejte ADRESU příjemce: ").strip()
+                if len(to_address) >= 3:
+                    to_address = to_address[:3].upper() + to_address[3:].lower()
+
                 if not is_valid_address(to_address):
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný formát adresy příjemce.")
                     continue
@@ -2779,13 +2971,13 @@ def main():
                         
                     target_hex = hex(block.target)[2:]
                     print(f"Blok #{block.index}")
-                    print(f" Verze: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
+                    print(f" Verze bloku: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
                     print(f" Chain ID: {Fore.CYAN}{block.chain_id}{Style.RESET_ALL}")
                     print(f" Hash: {Fore.MAGENTA}{block.hash}{Style.RESET_ALL}")
                     print(f" Merkle root: {Fore.CYAN}{block.merkle_root}{Style.RESET_ALL}")
-                    print(f" Cílový target: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
+                    print(f" Cílová obtížnost: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
                     print(f" Předchozí hash: {Fore.MAGENTA}{block.previous_hash}{Style.RESET_ALL}")
-                    print(f" PoW Nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
+                    print(f" PoW nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
                     print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(block.timestamp))}{Style.RESET_ALL}")
                     print(f" Velikost bloku: {Fore.CYAN}{block.get_size() / 1024:.2f} KB{Style.RESET_ALL}")
                     print(f" Počet potvrzení: {format_confirmations(droid_chain.get_confirmations(block.hash))}")
@@ -2800,7 +2992,7 @@ def main():
                             print(f"   Částka: {Fore.CYAN}{format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                             if tx.from_address != "COINBASE":
                                 print(f"   Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
-                                print(f"   TX Nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
+                                print(f"   TX nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
                             if tx.signature:
                                 print(f"   Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
                             else:
@@ -2817,6 +3009,64 @@ def main():
                 print(f"Celkový počet transakcí: {Fore.CYAN}{len(droid_chain.all_tx_ids)}{Style.RESET_ALL}")
                 print(f"Celkový počet adres: {Fore.CYAN}{len(all_addresses)}{Style.RESET_ALL}")
                 
+                export_choice = input(f"Chcete exportovat blockchain do souboru .txt? (a/n): ").strip().lower()
+                if export_choice == 'a':
+                    try:
+                        with open("blockchain_export.txt", "w", encoding="utf-8") as f:
+                            f.write("--- Blockchain ---\n")
+                            for row in rows:
+                                block_data = {
+                                    'index': row[0],
+                                    'timestamp': row[1],
+                                    'transactions': json.loads(row[2]),
+                                    'previous_hash': row[3],
+                                    'target': row[4],
+                                    'nonce': row[5],
+                                    'hash': row[6],
+                                    'merkle_root': row[7],
+                                    'version': row[8],
+                                    'chain_id': row[9]
+                                }
+                                block = Block.from_dict(block_data)
+                                target_hex = hex(block.target)[2:]
+                                f.write(f"Blok #{block.index}\n")
+                                f.write(f" Verze bloku: {block.version}\n")
+                                f.write(f" Chain ID: {block.chain_id}\n")
+                                f.write(f" Hash: {block.hash}\n")
+                                f.write(f" Merkle root: {block.merkle_root}\n")
+                                f.write(f" Cílová obtížnost: {target_hex}\n")
+                                f.write(f" Předchozí hash: {block.previous_hash}\n")
+                                f.write(f" PoW nonce: {block.nonce}\n")
+                                f.write(f" Čas: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(block.timestamp))}\n")
+                                f.write(f" Velikost bloku: {block.get_size() / 1024:.2f} KB\n")
+                                f.write(f" Počet potvrzení: {droid_chain.get_confirmations(block.hash)}\n")
+                                f.write(f" Počet transakcí: {len(block.transactions)}\n")
+                                
+                                if block.transactions:
+                                    f.write(" Transakce:\n")
+                                    for tx in block.transactions:
+                                        f.write(f" - TX ID: {tx.tx_id}\n")
+                                        f.write(f"   Od: {tx.from_address}\n")
+                                        f.write(f"   Komu: {tx.to_address}\n")
+                                        f.write(f"   Částka: {format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}\n")
+                                        if tx.from_address != "COINBASE":
+                                            f.write(f"   Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}\n")
+                                            f.write(f"   TX nonce: {tx.nonce}\n")
+                                        if tx.signature:
+                                            f.write(f"   Podpis: {tx.signature}\n")
+                                        else:
+                                            f.write(f"   Podpis: žádný\n")
+                                        if tx.data:
+                                            f.write(f"   Zpráva: {tx.data}\n")
+                                f.write("=" * 40 + "\n")
+                            f.write(f"Velikost blockchainu: {total_size_kb:.2f} KB / {total_size_mb:.2f} MB\n")
+                            f.write(f"Celkový počet bloků: {droid_chain.max_block_index + 1}\n")
+                            f.write(f"Celkový počet transakcí: {len(droid_chain.all_tx_ids)}\n")
+                            f.write(f"Celkový počet adres: {len(all_addresses)}\n")
+                        print(f"{Fore.GREEN}Blockchain byl úspěšně exportován do blockchain_export.txt.{Style.RESET_ALL}")
+                    except Exception as e:
+                        print(f"{Fore.RED}Chyba při exportu: {e}{Style.RESET_ALL}")
+
             elif choice == "5":
                 new_wallet = Wallet()
                 wallets[new_wallet.address] = new_wallet
@@ -2925,13 +3175,13 @@ def main():
                             print(f"{Fore.RED}Neplatný formát adresy.{Style.RESET_ALL}")
                         else:
                             address_book[name] = addr
-                            save_address_book(address_book)
+                            save_address_book(address_book, password)
                             print(f"{Fore.GREEN}Adresa '{name}' byla uložena.{Style.RESET_ALL}")
                     elif sub_choice == "2":
                         name = input("Zadejte jméno ke smazání: ").strip()
                         if name in address_book:
                             del address_book[name]
-                            save_address_book(address_book)
+                            save_address_book(address_book, password)
                             print(f"{Fore.GREEN}Adresa '{name}' byla smazána.{Style.RESET_ALL}")
                         else:
                             print(f"{Fore.RED}Jméno '{name}' nenalezeno.{Style.RESET_ALL}")
@@ -3057,6 +3307,61 @@ def main():
                 print(f"Celkový počet: {Fore.CYAN}{total_count}{Style.RESET_ALL}")
                 if pending_list:
                     print(f"Čekající transakce: {Fore.YELLOW}{len(pending_list)}{Style.RESET_ALL}")
+
+                export_choice = input(f"Chcete exportovat historii transakcí do souboru .txt? (a/n): ").strip().lower()
+                if export_choice == 'a':
+                    export_filename = f"history_{address[:10]}.txt"
+                    try:
+                        with open(export_filename, "w", encoding="utf-8") as f:
+                            f.write(f"--- Historie transakcí pro adresu '{address}' ---\n")
+                            if not tx_found:
+                                f.write("Žádné potvrzené transakce nebyly nalezeny.\n")
+                            else:
+                                for _, tx, block_index in tx_list:
+                                    direction = "Odesláno" if tx.from_address == address else "Přijato"
+                                    confirmations = droid_chain.max_block_index - block_index + 1
+                                    
+                                    f.write(f"TX ID: {tx.tx_id}\n")
+                                    f.write(f" Blok: #{block_index}\n")
+                                    f.write(f" Potvrzení: {confirmations}\n")
+                                    f.write(f" Směr: {direction}\n")
+                                    f.write(f" Od: {tx.from_address}\n")
+                                    f.write(f" Komu: {tx.to_address}\n")
+                                    f.write(f" Částka: {format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}\n")
+                                    if tx.from_address != "COINBASE":
+                                        f.write(f" Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}\n")
+                                    f.write(f" Čas: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}\n")
+                                    f.write("-" * 20 + "\n")
+                                    
+                            if pending_list:
+                                f.write("\n--- Čekající transakce (mempool) ---\n")
+                                for tx in pending_list:
+                                    direction = "Odesláno" if tx.from_address == address else "Přijato"
+                                    f.write(f"TX ID: {tx.tx_id}\n")
+                                    f.write(f" Blok: čekající\n")
+                                    f.write(f" Potvrzení: 0 (čekající)\n")
+                                    f.write(f" Směr: {direction}\n")
+                                    f.write(f" Od: {tx.from_address}\n")
+                                    f.write(f" Komu: {tx.to_address}\n")
+                                    f.write(f" Částka: {format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}\n")
+                                    f.write(f" Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}\n")
+                                    f.write(f" Čas: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}\n")
+                                    f.write("-" * 20 + "\n")
+                                    
+                            f.write("\n--- Statistiky historie transakcí ---\n")
+                            f.write(f"Potvrzený zůstatek: {format(confirmed_dec, f'.{DECIMALS}f')} {TICKER}\n")
+                            f.write(f"Odeslané mince: {format(sent_dec, f'.{DECIMALS}f')} {TICKER}\n")
+                            f.write(f"Přijaté mince: {format(received_dec, f'.{DECIMALS}f')} {TICKER}\n")
+                            f.write(f"Součet mincí: {format(total_coins_dec, f'.{DECIMALS}f')} {TICKER}\n")
+                            f.write(f"Odeslané transakce: {sent_count}\n")
+                            f.write(f"Přijaté transakce: {received_count}\n")
+                            f.write(f"Celkový počet: {total_count}\n")
+                            if pending_list:
+                                f.write(f"Čekající transakce: {len(pending_list)}\n")
+                                
+                        print(f"{Fore.GREEN}Historie byla úspěšně exportována do {export_filename}.{Style.RESET_ALL}")
+                    except Exception as e:
+                        print(f"{Fore.RED}Chyba při exportu: {e}{Style.RESET_ALL}")
                     
             elif choice == "14":
                 show_p2p_log()
@@ -3120,13 +3425,13 @@ def main():
                     target_hex = hex(block.target)[2:]
                     print(f"\n{Fore.GREEN}Blok nalezen!{Style.RESET_ALL}")
                     print(f"Blok #{block.index}")
-                    print(f" Verze: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
+                    print(f" Verze bloku: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
                     print(f" Chain ID: {Fore.CYAN}{block.chain_id}{Style.RESET_ALL}")
                     print(f" Hash: {Fore.MAGENTA}{block.hash}{Style.RESET_ALL}")
                     print(f" Merkle root: {Fore.CYAN}{block.merkle_root}{Style.RESET_ALL}")
-                    print(f" Cílový target: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
+                    print(f" Cílová obtížnost: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
                     print(f" Předchozí hash: {Fore.MAGENTA}{block.previous_hash}{Style.RESET_ALL}")
-                    print(f" PoW Nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
+                    print(f" PoW nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
                     print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(block.timestamp))}{Style.RESET_ALL}")
                     print(f" Velikost bloku: {Fore.CYAN}{block.get_size() / 1024:.2f} KB{Style.RESET_ALL}")
                     print(f" Počet potvrzení: {format_confirmations(droid_chain.get_confirmations(block.hash))}")
@@ -3141,7 +3446,7 @@ def main():
                             print(f"   Částka: {Fore.CYAN}{format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                             if tx.from_address != "COINBASE":
                                 print(f"   Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
-                                print(f"   TX Nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
+                                print(f"   TX nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
                             if tx.signature:
                                 print(f"   Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
                             else:
@@ -3164,28 +3469,65 @@ def main():
                     print(f"{Fore.YELLOW}Uzel {new_peer} již v seznamu existuje.{Style.RESET_ALL}")
                     
             elif choice == "19":
-                if p2p_node.peers:
-                    print(f"\n{Fore.YELLOW}--- Uložené uzly ---{Style.RESET_ALL}")
-                    for i, peer in enumerate(p2p_node.peers, 1):
-                        print(f"{i}. {peer[0]}:{peer[1]}")
-                else:
-                    print(f"{Fore.YELLOW}Žádné uzly nejsou uloženy.{Style.RESET_ALL}")
-                    continue
-                    
-                peer_ip = input("Zadejte IP adresu uzlu k odstranění: ")
+                print(" 1. Uložené uzly")
+                print(" 2. Zablokované IP adresy")
+                print(" 3. Zpět")
                 try:
-                    peer_port = int(input("Zadejte port uzlu k odstranění: "))
-                except ValueError:
-                    print(f"{Fore.RED}Neplatný port.{Style.RESET_ALL}")
+                    sub_choice = input("   Zadejte volbu: ").strip()
+                except EOFError:
                     continue
                     
-                peer_to_remove = (peer_ip, peer_port)
-                if peer_to_remove in p2p_node.peers:
-                    p2p_node.peers.remove(peer_to_remove)
-                    save_peers(p2p_node.peers)
-                    print(f"{Fore.GREEN}Uzel {peer_to_remove} byl odstraněn.{Style.RESET_ALL}")
+                if sub_choice == "1":
+                    if p2p_node.peers:
+                        print("   --- Uložené uzly ---")
+                        for i, peer in enumerate(p2p_node.peers, 1):
+                            print(f" {i}. {peer[0]}:{peer[1]}")
+                        try:
+                            idx = int(input("   Zadejte číslo uzlu k odstranění: ").strip())
+                            if 1 <= idx <= len(p2p_node.peers):
+                                peer_to_remove = p2p_node.peers[idx - 1]
+                                block_ip = input(f"Chcete IP adresu uzlu ({peer_to_remove[0]}) před smazáním i zablokovat? (a/n): ").strip().lower()
+                                
+                                p2p_node.peers.remove(peer_to_remove)
+                                save_peers(p2p_node.peers)
+                                
+                                if block_ip == 'a':
+                                    p2p_node.blacklist.add(peer_to_remove[0])
+                                    save_blacklist(p2p_node.blacklist)
+                                    print(f"{Fore.GREEN}Uzel {peer_to_remove[0]}:{peer_to_remove[1]} byl smazán a jeho IP zablokována.{Style.RESET_ALL}")
+                                else:
+                                    print(f"{Fore.GREEN}Uzel {peer_to_remove[0]}:{peer_to_remove[1]} byl smazán.{Style.RESET_ALL}")
+                            else:
+                                print(f"{Fore.RED}Neplatné číslo uzlu.{Style.RESET_ALL}")
+                        except ValueError:
+                            print(f"{Fore.RED}Neplatný vstup.{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.YELLOW}Žádné uzly nejsou uloženy.{Style.RESET_ALL}")
+                        
+                elif sub_choice == "2":
+                    if p2p_node.blacklist:
+                        print("--- Zablokované IP adresy ---")
+                        blocked_list = list(p2p_node.blacklist)
+                        for i, ip in enumerate(blocked_list, 1):
+                            print(f" {i}. {ip}")
+                        try:
+                            idx = int(input("   Zadejte číslo IP adresy k odblokování: ").strip())
+                            if 1 <= idx <= len(blocked_list):
+                                ip_to_remove = blocked_list[idx - 1]
+                                p2p_node.blacklist.remove(ip_to_remove)
+                                save_blacklist(p2p_node.blacklist)
+                                print(f"{Fore.GREEN}IP adresa {ip_to_remove} byla odblokována.{Style.RESET_ALL}")
+                            else:
+                                print(f"{Fore.RED}Neplatné číslo IP adresy.{Style.RESET_ALL}")
+                        except ValueError:
+                            print(f"{Fore.RED}Neplatný vstup.{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.YELLOW}Žádné IP adresy nejsou zablokovány.{Style.RESET_ALL}")
+                        
+                elif sub_choice == "3":
+                    pass
                 else:
-                    print(f"{Fore.RED}Uzel {peer_to_remove} není v seznamu.{Style.RESET_ALL}")
+                    print(f"{Fore.RED}Neplatná volba.{Style.RESET_ALL}")
                     
             elif choice == "20":
                 try:
@@ -3194,13 +3536,13 @@ def main():
                         block = droid_chain.get_block(block_index)
                         target_hex = hex(block.target)[2:]
                         print(f"Blok #{block.index}")
-                        print(f" Verze: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
+                        print(f" Verze bloku: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
                         print(f" Chain ID: {Fore.CYAN}{block.chain_id}{Style.RESET_ALL}")
                         print(f" Hash: {Fore.MAGENTA}{block.hash}{Style.RESET_ALL}")
                         print(f" Merkle root: {Fore.CYAN}{block.merkle_root}{Style.RESET_ALL}")
-                        print(f" Cílový target: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
+                        print(f" Cílová obtížnost: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
                         print(f" Předchozí hash: {Fore.MAGENTA}{block.previous_hash}{Style.RESET_ALL}")
-                        print(f" PoW Nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
+                        print(f" PoW nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
                         print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(block.timestamp))}{Style.RESET_ALL}")
                         print(f" Velikost bloku: {Fore.CYAN}{block.get_size() / 1024:.2f} KB{Style.RESET_ALL}")
                         print(f" Počet potvrzení: {format_confirmations(droid_chain.get_confirmations(block.hash))}")
@@ -3215,7 +3557,7 @@ def main():
                                 print(f"   Částka: {Fore.CYAN}{format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                                 if tx.from_address != "COINBASE":
                                     print(f"   Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
-                                    print(f"   TX Nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
+                                    print(f"   TX nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
                                 if tx.signature:
                                     print(f"   Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
                                 else:
