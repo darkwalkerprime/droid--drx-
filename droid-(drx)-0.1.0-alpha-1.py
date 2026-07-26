@@ -3390,6 +3390,69 @@ def main():
                     if tx.data:
                         print(f" Zpráva: {Fore.YELLOW}{tx.data}{Style.RESET_ALL}")
                     print("-" * 20)
+                    
+                    verify_choice = input(f"{Fore.BLUE}Chcete ověřit platnost této transakce? (a/n): {Style.RESET_ALL}").strip().lower()
+                    if verify_choice == 'a':
+                        print(f"\n{Fore.YELLOW}--- Start podrobného ověření transakce ---{Style.RESET_ALL}")
+                        is_valid = True
+                        
+                        # 1. Kontrola identity
+                        print(f"{Fore.CYAN}[Krok 1]{Style.RESET_ALL} Pokus o odvození adresy odesílatele z veřejného klíče...")
+                        if tx.from_address == "COINBASE":
+                            print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Coinbase transakce nepodléhá kontrole identity.")
+                        else:
+                            if tx.verify_sender_identity():
+                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Odvozená adresa se shoduje s odesílatelem.")
+                            else:
+                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Veřejný klíč neodpovídá deklarované adrese!")
+                                is_valid = False
+                                
+                        # 2. Kontrola podpisu
+                        print(f"{Fore.CYAN}[Krok 2]{Style.RESET_ALL} Ověření ECDSA podpisu dat transakce...")
+                        if tx.from_address == "COINBASE":
+                            print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Coinbase transakce se nepodepisuje.")
+                        else:
+                            if tx.verify_signature():
+                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Kryptografický podpis je platný.")
+                            else:
+                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Neplatný podpis transakce!")
+                                is_valid = False
+                                
+                        # 3. Kontrola částky a poplatku
+                        print(f"{Fore.CYAN}[Krok 3]{Style.RESET_ALL} Kontrola částky a poplatku...")
+                        amount_ok = tx.amount >= MIN_TX_AMOUNT
+                        fee_ok = True if tx.from_address == "COINBASE" else (TX_FEE_MIN <= tx.fee <= TX_FEE_MAX)
+                        
+                        if amount_ok and fee_ok:
+                            print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Částka i poplatek splňují povolené limity sítě.")
+                        else:
+                            print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Částka nebo poplatek jsou mimo limity!")
+                            is_valid = False
+                            
+                        # 4. Kontrola zůstatku
+                        if location == "Mempool" and tx.from_address != "COINBASE":
+                            print(f"{Fore.CYAN}[Krok 4]{Style.RESET_ALL} Kontrola dostatečného zůstatku pro odeslání (včetně pending transakcí)...")
+                            current_available_balance = droid_chain.get_confirmed_balance(tx.from_address)
+                            for tx_in_mempool in droid_chain.unconfirmed_transactions:
+                                if tx_in_mempool.from_address == tx.from_address and tx_in_mempool.tx_id != tx.tx_id:
+                                    current_available_balance -= (tx_in_mempool.amount + tx_in_mempool.fee)
+                                    
+                            if current_available_balance >= (tx.amount + tx.fee):
+                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Odesílatel má dostatečný zůstatek.")
+                            else:
+                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Nedostatečný zůstatek pro tuto transakci!")
+                                is_valid = False
+                        elif location == "Mempool" and tx.from_address == "COINBASE":
+                            print(f"{Fore.CYAN}[Krok 4]{Style.RESET_ALL} Kontrola zůstatku (Přeskočeno pro Coinbase).")
+                        else:
+                            print(f"{Fore.CYAN}[Krok 4]{Style.RESET_ALL} Kontrola zůstatku odesílatele (Přeskočeno - transakce je již zapsána v bloku).")
+                            
+                        # Závěr
+                        print("-" * 40)
+                        if is_valid:
+                            print(f"{Fore.GREEN}CELKOVÝ VERDIKT: TRANSAKCE JE PLATNÁ{Style.RESET_ALL}")
+                        else:
+                            print(f"{Fore.RED}CELKOVÝ VERDIKT: TRANSAKCE JE NEPLATNÁ{Style.RESET_ALL}")
                 else:
                     print(f"{Fore.RED}Transakce s TX ID '{tx_id}' nebyla nalezena.{Style.RESET_ALL}")
                     
@@ -3454,6 +3517,65 @@ def main():
                             if tx.data:
                                 print(f"   Zpráva: {Fore.YELLOW}{tx.data}{Style.RESET_ALL}")
                     print("=" * 40)
+                    
+                    verify_choice = input(f"{Fore.BLUE}Chcete ověřit platnost tohoto bloku? (a/n): {Style.RESET_ALL}").strip().lower()
+                    if verify_choice == 'a':
+                        print(f"\n{Fore.YELLOW}--- Start podrobného ověření bloku #{block.index} ---{Style.RESET_ALL}")
+                        is_valid = True
+                        
+                        # 1. Merkle Root
+                        print(f"{Fore.CYAN}[Krok 1]{Style.RESET_ALL} Výpočet Merkle rootu ze všech transakcí v bloku...")
+                        calc_merkle = compute_merkle_root(block.transactions)
+                        if calc_merkle == block.merkle_root:
+                            print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Vypočítaný Merkle root souhlasí s hlavičkou bloku.")
+                        else:
+                            print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Merkle root nesouhlasí!")
+                            print(f"  Očekáváno: {block.merkle_root}\n  Vypočteno: {calc_merkle}")
+                            is_valid = False
+                            
+                        # 2. Block Hash
+                        print(f"{Fore.CYAN}[Krok 2]{Style.RESET_ALL} Výpočet hashe dat bloku...")
+                        calc_hash = block.compute_hash()
+                        if calc_hash == block.hash:
+                            print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Vypočítaný hash odpovídá deklarovanému hashi bloku.")
+                        else:
+                            print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Hash nesouhlasí!")
+                            print(f"  Očekáváno: {block.hash}\n  Vypočteno: {calc_hash}")
+                            is_valid = False
+                            
+                        # 3. PoW Check
+                        print(f"{Fore.CYAN}[Krok 3]{Style.RESET_ALL} Kontrola Proof of Work (Target obtížnosti)...")
+                        if Blockchain.meets_difficulty(block.hash, block.target):
+                            print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Hash bloku číselně splňuje požadavky Targetu.")
+                        else:
+                            print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Nalezený hash nesplňuje požadovanou obtížnost (PoW je neplatný)!")
+                            is_valid = False
+                            
+                        # 4. Previous Hash Check
+                        print(f"{Fore.CYAN}[Krok 4]{Style.RESET_ALL} Kontrola návaznosti na předchozí blok...")
+                        if block.index == 0:
+                            if block.previous_hash == "0":
+                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Genesis blok nemá předchůdce (previous_hash je správně '0').")
+                            else:
+                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Genesis blok by měl mít previous_hash '0'!")
+                                is_valid = False
+                        else:
+                            prev_block = droid_chain.get_block(block.index - 1)
+                            if prev_block:
+                                if block.previous_hash == prev_block.hash:
+                                    print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - previous_hash korektně navazuje na blok #{prev_block.index}.")
+                                else:
+                                    print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Návaznost přerušena! previous_hash bloku se neshoduje s hashem bloku #{prev_block.index}.")
+                                    is_valid = False
+                            else:
+                                print(f"  {Fore.YELLOW}VAROVÁNÍ{Style.RESET_ALL} - Předchozí blok #{block.index - 1} nebyl nalezen v databázi, nelze ověřit.")
+                                
+                        # Závěr
+                        print("-" * 40)
+                        if is_valid:
+                            print(f"{Fore.GREEN}CELKOVÝ VERDIKT: BLOK JE VALIDNÍ A PLATNÝ{Style.RESET_ALL}")
+                        else:
+                            print(f"{Fore.RED}CELKOVÝ VERDIKT: BLOK JE NEPLATNÝ!{Style.RESET_ALL}")
                 else:
                     print(f"{Fore.RED}Blok s hashem {block_hash} nebyl nalezen.{Style.RESET_ALL}")
                 
@@ -3565,6 +3687,65 @@ def main():
                                 if tx.data:
                                     print(f"   Zpráva: {Fore.YELLOW}{tx.data}{Style.RESET_ALL}")
                         print("=" * 40)
+                        
+                        verify_choice = input(f"{Fore.BLUE}Chcete ověřit platnost tohoto bloku? (a/n): {Style.RESET_ALL}").strip().lower()
+                        if verify_choice == 'a':
+                            print(f"\n{Fore.YELLOW}--- Start podrobného ověření bloku #{block.index} ---{Style.RESET_ALL}")
+                            is_valid = True
+                            
+                            # 1. Merkle Root
+                            print(f"{Fore.CYAN}[Krok 1]{Style.RESET_ALL} Výpočet Merkle rootu ze všech transakcí v bloku...")
+                            calc_merkle = compute_merkle_root(block.transactions)
+                            if calc_merkle == block.merkle_root:
+                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Vypočítaný Merkle root souhlasí s hlavičkou bloku.")
+                            else:
+                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Merkle root nesouhlasí!")
+                                print(f"  Očekáváno: {block.merkle_root}\n  Vypočteno: {calc_merkle}")
+                                is_valid = False
+                                
+                            # 2. Block Hash
+                            print(f"{Fore.CYAN}[Krok 2]{Style.RESET_ALL} Výpočet hashe dat bloku...")
+                            calc_hash = block.compute_hash()
+                            if calc_hash == block.hash:
+                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Vypočítaný hash odpovídá deklarovanému hashi bloku.")
+                            else:
+                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Hash nesouhlasí!")
+                                print(f"  Očekáváno: {block.hash}\n  Vypočteno: {calc_hash}")
+                                is_valid = False
+                                
+                            # 3. PoW Check
+                            print(f"{Fore.CYAN}[Krok 3]{Style.RESET_ALL} Kontrola Proof of Work (Target obtížnosti)...")
+                            if Blockchain.meets_difficulty(block.hash, block.target):
+                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Hash bloku číselně splňuje požadavky Targetu.")
+                            else:
+                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Nalezený hash nesplňuje požadovanou obtížnost (PoW je neplatný)!")
+                                is_valid = False
+                                
+                            # 4. Previous Hash Check
+                            print(f"{Fore.CYAN}[Krok 4]{Style.RESET_ALL} Kontrola návaznosti na předchozí blok...")
+                            if block.index == 0:
+                                if block.previous_hash == "0":
+                                    print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Genesis blok nemá předchůdce (previous_hash je správně '0').")
+                                else:
+                                    print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Genesis blok by měl mít previous_hash '0'!")
+                                    is_valid = False
+                            else:
+                                prev_block = droid_chain.get_block(block.index - 1)
+                                if prev_block:
+                                    if block.previous_hash == prev_block.hash:
+                                        print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - previous_hash korektně navazuje na blok #{prev_block.index}.")
+                                    else:
+                                        print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Návaznost přerušena! previous_hash bloku se neshoduje s hashem bloku #{prev_block.index}.")
+                                        is_valid = False
+                                else:
+                                    print(f"  {Fore.YELLOW}VAROVÁNÍ{Style.RESET_ALL} - Předchozí blok #{block.index - 1} nebyl nalezen v databázi, nelze ověřit.")
+                                    
+                            # Závěr
+                            print("-" * 40)
+                            if is_valid:
+                                print(f"{Fore.GREEN}CELKOVÝ VERDIKT: BLOK JE VALIDNÍ A PLATNÝ{Style.RESET_ALL}")
+                            else:
+                                print(f"{Fore.RED}CELKOVÝ VERDIKT: BLOK JE NEPLATNÝ!{Style.RESET_ALL}")
                     else:
                         print(f"{Fore.RED}Blok s číslem {block_index} neexistuje.{Style.RESET_ALL}")
                 except ValueError:
