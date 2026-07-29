@@ -9,6 +9,7 @@ import socket
 import sys
 import subprocess
 import queue
+import select
 from colorama import Fore, Style, init
 import struct
 from cryptography.hazmat.primitives import hashes
@@ -89,11 +90,15 @@ time_offset = 0
 
 def get_ntp_time(server):
     TIME1970 = 2208988800
+    client = None
     try:
-        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        addr_info = socket.getaddrinfo(server, 123, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        family, socktype, proto, _, sockaddr = addr_info[0]
+        
+        client = socket.socket(family, socktype, proto)
         client.settimeout(5)
         data = b'\x1b' + 47 * b'\0'
-        client.sendto(data, (server, 123))
+        client.sendto(data, sockaddr)
         data, _ = client.recvfrom(1024)
         if data:
             t = struct.unpack('!12I', data)
@@ -106,7 +111,8 @@ def get_ntp_time(server):
     except Exception:
         return None
     finally:
-        client.close()
+        if client:
+            client.close()
     return None
 
 def sync_time_with_ntp():
@@ -2111,8 +2117,18 @@ class P2PNode:
         self.host = host
         self.port = port
         self.peers = initial_peers
+        self.peers_lock = threading.Lock()
+        # Mapování normalizovaná_IP -> naslouchací_port, naplňované z handshake
+        # a z odchozích connect_to_peer, aby bylo možné na request zprávy
+        # odpovídat unicastem (viz send_to_peer / handle_message).
+        self.peer_listen_ports = {}
         self.server_thread = threading.Thread(target=self.start_server)
         self.running = True
+        # Signalizuje hlavnímu vláknu, že fáze bindování portu v
+        # start_server() skončila (ať už úspěchem, nebo chybou), takže
+        # hlavní vlákno může bezpečně zkontrolovat self.running a rozhodnout
+        # se, zda pokračovat, nebo ukončit program.
+        self.ready_event = threading.Event()
         self.sync_thread = threading.Thread(target=self.sync_chain_periodically)
         self.sync_thread.daemon = True
         self.p2p_log = queue.Queue()
@@ -2120,6 +2136,17 @@ class P2PNode:
         self.blacklist = load_blacklist()
         self.tx_rate_limit = defaultdict(list)
         self.awaiting_full_chain = False
+
+    @staticmethod
+    def normalize_ip(ip_str):
+        # IPv6 adresy mohou mít více textových tvarů (např. '::1' vs
+        # '0:0:0:0:0:0:0:1', nebo IPv4-mapované tvary). Aby mapování
+        # IP -> naslouchací port fungovalo spolehlivě, vždy ho indexujeme
+        # podle kanonického tvaru z modulu ipaddress.
+        try:
+            return str(ipaddress.ip_address(ip_str))
+        except ValueError:
+            return ip_str
 
     def get_locator_hashes(self):
         locator = []
@@ -2157,41 +2184,76 @@ class P2PNode:
         return addr[0] in self.blacklist
 
     def is_peer_valid(self, peer_addr):
+        # Pozor: čte self.peers, ale záměrně si zámek nebere sama - všechna
+        # současná volací místa už peers_lock drží (handle_message při
+        # handshake/new_peer). Kdyby si zámek brala i tato metoda, došlo by
+        # k deadlocku (threading.Lock není reentrantní). Volající, který
+        # zámek ještě nedrží, si ho musí obalit sám.
         if len(self.peers) >= MAX_PEERS:
             return False
         return True
 
     def start_server(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            server_socket.bind((self.host, self.port))
-        except OSError:
-            print(f"\n{Fore.RED}Chyba: Port {self.port} je již obsazen jiným procesem. Vypínám uzel.{Style.RESET_ALL}")
+        sockets = []
+        for bind_ip in ['0.0.0.0', '::']:
+            try:
+                addr_info = socket.getaddrinfo(bind_ip, self.port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+                family, socktype, proto, _, sockaddr = addr_info[0]
+                
+                s = socket.socket(family, socktype, proto)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                
+                if family == socket.AF_INET6:
+                    try:
+                        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    except (AttributeError, OSError):
+                        pass
+                        
+                s.bind(sockaddr)
+                s.listen()
+                sockets.append(s)
+            except OSError as e:
+                self.add_log(f"{Fore.YELLOW}Nepodařilo se nabindovat na {bind_ip}:{self.port} - {e}{Style.RESET_ALL}")
+                
+        if not sockets:
+            print(f"\n{Fore.RED}Chyba: Port {self.port} nelze naslouchat na IPv4 ani IPv6. Vypínám uzel.{Style.RESET_ALL}")
             self.running = False
+            self.ready_event.set()
             return
             
-        server_socket.listen()
-        self.add_log(f"{Fore.CYAN}Poslouchám na {self.host}:{self.port}...{Style.RESET_ALL}")
-        server_socket.settimeout(1)
+        self.add_log(f"{Fore.CYAN}Poslouchám na portu {self.port} (IPv4 i IPv6)...{Style.RESET_ALL}")
+        self.ready_event.set()
         
         while self.running:
             try:
-                conn, addr = server_socket.accept()
-                if self.is_blacklisted(addr):
-                    conn.close()
-                    continue
-                if self.is_rate_limited(addr):
-                    conn.close()
-                    continue
+                readable, _, _ = select.select(sockets, [], [], 1.0)
+                for s in readable:
+                    conn, addr = s.accept()
                     
-                client_thread = threading.Thread(target=self.handle_client_connection, args=(conn, addr))
-                client_thread.daemon = True
-                client_thread.start()
-            except socket.timeout:
+                    # Normalizace pro IPv6 z 4-tice na 2-tici (ip, port)
+                    if isinstance(addr, tuple) and len(addr) > 2:
+                        addr = (addr[0], addr[1])
+                        
+                    if self.is_blacklisted(addr):
+                        conn.close()
+                        continue
+                    if self.is_rate_limited(addr):
+                        conn.close()
+                        continue
+                        
+                    client_thread = threading.Thread(target=self.handle_client_connection, args=(conn, addr))
+                    client_thread.daemon = True
+                    client_thread.start()
+            except OSError:
                 pass
             except Exception as e:
                 self.add_log(f"{Fore.RED}Chyba serveru: {e}{Style.RESET_ALL}")
+                
+        for s in sockets:
+            try:
+                s.close()
+            except Exception:
+                pass
 
     def handle_client_connection(self, conn, addr):
         with conn:
@@ -2249,6 +2311,19 @@ class P2PNode:
              except Exception as e:
                  self.add_log(f"{Fore.RED}Chyba spojení s {addr}: {e}{Style.RESET_ALL}")
 
+    def resolve_peer_addr(self, addr):
+        # Spojení je jednorázové, takže addr obsahuje jen náhodný zdrojový
+        # TCP port odesílatele, ne jeho skutečný naslouchací port. Skutečný
+        # naslouchací port dohledáme v mapě naplněné z handshake / connect_to_peer.
+        if not addr:
+            return None
+        normalized_ip = self.normalize_ip(addr[0])
+        with self.peers_lock:
+            listen_port = self.peer_listen_ports.get(normalized_ip)
+        if listen_port is None:
+            return None
+        return (addr[0], listen_port)
+
     def handle_message(self, message, addr=None):
         try:
             timestamp = get_time()
@@ -2257,7 +2332,7 @@ class P2PNode:
             formatted_time = "Neznámý čas"
             
         if addr:
-            ip_port = f"{addr[0]}:{addr[1]}"
+            ip_port = f"[{addr[0]}]:{addr[1]}" if ':' in addr[0] else f"{addr[0]}:{addr[1]}"
         else:
             ip_port = "neznámý uzel"
             
@@ -2291,11 +2366,18 @@ class P2PNode:
                 self.add_log(f"{Fore.RED}Přijatá transakce je neplatná, odmítnuta.{Style.RESET_ALL}")
                 
         elif msg_type == 'request_chain_info':
-            self.add_log(f"{Fore.YELLOW}Přijat požadavek na info o řetězci, odesílám...{Style.RESET_ALL}")
             local_length = self.blockchain.max_block_index + 1
             local_last_hash = self.blockchain.get_last_block().hash
             local_cum_work = self.blockchain.get_cumulative_work()
-            self.send_data_to_peers({'type': 'response_chain_info', 'data': {'length': local_length, 'last_hash': local_last_hash, 'cum_work': local_cum_work}})
+            response = {'type': 'response_chain_info', 'data': {'length': local_length, 'last_hash': local_last_hash, 'cum_work': local_cum_work}}
+
+            responder_addr = self.resolve_peer_addr(addr)
+            if responder_addr:
+                self.add_log(f"{Fore.YELLOW}Přijat požadavek na info o řetězci od {ip_port}, odesílám unicastem...{Style.RESET_ALL}")
+                self.send_to_peer(responder_addr, response)
+            else:
+                self.add_log(f"{Fore.YELLOW}Přijat požadavek na info o řetězci od {ip_port}, ale naslouchací port není znám. Odesílám broadcastem jako záložní řešení...{Style.RESET_ALL}")
+                self.send_data_to_peers(response)
             
         elif msg_type == 'response_chain_info':
             data = message['data']
@@ -2307,17 +2389,29 @@ class P2PNode:
             local_last_hash = self.blockchain.get_last_block().hash
             local_cum_work = self.blockchain.get_cumulative_work()
 
+            def request_blocks_from_sender():
+                # request_blocks se týká výhradně tohoto konkrétního uzlu
+                # (jen on nám právě oznámil lepší řetězec), proto se posílá
+                # unicastem místo broadcastu na celou síť.
+                requester_addr = self.resolve_peer_addr(addr)
+                request = {'type': 'request_blocks', 'data': {'locator_hashes': self.get_locator_hashes()}}
+                if requester_addr:
+                    self.send_to_peer(requester_addr, request)
+                else:
+                    self.add_log(f"{Fore.YELLOW}Naslouchací port uzlu {ip_port} není znám, žádost o bloky posílám broadcastem jako záložní řešení...{Style.RESET_ALL}")
+                    self.send_data_to_peers(request)
+
             if remote_cum_work > local_cum_work:
                 self.add_log(f"{Fore.YELLOW}Detekován řetězec s větší prací. Žádám o bloky přes inkrementální sync...{Style.RESET_ALL}")
-                self.send_data_to_peers({'type': 'request_blocks', 'data': {'locator_hashes': self.get_locator_hashes()}})
+                request_blocks_from_sender()
             elif remote_cum_work == local_cum_work:
                 if remote_length > local_length:
                     self.add_log(f"{Fore.YELLOW}Stejná práce, ale delší řetězec. Žádám o bloky přes inkrementální sync...{Style.RESET_ALL}")
-                    self.send_data_to_peers({'type': 'request_blocks', 'data': {'locator_hashes': self.get_locator_hashes()}})
+                    request_blocks_from_sender()
                 elif remote_length == local_length:
                     if remote_last_hash < local_last_hash:
                         self.add_log(f"{Fore.YELLOW}Stejná práce i délka, ale lepší hash (tie-breaker). Žádám o bloky přes inkrementální sync...{Style.RESET_ALL}")
-                        self.send_data_to_peers({'type': 'request_blocks', 'data': {'locator_hashes': self.get_locator_hashes()}})
+                        request_blocks_from_sender()
                     else:
                         self.add_log(f"{Fore.GREEN}Řetězce synchronizovány (stejná práce i délka, náš hash je lepší nebo stejný).{Style.RESET_ALL}")
                 else:
@@ -2340,7 +2434,6 @@ class P2PNode:
                         start_index = row[0] + 1
                         break
 
-            self.add_log(f"{Fore.YELLOW}Přijat požadavek na bloky, odesílám od indexu {start_index}...{Style.RESET_ALL}")
             c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index >= ? ORDER BY block_index", (start_index,))
             rows = c.fetchall()
             conn.close()
@@ -2359,7 +2452,15 @@ class P2PNode:
                     'version': row[8],
                     'chain_id': row[9]
                 })
-            self.send_data_to_peers({'type': 'response_blocks', 'data': blocks_data})
+            response = {'type': 'response_blocks', 'data': blocks_data}
+
+            responder_addr = self.resolve_peer_addr(addr)
+            if responder_addr:
+                self.add_log(f"{Fore.YELLOW}Přijat požadavek na bloky od {ip_port}, odesílám od indexu {start_index} unicastem...{Style.RESET_ALL}")
+                self.send_to_peer(responder_addr, response)
+            else:
+                self.add_log(f"{Fore.YELLOW}Přijat požadavek na bloky od {ip_port}, ale naslouchací port není znám. Odesílám broadcastem jako záložní řešení...{Style.RESET_ALL}")
+                self.send_data_to_peers(response)
 
         elif msg_type == 'response_blocks':
             blocks_data = message['data']
@@ -2403,9 +2504,15 @@ class P2PNode:
                 conn.close()
 
                 if not prefix_rows and first_block_index != 0:
-                    self.add_log(f"{Fore.RED}Nedokážu navázat přijaté bloky na svůj chain. Fallback na full sync...{Style.RESET_ALL}")
                     self.awaiting_full_chain = True
-                    self.send_data_to_peers({'type': 'request_full_chain'})
+                    request = {'type': 'request_full_chain'}
+                    requester_addr = self.resolve_peer_addr(addr)
+                    if requester_addr:
+                        self.add_log(f"{Fore.RED}Nedokážu navázat přijaté bloky na svůj chain. Fallback na full sync od {ip_port}...{Style.RESET_ALL}")
+                        self.send_to_peer(requester_addr, request)
+                    else:
+                        self.add_log(f"{Fore.RED}Nedokážu navázat přijaté bloky na svůj chain. Naslouchací port uzlu {ip_port} není znám, fallback na full sync posílám broadcastem...{Style.RESET_ALL}")
+                        self.send_data_to_peers(request)
                     return
 
                 full_new_chain_data = []
@@ -2431,7 +2538,6 @@ class P2PNode:
                     self.add_log(f"{Fore.RED}Navrhovaný fork není platný nebo nemá větší váhu. Odmítnuto.{Style.RESET_ALL}")
                 
         elif msg_type == 'request_full_chain':
-            self.add_log(f"{Fore.YELLOW}Přijat požadavek na celý řetězec, odesílám...{Style.RESET_ALL}")
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             c = conn.cursor()
             c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index")
@@ -2449,7 +2555,15 @@ class P2PNode:
                 'chain_id': row[9]
             }).to_dict() for row in rows]
             conn.close()
-            self.send_data_to_peers({'type': 'response_full_chain', 'data': chain_data})
+            response = {'type': 'response_full_chain', 'data': chain_data}
+
+            responder_addr = self.resolve_peer_addr(addr)
+            if responder_addr:
+                self.add_log(f"{Fore.YELLOW}Přijat požadavek na celý řetězec od {ip_port}, odesílám unicastem...{Style.RESET_ALL}")
+                self.send_to_peer(responder_addr, response)
+            else:
+                self.add_log(f"{Fore.YELLOW}Přijat požadavek na celý řetězec od {ip_port}, ale naslouchací port není znám. Odesílám broadcastem jako záložní řešení...{Style.RESET_ALL}")
+                self.send_data_to_peers(response)
             
         elif msg_type == 'response_full_chain':
             if not getattr(self, 'awaiting_full_chain', False):
@@ -2488,15 +2602,28 @@ class P2PNode:
                 exists = c.fetchone() is not None
                 conn.close()
                 if exists:
-                    self.add_log(f"{Fore.YELLOW}Přijatý blok není navázaný na náš poslední blok. Zahajuji synchronizaci...{Style.RESET_ALL}")
-                    self.send_data_to_peers({'type': 'request_chain_info'})
+                    request = {'type': 'request_chain_info'}
+                    requester_addr = self.resolve_peer_addr(addr)
+                    if requester_addr:
+                        self.add_log(f"{Fore.YELLOW}Přijatý blok není navázaný na náš poslední blok. Zahajuji synchronizaci s {ip_port}...{Style.RESET_ALL}")
+                        self.send_to_peer(requester_addr, request)
+                    else:
+                        self.add_log(f"{Fore.YELLOW}Přijatý blok není navázaný na náš poslední blok. Naslouchací port uzlu {ip_port} není znám, žádám o info broadcastem...{Style.RESET_ALL}")
+                        self.send_data_to_peers(request)
                 else:
                     self.blockchain.add_orphan_block(new_block)
                     self.add_log(f"{Fore.YELLOW}Přijat orphan blok {new_block.index}, uložen do poolu.{Style.RESET_ALL}")
                 
         elif msg_type == 'request_mempool':
-            self.add_log(f"{Fore.YELLOW}Přijat požadavek na mempool, odesílám...{Style.RESET_ALL}")
-            self.send_data_to_peers({'type': 'response_mempool', 'data': [tx.to_dict() for tx in self.blockchain.unconfirmed_transactions]})
+            response = {'type': 'response_mempool', 'data': [tx.to_dict() for tx in self.blockchain.unconfirmed_transactions]}
+
+            responder_addr = self.resolve_peer_addr(addr)
+            if responder_addr:
+                self.add_log(f"{Fore.YELLOW}Přijat požadavek na mempool od {ip_port}, odesílám unicastem...{Style.RESET_ALL}")
+                self.send_to_peer(responder_addr, response)
+            else:
+                self.add_log(f"{Fore.YELLOW}Přijat požadavek na mempool od {ip_port}, ale naslouchací port není znám. Odesílám broadcastem jako záložní řešení...{Style.RESET_ALL}")
+                self.send_data_to_peers(response)
             
         elif msg_type == 'response_mempool':
             tx_data_list = message['data']
@@ -2518,11 +2645,16 @@ class P2PNode:
                 is_allowed_ip = not (ip.is_loopback or ip.is_private or ip.is_multicast or ip.is_reserved or ip.is_unspecified)
             except ValueError:
                 is_allowed_ip = False
-                
-            if is_allowed_ip and new_peer_addr not in self.peers and new_peer_addr != (self.host, self.port) and self.is_peer_valid(new_peer_addr):
-                self.connect_to_peer(new_peer_addr)
-            elif not is_allowed_ip:
-                 self.add_log(f"{Fore.YELLOW}Zpráva 'new_peer' ignorována: Adresa {new_peer_addr[0]} není povolená veřejná IP.{Style.RESET_ALL}")
+
+            if is_allowed_ip:
+                with self.peers_lock:
+                    should_connect = new_peer_addr not in self.peers and new_peer_addr != (self.host, self.port) and self.is_peer_valid(new_peer_addr)
+                # connect_to_peer acquírí peers_lock sám uvnitř, proto ho voláme
+                # až po uvolnění zámku zde, aby nedošlo k deadlocku.
+                if should_connect:
+                    self.connect_to_peer(new_peer_addr)
+            else:
+                self.add_log(f"{Fore.YELLOW}Zpráva 'new_peer' ignorována: Adresa {new_peer_addr[0]} není povolená veřejná IP.{Style.RESET_ALL}")
                 
         elif msg_type == 'handshake':
             remote_protocol_version = message.get('protocol_version')
@@ -2541,45 +2673,99 @@ class P2PNode:
                 self.add_log(f"{Fore.RED}Handshake selhal od uzlu {ip_port}: nekompatibilní protocol_version {remote_protocol_version} (očekáváno {PROTOCOL_VERSION}). Uzel blacklistován.{Style.RESET_ALL}")
             else:
                 self.add_log(f"{Fore.GREEN}Handshake úspěšný od uzlu {ip_port}: software_version={remote_software_version}, protocol_version={remote_protocol_version}, chain_id={remote_chain_id}.{Style.RESET_ALL}")
+
+                # Handshake spojení je jednorázové, takže addr[1] je jen
+                # náhodný zdrojový TCP port. Skutečný naslouchací port
+                # odesílatele proto musí dorazit v payloadu zprávy.
+                remote_listen_port = message.get('listen_port')
+
+                if addr and isinstance(remote_listen_port, int) and 0 < remote_listen_port <= 65535:
+                    normalized_ip = self.normalize_ip(addr[0])
+                    with self.peers_lock:
+                        self.peer_listen_ports[normalized_ip] = remote_listen_port
+
+                    new_peer_addr = (addr[0], remote_listen_port)
+                    try:
+                        ip_obj = ipaddress.ip_address(addr[0])
+                        is_allowed_ip = not (ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified)
+                    except ValueError:
+                        is_allowed_ip = False
+
+                    if is_allowed_ip and new_peer_addr != (self.host, self.port):
+                        added = False
+                        with self.peers_lock:
+                            if new_peer_addr not in self.peers and self.is_peer_valid(new_peer_addr):
+                                self.peers.append(new_peer_addr)
+                                added = True
+                            peers_snapshot = list(self.peers)
+
+                        if added:
+                            save_peers(peers_snapshot)
+                            self.add_log(f"{Fore.GREEN}Uzel {ip_port} (naslouchá na portu {remote_listen_port}) byl automaticky přidán do peers.{Style.RESET_ALL}")
                 
     def connect_to_peer(self, peer_addr):
         if self.is_blacklisted(peer_addr):
             self.add_log(f"{Fore.YELLOW}Spojení zrušeno: Uzel {peer_addr[0]} je na blacklistu.{Style.RESET_ALL}")
             return False
-            
-        if peer_addr not in self.peers:
+
+        with self.peers_lock:
+            already_peer = peer_addr in self.peers
+
+        if not already_peer:
             try:
-                client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                addr_info = socket.getaddrinfo(peer_addr[0], peer_addr[1], socket.AF_UNSPEC, socket.SOCK_STREAM)
+                family, socktype, proto, _, sockaddr = addr_info[0]
+                
+                client_socket = socket.socket(family, socktype, proto)
                 client_socket.settimeout(3)
-                client_socket.connect(peer_addr)
-                self.peers.append(peer_addr)
+                client_socket.connect(sockaddr)
+
+                with self.peers_lock:
+                    self.peers.append(peer_addr)
+                    # Jelikož jsme spojení navázali my sami, známe naslouchací
+                    # port protistrany přímo z peer_addr - není třeba čekat
+                    # na zpětný handshake, abychom jí mohli odpovídat unicastem.
+                    self.peer_listen_ports[self.normalize_ip(peer_addr[0])] = peer_addr[1]
+                    peers_snapshot = list(self.peers)
+
                 self.add_log(f"{Fore.GREEN}Úspěšně připojeno k uzlu {peer_addr}{Style.RESET_ALL}")
-                
-                self.send_data_to_peers({'type': 'handshake', 'protocol_version': PROTOCOL_VERSION, 'software_version': SOFTWARE_VERSION, 'chain_id': CHAIN_ID})
-                self.send_data_to_peers({'type': 'request_mempool'})
-                self.send_data_to_peers({'type': 'request_chain_info'})
-                
-                save_peers(self.peers)
+
+                # Handshake i navazující požadavky se týkají výhradně tohoto
+                # nově připojeného uzlu, proto se posílají unicastem, ne
+                # broadcastem na celou síť.
+                self.send_to_peer(peer_addr, {'type': 'handshake', 'protocol_version': PROTOCOL_VERSION, 'software_version': SOFTWARE_VERSION, 'chain_id': CHAIN_ID, 'listen_port': self.port})
+                self.send_to_peer(peer_addr, {'type': 'request_mempool'})
+                self.send_to_peer(peer_addr, {'type': 'request_chain_info'})
+
+                save_peers(peers_snapshot)
                 client_socket.close()
                 return True
             except ConnectionRefusedError:
-                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nelze se připojit k uzlu {peer_addr}")
+                peer_str = f"[{peer_addr[0]}]:{peer_addr[1]}" if ':' in peer_addr[0] else f"{peer_addr[0]}:{peer_addr[1]}"
+                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nelze se připojit k uzlu {peer_str}")
             except Exception as e:
                 print(f"{Fore.RED}Chyba při připojování:{Style.RESET_ALL} {e}")
         return False
 
     def connect_to_all_peers(self):
-        for peer in list(self.peers):
+        with self.peers_lock:
+            peers_snapshot = list(self.peers)
+        for peer in peers_snapshot:
             self.connect_to_peer(peer)
 
     def _send_to_single_peer(self, peer, data):
         if self.is_blacklisted(peer):
             return
             
+        peer_str = f"[{peer[0]}]:{peer[1]}" if ':' in peer[0] else f"{peer[0]}:{peer[1]}"
+        
         try:
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            addr_info = socket.getaddrinfo(peer[0], peer[1], socket.AF_UNSPEC, socket.SOCK_STREAM)
+            family, socktype, proto, _, sockaddr = addr_info[0]
+            
+            client_socket = socket.socket(family, socktype, proto)
             client_socket.settimeout(5)
-            client_socket.connect(peer)
+            client_socket.connect(sockaddr)
             message = json.dumps(data).encode('utf-8')
             message_length = struct.pack('!I', len(message))
             client_socket.sendall(message_length + message)
@@ -2588,7 +2774,7 @@ class P2PNode:
             # Pokud spojení prošlo a uzel byl veden jako offline, ohlásíme návrat
             if hasattr(self, 'offline_peers') and peer in self.offline_peers:
                 self.offline_peers.remove(peer)
-                self.add_log(f"{Fore.GREEN}Uzel {peer[0]}:{peer[1]} je online{Style.RESET_ALL}")
+                self.add_log(f"{Fore.GREEN}Uzel {peer_str} je online{Style.RESET_ALL}")
                 
         except (ConnectionRefusedError, socket.timeout, OSError):
             # Vytvoření seznamu offline uzlů, pokud ještě neexistuje
@@ -2598,14 +2784,25 @@ class P2PNode:
             # Pokud spojení selhalo POPRVÉ, zapíšeme to do logu a přidáme ho na seznam
             if peer not in self.offline_peers:
                 self.offline_peers.add(peer)
-                self.add_log(f"{Fore.RED}Uzel {peer[0]}:{peer[1]} je offline{Style.RESET_ALL}")
+                self.add_log(f"{Fore.RED}Uzel {peer_str} je offline{Style.RESET_ALL}")
                 
         except Exception as e:
             # Ostatní divné a nečekané chyby do logu pustíme vždy
-            self.add_log(f"{Fore.RED}Neočekávaná chyba u uzlu {peer[0]}:{peer[1]} - {e}{Style.RESET_ALL}")
+            self.add_log(f"{Fore.RED}Neočekávaná chyba u uzlu {peer_str} - {e}{Style.RESET_ALL}")
+
+    def send_to_peer(self, peer_addr, data):
+        # Oficiální veřejná metoda pro unicast - odešle data pouze jedinému
+        # konkrétnímu peeru (na rozdíl od send_data_to_peers, který je
+        # broadcastuje všem). Odeslání běží v samostatném vlákně, stejně
+        # jako u broadcastu, aby nezablokovalo volajícího.
+        thread = threading.Thread(target=self._send_to_single_peer, args=(peer_addr, data))
+        thread.daemon = True
+        thread.start()
 
     def send_data_to_peers(self, data):
-        for peer in self.peers:
+        with self.peers_lock:
+            peers_snapshot = list(self.peers)
+        for peer in peers_snapshot:
             thread = threading.Thread(target=self._send_to_single_peer, args=(peer, data))
             thread.daemon = True
             thread.start()
@@ -2614,7 +2811,9 @@ class P2PNode:
         while self.running:
             time.sleep(10)
             self.blockchain.cleanup_mempool()
-            if self.peers:
+            with self.peers_lock:
+                has_peers = bool(self.peers)
+            if has_peers:
                 self.add_log(f"{Fore.YELLOW}Synchronizuji blockchain a mempool se sousedními uzly...{Style.RESET_ALL}")
                 self.send_data_to_peers({'type': 'request_chain_info'})
                 self.send_data_to_peers({'type': 'request_mempool'})
@@ -2624,9 +2823,12 @@ class P2PNode:
             return
             
         try:
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            addr_info = socket.getaddrinfo(peer[0], peer[1], socket.AF_UNSPEC, socket.SOCK_STREAM)
+            family, socktype, proto, _, sockaddr = addr_info[0]
+            
+            client_socket = socket.socket(family, socktype, proto)
             client_socket.settimeout(2)
-            client_socket.connect(peer)
+            client_socket.connect(sockaddr)
             client_socket.close()
             with lock:
                 online_peers_list.append(peer)
@@ -2637,8 +2839,11 @@ class P2PNode:
         online_peers = []
         threads = []
         lock = threading.Lock()
-        
-        for peer in self.peers:
+
+        with self.peers_lock:
+            peers_snapshot = list(self.peers)
+
+        for peer in peers_snapshot:
             thread = threading.Thread(target=self.check_peer_connectivity, args=(peer, online_peers, lock))
             thread.daemon = True
             threads.append(thread)
@@ -2772,8 +2977,15 @@ def main():
     p2p_node.server_thread.daemon = True
     p2p_node.server_thread.start()
     
+    # Počkáme, až start_server() skutečně dokončí pokus o bind (úspěšně,
+    # nebo neúspěšně). Bez tohoto čekání se self.running kontrolovalo
+    # okamžitě po start(), tedy ještě předtím, než vlákno vůbec stihlo
+    # zkusit bind - proto se program i po chybě portu spustil dál.
+    p2p_node.ready_event.wait()
+    
     if not p2p_node.running:
-        return
+        print(f"{Fore.RED}Uzel se nepodařilo spustit, program se ukončuje.{Style.RESET_ALL}")
+        sys.exit(1)
         
     p2p_node.sync_thread.start()
     
@@ -3201,7 +3413,8 @@ def main():
                             status = f"{Fore.GREEN}[ONLINE]{Style.RESET_ALL}"
                         else:
                             status = f"{Fore.RED}[OFFLINE]{Style.RESET_ALL}"
-                        print(f"  {Fore.CYAN}{peer[0]}:{peer[1]}{Style.RESET_ALL} {status}")
+                        peer_str = f"[{peer[0]}]:{peer[1]}" if ':' in peer[0] else f"{peer[0]}:{peer[1]}"
+                        print(f"  {Fore.CYAN}{peer_str}{Style.RESET_ALL} {status}")
                         
             elif choice == "12":
                 p2p_node.running = False
@@ -3580,15 +3793,19 @@ def main():
                     print(f"{Fore.RED}Blok s hashem {block_hash} nebyl nalezen.{Style.RESET_ALL}")
                 
             elif choice == "18":
-                peer_ip = input("Zadejte IP adresu uzlu k přidání: ")
-                peer_port = int(input("Zadejte port uzlu: "))
-                new_peer = (peer_ip, peer_port)
-                if new_peer not in p2p_node.peers:
-                    p2p_node.peers.append(new_peer)
-                    save_peers(p2p_node.peers)
-                    print(f"{Fore.GREEN}Uzel {new_peer} byl přidán do seznamu.{Style.RESET_ALL}")
-                else:
-                    print(f"{Fore.YELLOW}Uzel {new_peer} již v seznamu existuje.{Style.RESET_ALL}")
+                peer_ip = input("Zadejte IP adresu uzlu k přidání: ").strip()
+                try:
+                    peer_port = int(input("Zadejte port uzlu: ").strip())
+                    new_peer = (peer_ip, peer_port)
+                    print(f"{Fore.YELLOW}Pokouším se připojit k uzlu {new_peer}...{Style.RESET_ALL}")
+                    
+                    # Zásadní změna: Voláme oficiální metodu pro připojení!
+                    if p2p_node.connect_to_peer(new_peer):
+                        print(f"{Fore.GREEN}Požadavek na propojení odeslán! (Zkontrolujte stav uzlů přes volbu 11){Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.RED}Připojení selhalo. Uzel je možná offline, již existuje, nebo je blokován.{Style.RESET_ALL}")
+                except ValueError:
+                    print(f"{Fore.RED}Neplatný formát portu.{Style.RESET_ALL}")
                     
             elif choice == "19":
                 print(" 1. Uložené uzly")
@@ -3600,25 +3817,40 @@ def main():
                     continue
                     
                 if sub_choice == "1":
-                    if p2p_node.peers:
+                    # KROK 1: Rychlé a bezpečné načtení kopie seznamu
+                    with p2p_node.peers_lock:
+                        current_peers = list(p2p_node.peers)
+
+                    if current_peers:
                         print("   --- Uložené uzly ---")
-                        for i, peer in enumerate(p2p_node.peers, 1):
-                            print(f" {i}. {peer[0]}:{peer[1]}")
+                        for i, peer in enumerate(current_peers, 1):
+                            peer_str = f"[{peer[0]}]:{peer[1]}" if ':' in peer[0] else f"{peer[0]}:{peer[1]}"
+                            print(f" {i}. {peer_str}")
                         try:
                             idx = int(input("   Zadejte číslo uzlu k odstranění: ").strip())
-                            if 1 <= idx <= len(p2p_node.peers):
-                                peer_to_remove = p2p_node.peers[idx - 1]
+                            if 1 <= idx <= len(current_peers):
+                                peer_to_remove = current_peers[idx - 1]
+                                peer_str_rm = f"[{peer_to_remove[0]}]:{peer_to_remove[1]}" if ':' in peer_to_remove[0] else f"{peer_to_remove[0]}:{peer_to_remove[1]}"
                                 block_ip = input(f"Chcete IP adresu uzlu ({peer_to_remove[0]}) před smazáním i zablokovat? (a/n): ").strip().lower()
                                 
-                                p2p_node.peers.remove(peer_to_remove)
-                                save_peers(p2p_node.peers)
+                                # KROK 2: Bezpečné smazání ze skutečného seznamu a vytvoření dat k uložení
+                                with p2p_node.peers_lock:
+                                    if peer_to_remove in p2p_node.peers:
+                                        p2p_node.peers.remove(peer_to_remove)
+                                    # Smaže i zastaralý záznam naslouchacího portu, aby po
+                                    # odebrání peera přestal fungovat i fallback unicast
+                                    # odpovědí na jeho případné pozdější požadavky.
+                                    p2p_node.peer_listen_ports.pop(p2p_node.normalize_ip(peer_to_remove[0]), None)
+                                    peers_to_save = list(p2p_node.peers)
+
+                                save_peers(peers_to_save)
                                 
                                 if block_ip == 'a':
                                     p2p_node.blacklist.add(peer_to_remove[0])
                                     save_blacklist(p2p_node.blacklist)
-                                    print(f"{Fore.GREEN}Uzel {peer_to_remove[0]}:{peer_to_remove[1]} byl smazán a jeho IP zablokována.{Style.RESET_ALL}")
+                                    print(f"{Fore.GREEN}Uzel {peer_str_rm} byl smazán a jeho IP zablokována.{Style.RESET_ALL}")
                                 else:
-                                    print(f"{Fore.GREEN}Uzel {peer_to_remove[0]}:{peer_to_remove[1]} byl smazán.{Style.RESET_ALL}")
+                                    print(f"{Fore.GREEN}Uzel {peer_str_rm} byl smazán.{Style.RESET_ALL}")
                             else:
                                 print(f"{Fore.RED}Neplatné číslo uzlu.{Style.RESET_ALL}")
                         except ValueError:
