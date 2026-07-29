@@ -46,7 +46,6 @@ DIFFICULTY_ADJUSTMENT_INTERVAL = 10
 TARGET_BLOCK_TIME = BLOCK_TIME_SECONDS * (DIFFICULTY_ADJUSTMENT_INTERVAL)
 INITIAL_DIFFICULTY_BITS = 20
 FIXED_TARGET = (1 << 256) >> INITIAL_DIFFICULTY_BITS
-DYNAMIC_DIFFICULTY_ADJUSTMENT = True
 
 BLOCKCHAIN_DB = 'blockchain.db'
 WALLETS_FILE = 'wallets.json.enc'
@@ -72,11 +71,9 @@ MAX_PEERS = 20
 RATE_LIMIT_REQUESTS = 10
 RATE_LIMIT_WINDOW = 1
 MAX_MESSAGE_SIZE = 10 * 1024 * 1024
-ALLOW_EMPTY_BLOCKS = True
 
 TX_RATE_LIMIT = 100
 TX_RATE_WINDOW = 60
-ALLOW_NTP_SERVERS = True
 SOFTWARE_VERSION = "0.1.0-alpha.1"
 PROTOCOL_VERSION = 1
 BLOCK_VERSION = 1
@@ -118,10 +115,6 @@ def get_ntp_time(server):
 def sync_time_with_ntp():
     global time_offset
     available_servers = []
-    if not ALLOW_NTP_SERVERS:
-        print(f"{Fore.YELLOW}NTP synchronizace je vypnuta (ALLOW_NTP_SERVERS = False).{Style.RESET_ALL}")
-        return
-
     for server in NTP_SERVERS:
         try:
             ntp_time = get_ntp_time(server)
@@ -664,9 +657,6 @@ class Blockchain:
         return False
 
     def get_target(self, new_timestamp=None):
-        if not DYNAMIC_DIFFICULTY_ADJUSTMENT:
-            return FIXED_TARGET
-            
         last_block = self.get_last_block()
         new_block_index = last_block.index + 1
         
@@ -751,9 +741,6 @@ class Blockchain:
         return (timestamps[mid - 1] + timestamps[mid]) // 2
 
     def calculate_expected_target(self, new_block_index, chain=None, new_timestamp=None):
-        if not DYNAMIC_DIFFICULTY_ADJUSTMENT:
-            return FIXED_TARGET
-            
         if chain is None:
             last_block = self.get_block(new_block_index - 1)
         else:
@@ -1129,10 +1116,6 @@ class Blockchain:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Překročení maximální nabídky mincí.{Style.RESET_ALL}")
                 return False
 
-            if not ALLOW_EMPTY_BLOCKS and len(block.transactions) <= 1:
-                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Blok je prázdný (obsahuje pouze coinbase transakci).{Style.RESET_ALL}")
-                return False
-
             temp_balance_changes = defaultdict(int)
             for tx in block.transactions:
                 if tx.from_address != "COINBASE":
@@ -1296,10 +1279,6 @@ class Blockchain:
                         
             new_block_transactions += selected_txs
             
-            if not ALLOW_EMPTY_BLOCKS and len(new_block_transactions) == 1 and not self.unconfirmed_transactions:
-                print(f"{Fore.YELLOW}Upozornění:{Style.RESET_ALL} V mempoolu nejsou žádné transakce k vytěžení. Těžba nebyla spuštěna.")
-                return False
-                
             final_reward = current_reward + total_fees
             if final_reward == 0:
                 print(f"{Fore.YELLOW}Upozornění:{Style.RESET_ALL} Maximální nabídka byla dosažena a nejsou k dispozici žádné transakce k vytěžení.")
@@ -2124,11 +2103,11 @@ class P2PNode:
         self.peer_listen_ports = {}
         self.server_thread = threading.Thread(target=self.start_server)
         self.running = True
-        # Signalizuje hlavnímu vláknu, že fáze bindování portu v
-        # start_server() skončila (ať už úspěchem, nebo chybou), takže
-        # hlavní vlákno může bezpečně zkontrolovat self.running a rozhodnout
-        # se, zda pokračovat, nebo ukončit program.
-        self.ready_event = threading.Event()
+        # Nastaveno vláknem start_server hned po dokončení pokusu o
+        # nabindování portů (úspěšném i neúspěšném). main() na tuto
+        # událost čeká, aby nevykreslil menu dřív, než je jisté, zda se
+        # uzel skutečně podařilo spustit (viz start_server / bind_ready).
+        self.bind_ready = threading.Event()
         self.sync_thread = threading.Thread(target=self.sync_chain_periodically)
         self.sync_thread.daemon = True
         self.p2p_log = queue.Queue()
@@ -2218,11 +2197,11 @@ class P2PNode:
         if not sockets:
             print(f"\n{Fore.RED}Chyba: Port {self.port} nelze naslouchat na IPv4 ani IPv6. Vypínám uzel.{Style.RESET_ALL}")
             self.running = False
-            self.ready_event.set()
+            self.bind_ready.set()
             return
             
         self.add_log(f"{Fore.CYAN}Poslouchám na portu {self.port} (IPv4 i IPv6)...{Style.RESET_ALL}")
-        self.ready_event.set()
+        self.bind_ready.set()
         
         while self.running:
             try:
@@ -2977,15 +2956,14 @@ def main():
     p2p_node.server_thread.daemon = True
     p2p_node.server_thread.start()
     
-    # Počkáme, až start_server() skutečně dokončí pokus o bind (úspěšně,
-    # nebo neúspěšně). Bez tohoto čekání se self.running kontrolovalo
-    # okamžitě po start(), tedy ještě předtím, než vlákno vůbec stihlo
-    # zkusit bind - proto se program i po chybě portu spustil dál.
-    p2p_node.ready_event.wait()
+    # Počkat, až vlákno serveru dokončí pokus o nabindování portů, než se
+    # zkontroluje running - jinak by hlavní vlákno mohlo uteci dál a
+    # vykreslit menu dřív, než server stihne zjistit, že port je obsazený
+    # (viz self.bind_ready.set() v start_server).
+    p2p_node.bind_ready.wait()
     
     if not p2p_node.running:
-        print(f"{Fore.RED}Uzel se nepodařilo spustit, program se ukončuje.{Style.RESET_ALL}")
-        sys.exit(1)
+        return
         
     p2p_node.sync_thread.start()
     
