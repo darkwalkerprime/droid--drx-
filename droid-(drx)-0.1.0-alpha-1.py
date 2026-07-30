@@ -31,7 +31,6 @@ import platform
 init(autoreset=True)
 
 # ----------------- GLOBÁLNÍ KONSTANTY -----------------
-CHAIN_ID = 1
 PROJECT_NAME = "Droid"
 TICKER = "DRX"
 DECIMALS = 8
@@ -76,6 +75,7 @@ TX_RATE_LIMIT = 100
 TX_RATE_WINDOW = 60
 SOFTWARE_VERSION = "0.1.0-alpha.1"
 PROTOCOL_VERSION = 1
+CHAIN_ID = 1
 BLOCK_VERSION = 1
 MEMPOOL_TX_EXPIRATION = 86400
 
@@ -2870,9 +2870,9 @@ def print_menu():
     print(f"{Fore.GREEN}14{Style.RESET_ALL} - Zobrazit log P2P sítě")
     print(f"{Fore.GREEN}15{Style.RESET_ALL} - Zobrazit detaily transakce podle TX ID")
     print(f"{Fore.GREEN}16{Style.RESET_ALL} - Zobrazit celkovou nabídku mincí")
-    print(f"{Fore.GREEN}17{Style.RESET_ALL} - Vyhledat blok podle hashe")
+    print(f"{Fore.GREEN}17{Style.RESET_ALL} - Smazat uzel")
     print(f"{Fore.GREEN}18{Style.RESET_ALL} - Manuálně přidat nový uzel")
-    print(f"{Fore.GREEN}19{Style.RESET_ALL} - Smazat uzel")
+    print(f"{Fore.GREEN}19{Style.RESET_ALL} - Zablokované IP adresy")
     print(f"{Fore.GREEN}20{Style.RESET_ALL} - Zobrazit blok")
 
 def verify_genesis_address():
@@ -3320,9 +3320,14 @@ def main():
             elif choice == "7":
                 address_to_delete = input(f"Zadejte ADRESU peněženky, kterou chcete smazat: ")
                 if address_to_delete in wallets:
-                    del wallets[address_to_delete]
-                    print(f"{Fore.GREEN}Peněženka '{address_to_delete}' byla úspěšně smazána.{Style.RESET_ALL}")
-                    save_data(droid_chain, wallets, password, p2p_node.peers)
+                    confirm = input(f"\n{Fore.YELLOW}Jste si jistí že chcete tuto peněženku smazat? Tato akce je nevratná (a/n): {Style.RESET_ALL}").strip().lower()
+                    
+                    if confirm == 'a':
+                        del wallets[address_to_delete]
+                        print(f"\n{Fore.GREEN}Peněženka '{address_to_delete}' byla úspěšně smazána.{Style.RESET_ALL}")
+                        save_data(droid_chain, wallets, password, p2p_node.peers)
+                    else:
+                        print(f"\n{Fore.YELLOW}Akce zrušena. Peněženka nebyla smazána.{Style.RESET_ALL}")
                 else:
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Peněženka s adresou '{address_to_delete}' neexistuje.")
                     
@@ -3655,27 +3660,123 @@ def main():
                 print(f" Maximální nabídka: {Fore.CYAN}{format(Decimal(max_supply) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                 
             elif choice == "17":
-                block_hash = input("Zadejte hash bloku: ").strip()
-                conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-                c = conn.cursor()
-                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_hash = ?", (block_hash,))
-                row = c.fetchone()
-                conn.close()
-                
-                if row:
-                    block_data = {
-                        'index': row[0],
-                        'timestamp': row[1],
-                        'transactions': json.loads(row[2]),
-                        'previous_hash': row[3],
-                        'target': row[4],
-                        'nonce': row[5],
-                        'hash': row[6],
-                        'merkle_root': row[7],
-                        'version': row[8],
-                        'chain_id': row[9]
-                    }
-                    block = Block.from_dict(block_data)
+                # KROK 1: Rychlé a bezpečné načtení kopie seznamu
+                with p2p_node.peers_lock:
+                    current_peers = list(p2p_node.peers)
+
+                if current_peers:
+                    print("   --- Uložené uzly ---")
+                    for i, peer in enumerate(current_peers, 1):
+                        peer_str = f"[{peer[0]}]:{peer[1]}" if ':' in peer[0] else f"{peer[0]}:{peer[1]}"
+                        print(f" {i}. {peer_str}")
+                    try:
+                        idx = int(input("   Zadejte číslo uzlu k odstranění: ").strip())
+                        if 1 <= idx <= len(current_peers):
+                            peer_to_remove = current_peers[idx - 1]
+                            peer_str_rm = f"[{peer_to_remove[0]}]:{peer_to_remove[1]}" if ':' in peer_to_remove[0] else f"{peer_to_remove[0]}:{peer_to_remove[1]}"
+                            block_ip = input(f"Chcete IP adresu uzlu ({peer_to_remove[0]}) před smazáním i zablokovat? (a/n): ").strip().lower()
+                            
+                            # KROK 2: Bezpečné smazání ze skutečného seznamu a vytvoření dat k uložení
+                            with p2p_node.peers_lock:
+                                if peer_to_remove in p2p_node.peers:
+                                    p2p_node.peers.remove(peer_to_remove)
+                                # Smaže i zastaralý záznam naslouchacího portu, aby po
+                                # odebrání peera přestal fungovat i fallback unicast
+                                # odpovědí na jeho případné pozdější požadavky.
+                                p2p_node.peer_listen_ports.pop(p2p_node.normalize_ip(peer_to_remove[0]), None)
+                                peers_to_save = list(p2p_node.peers)
+
+                            save_peers(peers_to_save)
+                            
+                            if block_ip == 'a':
+                                p2p_node.blacklist.add(peer_to_remove[0])
+                                save_blacklist(p2p_node.blacklist)
+                                print(f"{Fore.GREEN}Uzel {peer_str_rm} byl smazán a jeho IP zablokována.{Style.RESET_ALL}")
+                            else:
+                                print(f"{Fore.GREEN}Uzel {peer_str_rm} byl smazán.{Style.RESET_ALL}")
+                        else:
+                            print(f"{Fore.RED}Neplatné číslo uzlu.{Style.RESET_ALL}")
+                    except ValueError:
+                        print(f"{Fore.RED}Neplatný vstup.{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.YELLOW}Žádné uzly nejsou uloženy.{Style.RESET_ALL}")
+                    
+            elif choice == "18":
+                peer_ip = input("Zadejte IP adresu uzlu k přidání: ").strip()
+                try:
+                    peer_port = int(input("Zadejte port uzlu: ").strip())
+                    new_peer = (peer_ip, peer_port)
+                    print(f"{Fore.YELLOW}Pokouším se připojit k uzlu {new_peer}...{Style.RESET_ALL}")
+                    
+                    # Zásadní změna: Voláme oficiální metodu pro připojení!
+                    if p2p_node.connect_to_peer(new_peer):
+                        print(f"{Fore.GREEN}Požadavek na propojení odeslán! (Zkontrolujte stav uzlů přes volbu 11){Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.RED}Připojení selhalo. Uzel je možná offline, již existuje, nebo je blokován.{Style.RESET_ALL}")
+                except ValueError:
+                    print(f"{Fore.RED}Neplatný formát portu.{Style.RESET_ALL}")
+                    
+            elif choice == "19":
+                if p2p_node.blacklist:
+                    print("--- Zablokované IP adresy ---")
+                    blocked_list = list(p2p_node.blacklist)
+                    for i, ip in enumerate(blocked_list, 1):
+                        print(f" {i}. {ip}")
+                    try:
+                        idx = int(input("   Zadejte číslo IP adresy k odblokování: ").strip())
+                        if 1 <= idx <= len(blocked_list):
+                            ip_to_remove = blocked_list[idx - 1]
+                            p2p_node.blacklist.remove(ip_to_remove)
+                            save_blacklist(p2p_node.blacklist)
+                            print(f"{Fore.GREEN}IP adresa {ip_to_remove} byla odblokována.{Style.RESET_ALL}")
+                        else:
+                            print(f"{Fore.RED}Neplatné číslo IP adresy.{Style.RESET_ALL}")
+                    except ValueError:
+                        print(f"{Fore.RED}Neplatný vstup.{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.YELLOW}Žádné IP adresy nejsou zablokovány.{Style.RESET_ALL}")
+                    
+            elif choice == "20":
+                search_input = input("Zadejte číslo bloku nebo jeho hash: ").strip()
+                block = None
+
+                # Zjištění, zda byl zadán index (číslo) nebo hash
+                if search_input.isdigit():
+                    try:
+                        block_index = int(search_input)
+                        if 0 <= block_index <= droid_chain.max_block_index:
+                            block = droid_chain.get_block(block_index)
+                        else:
+                            print(f"{Fore.RED}Blok s číslem {block_index} neexistuje.{Style.RESET_ALL}")
+                    except ValueError:
+                        print(f"{Fore.RED}Neplatné číslo bloku.{Style.RESET_ALL}")
+                else:
+                    # Vyhledávání podle hashe
+                    conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+                    c = conn.cursor()
+                    c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_hash = ?", (search_input,))
+                    row = c.fetchone()
+                    conn.close()
+                    
+                    if row:
+                        block_data = {
+                            'index': row[0],
+                            'timestamp': row[1],
+                            'transactions': json.loads(row[2]),
+                            'previous_hash': row[3],
+                            'target': row[4],
+                            'nonce': row[5],
+                            'hash': row[6],
+                            'merkle_root': row[7],
+                            'version': row[8],
+                            'chain_id': row[9]
+                        }
+                        block = Block.from_dict(block_data)
+                    else:
+                        print(f"{Fore.RED}Blok s hashem {search_input} nebyl nalezen.{Style.RESET_ALL}")
+
+                # Pokud byl blok úspěšně nalezen (ať už podle indexu nebo hashe), vypíšeme ho
+                if block:
                     target_hex = hex(block.target)[2:]
                     print(f"\n{Fore.GREEN}Blok nalezen!{Style.RESET_ALL}")
                     print(f"Blok #{block.index}")
@@ -3767,201 +3868,6 @@ def main():
                             print(f"{Fore.GREEN}CELKOVÝ VERDIKT: BLOK JE VALIDNÍ A PLATNÝ{Style.RESET_ALL}")
                         else:
                             print(f"{Fore.RED}CELKOVÝ VERDIKT: BLOK JE NEPLATNÝ!{Style.RESET_ALL}")
-                else:
-                    print(f"{Fore.RED}Blok s hashem {block_hash} nebyl nalezen.{Style.RESET_ALL}")
-                
-            elif choice == "18":
-                peer_ip = input("Zadejte IP adresu uzlu k přidání: ").strip()
-                try:
-                    peer_port = int(input("Zadejte port uzlu: ").strip())
-                    new_peer = (peer_ip, peer_port)
-                    print(f"{Fore.YELLOW}Pokouším se připojit k uzlu {new_peer}...{Style.RESET_ALL}")
-                    
-                    # Zásadní změna: Voláme oficiální metodu pro připojení!
-                    if p2p_node.connect_to_peer(new_peer):
-                        print(f"{Fore.GREEN}Požadavek na propojení odeslán! (Zkontrolujte stav uzlů přes volbu 11){Style.RESET_ALL}")
-                    else:
-                        print(f"{Fore.RED}Připojení selhalo. Uzel je možná offline, již existuje, nebo je blokován.{Style.RESET_ALL}")
-                except ValueError:
-                    print(f"{Fore.RED}Neplatný formát portu.{Style.RESET_ALL}")
-                    
-            elif choice == "19":
-                print(" 1. Uložené uzly")
-                print(" 2. Zablokované IP adresy")
-                print(" 3. Zpět")
-                try:
-                    sub_choice = input("   Zadejte volbu: ").strip()
-                except EOFError:
-                    continue
-                    
-                if sub_choice == "1":
-                    # KROK 1: Rychlé a bezpečné načtení kopie seznamu
-                    with p2p_node.peers_lock:
-                        current_peers = list(p2p_node.peers)
-
-                    if current_peers:
-                        print("   --- Uložené uzly ---")
-                        for i, peer in enumerate(current_peers, 1):
-                            peer_str = f"[{peer[0]}]:{peer[1]}" if ':' in peer[0] else f"{peer[0]}:{peer[1]}"
-                            print(f" {i}. {peer_str}")
-                        try:
-                            idx = int(input("   Zadejte číslo uzlu k odstranění: ").strip())
-                            if 1 <= idx <= len(current_peers):
-                                peer_to_remove = current_peers[idx - 1]
-                                peer_str_rm = f"[{peer_to_remove[0]}]:{peer_to_remove[1]}" if ':' in peer_to_remove[0] else f"{peer_to_remove[0]}:{peer_to_remove[1]}"
-                                block_ip = input(f"Chcete IP adresu uzlu ({peer_to_remove[0]}) před smazáním i zablokovat? (a/n): ").strip().lower()
-                                
-                                # KROK 2: Bezpečné smazání ze skutečného seznamu a vytvoření dat k uložení
-                                with p2p_node.peers_lock:
-                                    if peer_to_remove in p2p_node.peers:
-                                        p2p_node.peers.remove(peer_to_remove)
-                                    # Smaže i zastaralý záznam naslouchacího portu, aby po
-                                    # odebrání peera přestal fungovat i fallback unicast
-                                    # odpovědí na jeho případné pozdější požadavky.
-                                    p2p_node.peer_listen_ports.pop(p2p_node.normalize_ip(peer_to_remove[0]), None)
-                                    peers_to_save = list(p2p_node.peers)
-
-                                save_peers(peers_to_save)
-                                
-                                if block_ip == 'a':
-                                    p2p_node.blacklist.add(peer_to_remove[0])
-                                    save_blacklist(p2p_node.blacklist)
-                                    print(f"{Fore.GREEN}Uzel {peer_str_rm} byl smazán a jeho IP zablokována.{Style.RESET_ALL}")
-                                else:
-                                    print(f"{Fore.GREEN}Uzel {peer_str_rm} byl smazán.{Style.RESET_ALL}")
-                            else:
-                                print(f"{Fore.RED}Neplatné číslo uzlu.{Style.RESET_ALL}")
-                        except ValueError:
-                            print(f"{Fore.RED}Neplatný vstup.{Style.RESET_ALL}")
-                    else:
-                        print(f"{Fore.YELLOW}Žádné uzly nejsou uloženy.{Style.RESET_ALL}")
-                        
-                elif sub_choice == "2":
-                    if p2p_node.blacklist:
-                        print("--- Zablokované IP adresy ---")
-                        blocked_list = list(p2p_node.blacklist)
-                        for i, ip in enumerate(blocked_list, 1):
-                            print(f" {i}. {ip}")
-                        try:
-                            idx = int(input("   Zadejte číslo IP adresy k odblokování: ").strip())
-                            if 1 <= idx <= len(blocked_list):
-                                ip_to_remove = blocked_list[idx - 1]
-                                p2p_node.blacklist.remove(ip_to_remove)
-                                save_blacklist(p2p_node.blacklist)
-                                print(f"{Fore.GREEN}IP adresa {ip_to_remove} byla odblokována.{Style.RESET_ALL}")
-                            else:
-                                print(f"{Fore.RED}Neplatné číslo IP adresy.{Style.RESET_ALL}")
-                        except ValueError:
-                            print(f"{Fore.RED}Neplatný vstup.{Style.RESET_ALL}")
-                    else:
-                        print(f"{Fore.YELLOW}Žádné IP adresy nejsou zablokovány.{Style.RESET_ALL}")
-                        
-                elif sub_choice == "3":
-                    pass
-                else:
-                    print(f"{Fore.RED}Neplatná volba.{Style.RESET_ALL}")
-                    
-            elif choice == "20":
-                try:
-                    block_index = int(input("Zadejte číslo bloku: "))
-                    if 0 <= block_index <= droid_chain.max_block_index:
-                        block = droid_chain.get_block(block_index)
-                        target_hex = hex(block.target)[2:]
-                        print(f"Blok #{block.index}")
-                        print(f" Verze bloku: {Fore.CYAN}{block.version}{Style.RESET_ALL}")
-                        print(f" Chain ID: {Fore.CYAN}{block.chain_id}{Style.RESET_ALL}")
-                        print(f" Hash: {Fore.MAGENTA}{block.hash}{Style.RESET_ALL}")
-                        print(f" Merkle root: {Fore.CYAN}{block.merkle_root}{Style.RESET_ALL}")
-                        print(f" Cílová obtížnost: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
-                        print(f" Předchozí hash: {Fore.MAGENTA}{block.previous_hash}{Style.RESET_ALL}")
-                        print(f" PoW nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
-                        print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(block.timestamp))}{Style.RESET_ALL}")
-                        print(f" Velikost bloku: {Fore.CYAN}{block.get_size() / 1024:.2f} KB{Style.RESET_ALL}")
-                        print(f" Počet potvrzení: {format_confirmations(droid_chain.get_confirmations(block.hash))}")
-                        print(f" Počet transakcí: {len(block.transactions)}")
-                        
-                        if block.transactions:
-                            print(f" {Fore.YELLOW}Transakce:{Style.RESET_ALL}")
-                            for tx in block.transactions:
-                                print(f" - TX ID: {Fore.CYAN}{tx.tx_id}{Style.RESET_ALL}")
-                                print(f"   Od: {tx.from_address}")
-                                print(f"   Komu: {tx.to_address}")
-                                print(f"   Částka: {Fore.CYAN}{format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
-                                if tx.from_address != "COINBASE":
-                                    print(f"   Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
-                                    print(f"   TX nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
-                                if tx.signature:
-                                    print(f"   Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
-                                else:
-                                    print(f"   Podpis: {Fore.RED}žádný{Style.RESET_ALL}")
-                                if tx.data:
-                                    print(f"   Zpráva: {Fore.YELLOW}{tx.data}{Style.RESET_ALL}")
-                        print("=" * 40)
-                        
-                        verify_choice = input(f"{Fore.BLUE}Chcete ověřit platnost tohoto bloku? (a/n): {Style.RESET_ALL}").strip().lower()
-                        if verify_choice == 'a':
-                            print(f"\n{Fore.YELLOW}--- Start podrobného ověření bloku #{block.index} ---{Style.RESET_ALL}")
-                            is_valid = True
-                            
-                            # 1. Merkle Root
-                            print(f"{Fore.CYAN}[Krok 1]{Style.RESET_ALL} Výpočet Merkle rootu ze všech transakcí v bloku...")
-                            calc_merkle = compute_merkle_root(block.transactions)
-                            if calc_merkle == block.merkle_root:
-                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Vypočítaný Merkle root souhlasí s hlavičkou bloku.")
-                            else:
-                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Merkle root nesouhlasí!")
-                                print(f"  Očekáváno: {block.merkle_root}\n  Vypočteno: {calc_merkle}")
-                                is_valid = False
-                                
-                            # 2. Block Hash
-                            print(f"{Fore.CYAN}[Krok 2]{Style.RESET_ALL} Výpočet hashe dat bloku...")
-                            calc_hash = block.compute_hash()
-                            if calc_hash == block.hash:
-                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Vypočítaný hash odpovídá deklarovanému hashi bloku.")
-                            else:
-                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Hash nesouhlasí!")
-                                print(f"  Očekáváno: {block.hash}\n  Vypočteno: {calc_hash}")
-                                is_valid = False
-                                
-                            # 3. PoW Check
-                            print(f"{Fore.CYAN}[Krok 3]{Style.RESET_ALL} Kontrola Proof of Work (Target obtížnosti)...")
-                            if Blockchain.meets_difficulty(block.hash, block.target):
-                                print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Hash bloku číselně splňuje požadavky Targetu.")
-                            else:
-                                print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Nalezený hash nesplňuje požadovanou obtížnost (PoW je neplatný)!")
-                                is_valid = False
-                                
-                            # 4. Previous Hash Check
-                            print(f"{Fore.CYAN}[Krok 4]{Style.RESET_ALL} Kontrola návaznosti na předchozí blok...")
-                            if block.index == 0:
-                                if block.previous_hash == "0":
-                                    print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - Genesis blok nemá předchůdce (previous_hash je správně '0').")
-                                else:
-                                    print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Genesis blok by měl mít previous_hash '0'!")
-                                    is_valid = False
-                            else:
-                                prev_block = droid_chain.get_block(block.index - 1)
-                                if prev_block:
-                                    if block.previous_hash == prev_block.hash:
-                                        print(f"  {Fore.GREEN}OK{Style.RESET_ALL} - previous_hash korektně navazuje na blok #{prev_block.index}.")
-                                    else:
-                                        print(f"  {Fore.RED}CHYBA{Style.RESET_ALL} - Návaznost přerušena! previous_hash bloku se neshoduje s hashem bloku #{prev_block.index}.")
-                                        is_valid = False
-                                else:
-                                    print(f"  {Fore.YELLOW}VAROVÁNÍ{Style.RESET_ALL} - Předchozí blok #{block.index - 1} nebyl nalezen v databázi, nelze ověřit.")
-                                    
-                            # Závěr
-                            print("-" * 40)
-                            if is_valid:
-                                print(f"{Fore.GREEN}CELKOVÝ VERDIKT: BLOK JE VALIDNÍ A PLATNÝ{Style.RESET_ALL}")
-                            else:
-                                print(f"{Fore.RED}CELKOVÝ VERDIKT: BLOK JE NEPLATNÝ!{Style.RESET_ALL}")
-                    else:
-                        print(f"{Fore.RED}Blok s číslem {block_index} neexistuje.{Style.RESET_ALL}")
-                except ValueError:
-                    print(f"{Fore.RED}Neplatné číslo bloku.{Style.RESET_ALL}")
-            else:
-                print(f"{Fore.RED}Neplatná volba. Zkuste to prosím znovu.{Style.RESET_ALL}")
                 
         except KeyboardInterrupt:
             print(f"\n{Fore.YELLOW}Ukončuji program (CTRL+C)...{Style.RESET_ALL}")
