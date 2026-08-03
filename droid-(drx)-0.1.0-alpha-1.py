@@ -231,7 +231,16 @@ class Transaction:
             data=data.get('data'),
             chain_id=data.get('chain_id', CHAIN_ID)
         )
-        tx.tx_id = data.get('tx_id') or tx.compute_hash()
+        # tx.tx_id byl v konstruktoru nastaven na tx.compute_hash() (viz __init__).
+        # Pokud slovník dodává vlastní tx_id, MUSÍ se rovnat skutečnému hashi obsahu -
+        # jinak by šlo podvrhnout tx_id libovolné (např. cizí) transakce a obejít tak
+        # kontroly duplicit/tx_id v mempoolu, DB i validaci bloků/řetězce.
+        supplied_tx_id = data.get('tx_id')
+        if supplied_tx_id is not None and supplied_tx_id != tx.tx_id:
+            raise ValueError(
+                f"Neplatné tx_id: dodané tx_id '{supplied_tx_id}' neodpovídá "
+                f"vypočtenému hashi obsahu transakce '{tx.tx_id}'."
+            )
         return tx
 
     def get_size(self):
@@ -547,33 +556,30 @@ class Blockchain:
             if transaction.from_address != "COINBASE" and transaction.data is not None:
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nepovolená zpráva v ne-coinbase transakci.")
                 return False
-                
+            
             mempool_size = sum(tx.get_size() for tx in self.unconfirmed_transactions)
             tx_size = transaction.get_size()
-            
             if mempool_size + tx_size > MAX_MEMPOOL_SIZE_BYTES:
-                needed_space = (mempool_size + tx_size) - MAX_MEMPOOL_SIZE_BYTES
-                sorted_txs = sorted(self.unconfirmed_transactions, key=lambda t: t.fee / t.get_size())
-                tx_ratio = transaction.fee / tx_size
+                new_ratio = transaction.fee / tx_size
+                sorted_pool = sorted(self.unconfirmed_transactions, key=lambda t: t.fee / t.get_size())
                 freed_space = 0
-                txs_to_remove = []
+                to_remove = set()
                 
-                for t in sorted_txs:
-                    if (t.fee / t.get_size()) >= tx_ratio:
-                        break
-                    freed_space += t.get_size()
-                    txs_to_remove.append(t)
-                    if freed_space >= needed_space:
+                for t in sorted_pool:
+                    if (t.fee / t.get_size()) < new_ratio:
+                        to_remove.add(t.tx_id)
+                        freed_space += t.get_size()
+                        if mempool_size - freed_space + tx_size <= MAX_MEMPOOL_SIZE_BYTES:
+                            break
+                    else:
                         break
                         
-                if freed_space < needed_space:
-                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Mempool je plný, nová transakce byla odmítnuta (nízký poplatek pro nahrazení jiných).")
+                if mempool_size - freed_space + tx_size > MAX_MEMPOOL_SIZE_BYTES:
+                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Mempool je plný a nová transakce nemá dostatečný poplatek k nahrazení jiných.")
                     return False
                     
-                for t in txs_to_remove:
-                    self.unconfirmed_transactions.remove(t)
-                print(f"{Fore.YELLOW}Upozornění:{Style.RESET_ALL} Z mempoolu bylo vyhozeno {len(txs_to_remove)} transakcí s nižším poplatkem pro uvolnění místa.")
-
+                self.unconfirmed_transactions = [t for t in self.unconfirmed_transactions if t.tx_id not in to_remove]
+                
             if not transaction.is_valid_timestamp():
                 print(f"{Fore.RED}Chyba ověření transakce:{Style.RESET_ALL} Timestamp transakce je neplatný.")
                 return False
@@ -1630,24 +1636,19 @@ class Blockchain:
             }) for row in rows]
             conn.close()
 
-            # Fix: Save the existing mempool before processing the reorg
-            existing_mempool = list(self.unconfirmed_transactions)
+            existing_mempool = self.unconfirmed_transactions
             self.unconfirmed_transactions = []
             
-            combined_txs = orphaned_transactions + existing_mempool
-            unique_txs = []
-            seen_txs = set()
-            for tx in combined_txs:
-                if tx.tx_id not in seen_txs:
-                    seen_txs.add(tx.tx_id)
-                    unique_txs.append(tx)
-                    
-            unique_txs.sort(key=lambda x: (x.from_address, x.nonce))
-            for tx in unique_txs:
-                if 'new_tx_ids' in locals() and tx.tx_id in new_tx_ids:
-                    continue # Skip transactions already in the new chain
+            all_pending = {tx.tx_id: tx for tx in existing_mempool}
+            for tx in orphaned_transactions:
+                all_pending[tx.tx_id] = tx
+                
+            combined_transactions = list(all_pending.values())
+            combined_transactions.sort(key=lambda x: (x.from_address, x.nonce))
+            
+            for tx in combined_transactions:
                 if self.add_transaction(tx):
-                    p2p_node.add_log(f"{Fore.GREEN}Uživatelská transakce {tx.tx_id} přidána zpět do mempoolu po reorgu.{Style.RESET_ALL}")
+                    p2p_node.add_log(f"{Fore.GREEN}Osiřelá/čekající transakce {tx.tx_id} ponechána nebo přidána do mempoolu.{Style.RESET_ALL}")
                 else:
                     reason = "Neznámý důvod"
                     if self.is_tx_id_in_chain(tx.tx_id):
@@ -1659,8 +1660,8 @@ class Blockchain:
                     elif self.get_confirmed_balance(tx.from_address) - sum(t.amount + t.fee for t in self.unconfirmed_transactions if t.from_address == tx.from_address) < tx.amount + tx.fee:
                         reason = "Nedostatečný zůstatek"
                     else:
-                        reason = "Jiná chyba ověření (např. čas, podpis)"
-                    p2p_node.add_log(f"{Fore.RED}Uživatelská transakce {tx.tx_id} zamítnuta z mempoolu po reorgu. Důvod: {reason}.{Style.RESET_ALL}")
+                        reason = "Jiná chyba ověření (např. čas, podpis, plný mempool)"
+                    p2p_node.add_log(f"{Fore.RED}Transakce {tx.tx_id} zamítnuta z mempoolu po reorgu. Důvod: {reason}.{Style.RESET_ALL}")
             
             save_mempool(self.unconfirmed_transactions)
             return True
@@ -2059,7 +2060,13 @@ def load_mempool(droid_chain):
                     'signature': row[8],
                     'chain_id': row[9]
                 }
-                tx = Transaction.from_dict(tx_data)
+                try:
+                    tx = Transaction.from_dict(tx_data)
+                except ValueError as e:
+                    # Např. nesoulad tx_id s vypočteným hashem (poškozený/upravený řádek).
+                    # Přeskočíme pouze tento řádek, aby zbytek mempoolu šel načíst dál.
+                    print(f"{Fore.RED}Přeskakuji neplatnou transakci z mempoolu DB (tx_id={row[0]}): {e}{Style.RESET_ALL}")
+                    continue
                 if not droid_chain.add_transaction(tx):
                     print(f"{Fore.RED}Transakce z mempoolu DB zamítnuta (duplicitní nebo neplatná): {tx.tx_id}{Style.RESET_ALL}")
         except Exception as e:
@@ -2074,6 +2081,7 @@ class P2PNode:
         self.port = port
         self.peers = initial_peers
         self.peers_lock = threading.Lock()
+        # Při startu rovnou naplníme mapovací slovník ze známých uložených peerů
         self.peer_listen_ports = {self.normalize_ip(ip): port for ip, port in initial_peers}
         self.server_thread = threading.Thread(target=self.start_server)
         self.running = True
@@ -2275,8 +2283,7 @@ class P2PNode:
             tx = Transaction.from_dict(tx_data)
             if self.blockchain.add_transaction(tx):
                 self.add_log(f"{Fore.GREEN}Přijata a ověřena nová transakce.{Style.RESET_ALL}")
-                with self.blockchain.lock:
-                    save_mempool(self.blockchain.unconfirmed_transactions)
+                save_mempool(self.blockchain.unconfirmed_transactions)
             else:
                 self.add_log(f"{Fore.RED}Přijatá transakce je neplatná, odmítnuta.{Style.RESET_ALL}")
                 
@@ -2345,6 +2352,7 @@ class P2PNode:
                         start_index = row[0] + 1
                         break
                         
+            # Tvrdý limit 10 pro eliminaci OOM a nepřekročení MAX_MESSAGE_SIZE
             c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index >= ? ORDER BY block_index LIMIT 10", (start_index,))
             blocks_data = []
             for row in c:
@@ -2402,6 +2410,8 @@ class P2PNode:
             else:
                 self.add_log(f"{Fore.YELLOW}Detekován fork (blok navazuje na starší index). Pokouším se o inkrementální lokální reorg...{Style.RESET_ALL}")
                 
+                # Zabráníme plnění celé předchozí části do RAM, jak zněl pokyn.
+                # Předáváme pouze fork_index a nové bloky.
                 conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                 conn.execute("PRAGMA journal_mode=WAL;")
                 c = conn.cursor()
@@ -2409,6 +2419,7 @@ class P2PNode:
                 row = c.fetchone()
                 conn.close()
                 
+                # Záchranný fall-back, pokud nám k napojení naší historie stále chybí hlubší propojení.
                 if (not row or row[0] != first_block_data['previous_hash']) and first_block_index != 0:
                     self.awaiting_full_chain = True
                     request = {'type': 'request_full_chain'}
@@ -2421,6 +2432,7 @@ class P2PNode:
                         self.send_data_to_peers(request)
                     return
                 
+                # Reorg provádíme s novou inkrementální replace_chain metodou z Části 1.
                 if self.blockchain.replace_chain(first_block_index, blocks_data):
                     save_data(self.blockchain, wallets, password, self.peers)
                     self.add_log(f"{Fore.GREEN}Úspěšný inkrementální reorg!{Style.RESET_ALL}")
@@ -2431,6 +2443,8 @@ class P2PNode:
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
             c = conn.cursor()
+            # Tvrdé odstranění časované bomby s fetchall bez limitu - pošleme úvodní dávku (LIMIT 10),
+            # další dotahy obstará standardní periodický sync skrz request_blocks inkrementálně.
             c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index LIMIT 10")
             chain_data = []
             for row in c:
@@ -2528,8 +2542,7 @@ class P2PNode:
                         self.add_log(f"{Fore.GREEN}Přidána nová transakce z mempoolu od uzlu: {tx.tx_id}{Style.RESET_ALL}")
                     else:
                         self.add_log(f"{Fore.RED}Transakce z mempoolu zamítnuta (neplatná nonce nebo jiná chyba): {tx.tx_id}{Style.RESET_ALL}")
-            with self.blockchain.lock:
-                save_mempool(self.blockchain.unconfirmed_transactions)
+            save_mempool(self.blockchain.unconfirmed_transactions)
             
         elif msg_type == 'new_peer':
             new_peer_addr = tuple(message['data'])
@@ -2596,6 +2609,7 @@ class P2PNode:
                     if is_allowed_ip and new_peer_addr != (self.host, self.port):
                         changed = False
                         with self.peers_lock:
+                            # 1. Hledání existujícího záznamu podle IP adresy
                             old_peer = None
                             for p in self.peers:
                                 if p[0] == addr[0]:
@@ -2603,17 +2617,20 @@ class P2PNode:
                                     break
                             
                             if old_peer:
+                                # 2. Pokud IP existuje, ale port se liší, aktualizujeme ho
                                 if old_peer[1] != remote_listen_port:
                                     self.peers.remove(old_peer)
                                     self.peers.append(new_peer_addr)
                                     changed = True
                             else:
+                                # 3. Zcela nový peer, přidáme pokud je místo
                                 if self.is_peer_valid(new_peer_addr):
                                     self.peers.append(new_peer_addr)
                                     changed = True
                             
                             peers_snapshot = list(self.peers)
                             
+                        # Ukládáme a logujeme pouze pokud došlo ke změně nebo přidání
                         if changed:
                             save_peers(peers_snapshot)
                             self.add_log(f"{Fore.GREEN}Uzel {ip_port} (naslouchá na portu {remote_listen_port}) byl aktualizován/přidán do peers.{Style.RESET_ALL}")
@@ -3019,6 +3036,11 @@ def main():
                     )
                     tx.public_key = binascii.hexlify(from_wallet.public_key.to_string()).decode()
                     tx.signature = from_wallet.sign_transaction(tx)
+                    # tx_id byl spočítán v konstruktoru (Transaction.__init__), tedy PŘED tímto
+                    # přiřazením public_key. Musí se přepočítat, aby odpovídal finálnímu obsahu
+                    # transakce (stejnému, jaký se právě podepsal a jaký uvidí ostatní uzly) -
+                    # jinak by tx_id neprošel kontrolou v Transaction.from_dict na přijímací straně.
+                    tx.tx_id = tx.compute_hash()
                     
                     if any(t.tx_id == tx.tx_id for t in droid_chain.unconfirmed_transactions):
                         print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Duplicitní TX ID {tx.tx_id} po vytvoření. Transakce odmítnuta.")
