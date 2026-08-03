@@ -231,10 +231,6 @@ class Transaction:
             data=data.get('data'),
             chain_id=data.get('chain_id', CHAIN_ID)
         )
-        # tx.tx_id byl v konstruktoru nastaven na tx.compute_hash() (viz __init__).
-        # Pokud slovník dodává vlastní tx_id, MUSÍ se rovnat skutečnému hashi obsahu -
-        # jinak by šlo podvrhnout tx_id libovolné (např. cizí) transakce a obejít tak
-        # kontroly duplicit/tx_id v mempoolu, DB i validaci bloků/řetězce.
         supplied_tx_id = data.get('tx_id')
         if supplied_tx_id is not None and supplied_tx_id != tx.tx_id:
             raise ValueError(
@@ -2063,8 +2059,6 @@ def load_mempool(droid_chain):
                 try:
                     tx = Transaction.from_dict(tx_data)
                 except ValueError as e:
-                    # Např. nesoulad tx_id s vypočteným hashem (poškozený/upravený řádek).
-                    # Přeskočíme pouze tento řádek, aby zbytek mempoolu šel načíst dál.
                     print(f"{Fore.RED}Přeskakuji neplatnou transakci z mempoolu DB (tx_id={row[0]}): {e}{Style.RESET_ALL}")
                     continue
                 if not droid_chain.add_transaction(tx):
@@ -2081,7 +2075,6 @@ class P2PNode:
         self.port = port
         self.peers = initial_peers
         self.peers_lock = threading.Lock()
-        # Při startu rovnou naplníme mapovací slovník ze známých uložených peerů
         self.peer_listen_ports = {self.normalize_ip(ip): port for ip, port in initial_peers}
         self.server_thread = threading.Thread(target=self.start_server)
         self.running = True
@@ -2093,13 +2086,9 @@ class P2PNode:
         self.blacklist = load_blacklist()
         self.tx_rate_limit = defaultdict(list)
         self.awaiting_full_chain = False
-
-    @staticmethod
-    def normalize_ip(ip_str):
-        try:
-            return str(ipaddress.ip_address(ip_str))
-        except ValueError:
-            return ip_str
+        self.syncing_fork = False
+        self.fork_start_index = None
+        self.SYNC_BUFFER_DB = 'sync_buffer.db'
 
     def get_locator_hashes(self):
         locator = []
@@ -2114,6 +2103,85 @@ class P2PNode:
         except Exception:
             pass
         return locator
+
+    def init_sync_buffer(self):
+        conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        c = conn.cursor()
+        c.execute("DROP TABLE IF EXISTS sync_blocks")
+        c.execute('''
+            CREATE TABLE sync_blocks (
+                block_index INTEGER PRIMARY KEY,
+                timestamp INTEGER,
+                transactions TEXT,
+                previous_hash TEXT,
+                target_hex TEXT,
+                nonce INTEGER,
+                block_hash TEXT,
+                merkle_root TEXT,
+                version INTEGER,
+                chain_id INTEGER
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def process_sync_buffer(self):
+        self.add_log(f"{Fore.YELLOW}Stahování forku do bufferu dokončeno, spouštím replace_chain()...{Style.RESET_ALL}")
+        
+        try:
+            conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
+            c = conn.cursor()
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM sync_blocks ORDER BY block_index")
+            
+            blocks_data = []
+            for row in c:
+                blocks_data.append({
+                    'index': row[0],
+                    'timestamp': row[1],
+                    'transactions': json.loads(row[2]),
+                    'previous_hash': row[3],
+                    'target': row[4],
+                    'nonce': row[5],
+                    'hash': row[6],
+                    'merkle_root': row[7],
+                    'version': row[8],
+                    'chain_id': row[9]
+                })
+            conn.close()
+        except Exception as e:
+            self.add_log(f"{Fore.RED}Chyba při čtení ze sync bufferu: {e}{Style.RESET_ALL}")
+            self.syncing_fork = False
+            return
+
+        fork_idx = self.fork_start_index
+        
+        self.syncing_fork = False
+        self.fork_start_index = None
+        
+        if not blocks_data:
+            return
+            
+        global wallets, password
+        if self.blockchain.replace_chain(fork_idx, blocks_data):
+            save_data(self.blockchain, wallets, password, self.peers)
+            self.add_log(f"{Fore.GREEN}Úspěšný reorg z bufferu! (zpracováno {len(blocks_data)} bloků){Style.RESET_ALL}")
+        else:
+            self.add_log(f"{Fore.RED}Navrhovaný fork z bufferu není platný nebo nemá větší váhu. Odmítnuto.{Style.RESET_ALL}")
+            
+        try:
+            os.remove(self.SYNC_BUFFER_DB)
+            os.remove(self.SYNC_BUFFER_DB + '-wal')
+            os.remove(self.SYNC_BUFFER_DB + '-shm')
+        except OSError:
+            pass
+
+    @staticmethod
+    def normalize_ip(ip_str):
+        try:
+            return str(ipaddress.ip_address(ip_str))
+        except ValueError:
+            return ip_str
 
     def add_log(self, message):
         self.p2p_log.put(message)
@@ -2352,7 +2420,6 @@ class P2PNode:
                         start_index = row[0] + 1
                         break
                         
-            # Tvrdý limit 10 pro eliminaci OOM a nepřekročení MAX_MESSAGE_SIZE
             c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index >= ? ORDER BY block_index LIMIT 10", (start_index,))
             blocks_data = []
             for row in c:
@@ -2381,16 +2448,21 @@ class P2PNode:
                 
         elif msg_type == 'response_blocks':
             blocks_data = message['data']
+            
             if not blocks_data:
+                if getattr(self, 'syncing_fork', False):
+                    self.process_sync_buffer()
                 return
+                
             self.add_log(f"{Fore.YELLOW}Přijaty bloky ({len(blocks_data)}), zpracovávám...{Style.RESET_ALL}")
             
             current_index = self.blockchain.max_block_index + 1
             last_hash = self.blockchain.get_last_block().hash
             first_block_data = blocks_data[0]
             first_block_index = first_block_data['index']
+            last_block_data = blocks_data[-1]
             
-            if first_block_index == current_index and first_block_data['previous_hash'] == last_hash:
+            if first_block_index == current_index and first_block_data['previous_hash'] == last_hash and not getattr(self, 'syncing_fork', False):
                 added = False
                 for block_data in blocks_data:
                     block = Block.from_dict(block_data)
@@ -2404,47 +2476,74 @@ class P2PNode:
                     else:
                         self.add_log(f"{Fore.RED}Neplatný blok #{block.index}, přerušuji přidávání.{Style.RESET_ALL}")
                         break
+                        
                 if added:
                     save_data(self.blockchain, wallets, password, self.peers)
                     self.add_log(f"{Fore.GREEN}Nové bloky úspěšně přidány (přímé pokračování).{Style.RESET_ALL}")
-            else:
-                self.add_log(f"{Fore.YELLOW}Detekován fork (blok navazuje na starší index). Pokouším se o inkrementální lokální reorg...{Style.RESET_ALL}")
-                
-                # Zabráníme plnění celé předchozí části do RAM, jak zněl pokyn.
-                # Předáváme pouze fork_index a nové bloky.
-                conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-                conn.execute("PRAGMA journal_mode=WAL;")
-                c = conn.cursor()
-                c.execute("SELECT block_hash FROM blocks WHERE block_index = ?", (first_block_index - 1,))
-                row = c.fetchone()
-                conn.close()
-                
-                # Záchranný fall-back, pokud nám k napojení naší historie stále chybí hlubší propojení.
-                if (not row or row[0] != first_block_data['previous_hash']) and first_block_index != 0:
-                    self.awaiting_full_chain = True
-                    request = {'type': 'request_full_chain'}
+                    
+                if len(blocks_data) == 10:
+                    request = {'type': 'request_blocks', 'data': {'locator_hashes': [last_block_data['hash']]}}
                     requester_addr = self.resolve_peer_addr(addr)
                     if requester_addr:
-                        self.add_log(f"{Fore.RED}Nedokážu navázat přijaté bloky na svůj chain. Fallback na full sync od počátku z uzlu {ip_port}...{Style.RESET_ALL}")
                         self.send_to_peer(requester_addr, request)
                     else:
-                        self.add_log(f"{Fore.RED}Nedokážu navázat přijaté bloky na svůj chain. Naslouchací port uzlu {ip_port} není znám, fallback posílám broadcastem...{Style.RESET_ALL}")
                         self.send_data_to_peers(request)
-                    return
+
+            else:
+                if not getattr(self, 'syncing_fork', False):
+                    self.add_log(f"{Fore.YELLOW}Detekován fork (od bloku #{first_block_index}). Zahajuji ukládání do dočasného bufferu...{Style.RESET_ALL}")
+                    
+                    conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    c = conn.cursor()
+                    c.execute("SELECT block_hash FROM blocks WHERE block_index = ?", (first_block_index - 1,))
+                    row = c.fetchone()
+                    conn.close()
+                    
+                    if (not row or row[0] != first_block_data['previous_hash']) and first_block_index != 0:
+                        self.awaiting_full_chain = True
+                        request = {'type': 'request_full_chain'}
+                        requester_addr = self.resolve_peer_addr(addr)
+                        if requester_addr:
+                            self.add_log(f"{Fore.RED}Nedokážu navázat přijaté bloky. Fallback na full sync...{Style.RESET_ALL}")
+                            self.send_to_peer(requester_addr, request)
+                        else:
+                            self.send_data_to_peers(request)
+                        return
+                        
+                    self.syncing_fork = True
+                    self.fork_start_index = first_block_index
+                    self.init_sync_buffer()
+
+                conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                c = conn.cursor()
+                for bd in blocks_data:
+                    tx_json = json.dumps(bd['transactions'])
+                    c.execute('''
+                        INSERT OR REPLACE INTO sync_blocks 
+                        (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (bd['index'], bd['timestamp'], tx_json, bd['previous_hash'], bd['target'], bd['nonce'], bd['hash'], bd['merkle_root'], bd.get('version', BLOCK_VERSION), bd.get('chain_id', CHAIN_ID)))
+                conn.commit()
+                conn.close()
                 
-                # Reorg provádíme s novou inkrementální replace_chain metodou z Části 1.
-                if self.blockchain.replace_chain(first_block_index, blocks_data):
-                    save_data(self.blockchain, wallets, password, self.peers)
-                    self.add_log(f"{Fore.GREEN}Úspěšný inkrementální reorg!{Style.RESET_ALL}")
+                self.add_log(f"{Fore.CYAN}Uloženo {len(blocks_data)} bloků do bufferu (od #{first_block_index} do #{last_block_data['index']}).{Style.RESET_ALL}")
+
+                if len(blocks_data) == 10:
+                    request = {'type': 'request_blocks', 'data': {'locator_hashes': [last_block_data['hash']]}}
+                    requester_addr = self.resolve_peer_addr(addr)
+                    if requester_addr:
+                        self.send_to_peer(requester_addr, request)
+                    else:
+                        self.send_data_to_peers(request)
                 else:
-                    self.add_log(f"{Fore.RED}Navrhovaný fork není platný nebo nemá větší váhu. Odmítnuto.{Style.RESET_ALL}")
+                    self.process_sync_buffer()
                     
         elif msg_type == 'request_full_chain':
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
             c = conn.cursor()
-            # Tvrdé odstranění časované bomby s fetchall bez limitu - pošleme úvodní dávku (LIMIT 10),
-            # další dotahy obstará standardní periodický sync skrz request_blocks inkrementálně.
             c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index LIMIT 10")
             chain_data = []
             for row in c:
@@ -2609,7 +2708,6 @@ class P2PNode:
                     if is_allowed_ip and new_peer_addr != (self.host, self.port):
                         changed = False
                         with self.peers_lock:
-                            # 1. Hledání existujícího záznamu podle IP adresy
                             old_peer = None
                             for p in self.peers:
                                 if p[0] == addr[0]:
@@ -2617,20 +2715,17 @@ class P2PNode:
                                     break
                             
                             if old_peer:
-                                # 2. Pokud IP existuje, ale port se liší, aktualizujeme ho
                                 if old_peer[1] != remote_listen_port:
                                     self.peers.remove(old_peer)
                                     self.peers.append(new_peer_addr)
                                     changed = True
                             else:
-                                # 3. Zcela nový peer, přidáme pokud je místo
                                 if self.is_peer_valid(new_peer_addr):
                                     self.peers.append(new_peer_addr)
                                     changed = True
                             
                             peers_snapshot = list(self.peers)
                             
-                        # Ukládáme a logujeme pouze pokud došlo ke změně nebo přidání
                         if changed:
                             save_peers(peers_snapshot)
                             self.add_log(f"{Fore.GREEN}Uzel {ip_port} (naslouchá na portu {remote_listen_port}) byl aktualizován/přidán do peers.{Style.RESET_ALL}")
@@ -3036,10 +3131,6 @@ def main():
                     )
                     tx.public_key = binascii.hexlify(from_wallet.public_key.to_string()).decode()
                     tx.signature = from_wallet.sign_transaction(tx)
-                    # tx_id byl spočítán v konstruktoru (Transaction.__init__), tedy PŘED tímto
-                    # přiřazením public_key. Musí se přepočítat, aby odpovídal finálnímu obsahu
-                    # transakce (stejnému, jaký se právě podepsal a jaký uvidí ostatní uzly) -
-                    # jinak by tx_id neprošel kontrolou v Transaction.from_dict na přijímací straně.
                     tx.tx_id = tx.compute_hash()
                     
                     if any(t.tx_id == tx.tx_id for t in droid_chain.unconfirmed_transactions):
