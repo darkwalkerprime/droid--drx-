@@ -2131,6 +2131,7 @@ class P2PNode:
         
         try:
             conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
             c = conn.cursor()
             c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM sync_blocks ORDER BY block_index")
             
