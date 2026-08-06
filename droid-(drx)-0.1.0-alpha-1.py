@@ -355,7 +355,6 @@ class Blockchain:
         self.max_block_index = 0
         self.unconfirmed_transactions = []
         self.mining_in_progress = False
-        self.all_tx_ids = set()
         self.balance_map = {}
         self.nonce_map = {}
         self.total_supply = 0
@@ -399,13 +398,11 @@ class Blockchain:
         genesis_block = Block(0, [genesis_tx], "0", FIXED_TARGET, nonce=518174, timestamp=GENESIS_TIMESTAMP, version=BLOCK_VERSION, chain_id=CHAIN_ID)
         self.chain.append(genesis_block)
         self.max_block_index = 0
-        self.all_tx_ids.add(genesis_tx.tx_id)
         self.update_state_with_block(genesis_block)
         print(f"{Fore.GREEN}Genesis blok vytvořen a přidán do řetězce!{Style.RESET_ALL}")
 
     def update_state_with_block(self, block):
         for tx in block.transactions:
-            self.all_tx_ids.add(tx.tx_id)
             if tx.from_address == "COINBASE":
                 self.balance_map[tx.to_address] = self.balance_map.get(tx.to_address, 0) + tx.amount
             else:
@@ -429,7 +426,6 @@ class Blockchain:
         c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index")
         self.balance_map = {}
         self.nonce_map = {}
-        self.all_tx_ids = set()
         self.cumulative_work = 0
         self.total_supply = 0
         for row in c:
@@ -622,8 +618,6 @@ class Blockchain:
             self.lock.release()
 
     def is_tx_id_in_chain(self, tx_id):
-        if tx_id in self.all_tx_ids:
-            return True
         conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         c = conn.cursor()
@@ -1508,7 +1502,6 @@ class Blockchain:
             'balance_map': balance_map,
             'nonce_map': final_nonce_map,
             'total_supply': total_supply,
-            'all_tx_ids': seen_tx_ids,
             'cumulative_work': cumulative_work
         }
         return True, state_dict
@@ -1611,7 +1604,6 @@ class Blockchain:
             self.balance_map = new_state['balance_map']
             self.nonce_map = new_state['nonce_map']
             self.total_supply = new_state['total_supply']
-            self.all_tx_ids = new_state['all_tx_ids']
             self.cumulative_work = new_state['cumulative_work']
             self.max_block_index = new_length - 1
             
@@ -2045,7 +2037,6 @@ def load_data():
     droid_chain.balance_map = chain_state['balance_map']
     droid_chain.nonce_map = chain_state['nonce_map']
     droid_chain.total_supply = chain_state['total_supply']
-    droid_chain.all_tx_ids = chain_state['all_tx_ids']
     droid_chain.cumulative_work = chain_state['cumulative_work']
     print(f"{Fore.GREEN}Blockchain validován úspěšně.{Style.RESET_ALL}")
     droid_chain.unconfirmed_transactions = load_mempool(droid_chain)
@@ -3368,13 +3359,16 @@ def main():
                                 print(f"   Zpráva: {Fore.YELLOW}{tx.data}{Style.RESET_ALL}")
                     print("=" * 40)
                     
+                c.execute("SELECT COUNT(*) FROM transactions")
+                total_tx_count = c.fetchone()[0]
+                
                 conn.close()
                 total_size_kb = total_size / 1024
                 total_size_mb = total_size_kb / 1024
                 print(f"Velikost blockchainu: {Fore.CYAN}{total_size_kb:.2f} KB / {total_size_mb:.2f} MB{Style.RESET_ALL}")
                 print(f"Celková kumulativní práce: {Fore.CYAN}{droid_chain.get_cumulative_work()}{Style.RESET_ALL}")
                 print(f"Celkový počet bloků: {Fore.CYAN}{droid_chain.max_block_index + 1}{Style.RESET_ALL}")
-                print(f"Celkový počet transakcí: {Fore.CYAN}{len(droid_chain.all_tx_ids)}{Style.RESET_ALL}")
+                print(f"Celkový počet transakcí: {Fore.CYAN}{total_tx_count}{Style.RESET_ALL}")
                 print(f"Celkový počet adres: {Fore.CYAN}{len(all_addresses)}{Style.RESET_ALL}")
                 
             elif choice == "11":
