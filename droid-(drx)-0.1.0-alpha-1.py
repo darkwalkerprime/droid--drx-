@@ -56,7 +56,7 @@ P2P_HOST = '0.0.0.0'
 GENESIS_ADDRESS = "DRX5eed3a1ebfcda2a258e09af660d5cc056cd3c57cbe164bd312000762bc7368ce4026"
 GENESIS_ADDRESS_EXPECTED_HASH = "804e96365ba33513ad0d5065c751448eab3a285f23e97c6de6d36b7d7a7cf887"
 GENESIS_TIMESTAMP = 1785614400
-GENESIS_BLOCK_EXPECTED_HASH = "00000dd9f176a81ed736f4b46de31fe4a1664a384cdf00a3d81ca4352a661f38"
+GENESIS_BLOCK_EXPECTED_HASH = "00000ac311b2aaa4c74fb7cc193ca9ba0fa55bae0483cde9892cc4a657a87a50"
 GENESIS_AMOUNT = 50 * (10 ** DECIMALS)
 
 MAX_BLOCK_SIZE_BYTES = 1 * 1024 * 1024
@@ -193,21 +193,12 @@ class Transaction:
         return raw_string.encode('utf-8')
 
     def compute_hash(self):
-        pk_bytes = self.public_key.encode('utf-8') if self.public_key else b''
-        data_bytes = self.data.encode('utf-8') if self.data else b''
+        pk_str = self.public_key if self.public_key else ""
+        sig_str = self.signature if self.signature else ""
+        data_str = self.data if self.data else ""
         
-        raw = (
-            str(self.chain_id).encode('utf-8') +
-            self.from_address.encode('utf-8') +
-            self.to_address.encode('utf-8') +
-            str(self.amount).encode('utf-8') +
-            str(self.fee).encode('utf-8') +
-            str(self.timestamp).encode('utf-8') +
-            str(self.nonce).encode('utf-8') +
-            pk_bytes +
-            data_bytes
-        )
-        return hashlib.sha3_256(raw).hexdigest()
+        raw_string = f"{self.chain_id}|{self.from_address}|{self.to_address}|{self.amount}|{self.fee}|{self.timestamp}|{self.nonce}|{pk_str}|{sig_str}|{data_str}"
+        return hashlib.sha3_256(raw_string.encode('utf-8')).hexdigest()
 
     def to_dict(self):
         return {
@@ -279,23 +270,12 @@ class Transaction:
             return False
 
 def compute_merkle_leaf_hash(tx):
-    pk_bytes = tx.public_key.encode('utf-8') if tx.public_key else b''
-    sig_bytes = tx.signature.encode('utf-8') if tx.signature else b''
-    data_bytes = tx.data.encode('utf-8') if tx.data else b''
+    pk_str = tx.public_key if tx.public_key else ""
+    sig_str = tx.signature if tx.signature else ""
+    data_str = tx.data if tx.data else ""
     
-    raw = (
-        str(tx.chain_id).encode('utf-8') +
-        tx.from_address.encode('utf-8') +
-        tx.to_address.encode('utf-8') +
-        str(tx.amount).encode('utf-8') +
-        str(tx.fee).encode('utf-8') +
-        str(tx.timestamp).encode('utf-8') +
-        str(tx.nonce).encode('utf-8') +
-        pk_bytes +
-        sig_bytes +
-        data_bytes
-    )
-    return hashlib.sha3_256(raw).hexdigest()
+    raw_string = f"{tx.chain_id}|{tx.from_address}|{tx.to_address}|{tx.amount}|{tx.fee}|{tx.timestamp}|{tx.nonce}|{pk_str}|{sig_str}|{data_str}"
+    return hashlib.sha3_256(raw_string.encode('utf-8')).hexdigest()
 
 def compute_merkle_root(transactions):
     if not transactions:
@@ -326,17 +306,8 @@ class Block:
         self.hash = self.compute_hash()
 
     def compute_hash(self):
-        raw = (
-            str(self.version).encode('utf-8') +
-            str(self.chain_id).encode('utf-8') +
-            str(self.index).encode('utf-8') +
-            str(self.timestamp).encode('utf-8') +
-            self.merkle_root.encode('utf-8') +
-            self.previous_hash.encode('utf-8') +
-            hex(self.target)[2:].encode('utf-8') +
-            str(self.nonce).encode('utf-8')
-        )
-        return hashlib.sha3_256(raw).hexdigest()
+        raw_string = f"{self.version}|{self.chain_id}|{self.index}|{self.timestamp}|{self.merkle_root}|{self.previous_hash}|{hex(self.target)[2:]}|{self.nonce}"
+        return hashlib.sha3_256(raw_string.encode('utf-8')).hexdigest()
 
     def get_size(self):
         return len(json.dumps(self.to_dict()).encode('utf-8'))
@@ -425,7 +396,7 @@ class Blockchain:
             timestamp=GENESIS_TIMESTAMP,
             data="BTC: 000000000000000000009c26a9609e1956765cb1a89fb4cdd2411b75f208dd76"
         )
-        genesis_block = Block(0, [genesis_tx], "0", FIXED_TARGET, nonce=401888, timestamp=GENESIS_TIMESTAMP, version=BLOCK_VERSION, chain_id=CHAIN_ID)
+        genesis_block = Block(0, [genesis_tx], "0", FIXED_TARGET, nonce=518174, timestamp=GENESIS_TIMESTAMP, version=BLOCK_VERSION, chain_id=CHAIN_ID)
         self.chain.append(genesis_block)
         self.max_block_index = 0
         self.all_tx_ids.add(genesis_tx.tx_id)
@@ -823,17 +794,8 @@ class Blockchain:
                     sys.stdout.write(f"{Fore.MAGENTA}Target:{Style.RESET_ALL} {hex(target)[2:]}\n\n")
                     sys.stdout.flush()
             
-            raw = (
-                str(version).encode('utf-8') +
-                str(chain_id).encode('utf-8') +
-                str(index).encode('utf-8') +
-                str(timestamp).encode('utf-8') +
-                merkle_root.encode('utf-8') +
-                previous_hash.encode('utf-8') +
-                hex(target)[2:].encode('utf-8') +
-                str(nonce).encode('utf-8')
-            )
-            computed_hash = hashlib.sha3_256(raw).hexdigest()
+            raw_string = f"{version}|{chain_id}|{index}|{timestamp}|{merkle_root}|{previous_hash}|{hex(target)[2:]}|{nonce}"
+            computed_hash = hashlib.sha3_256(raw_string.encode('utf-8')).hexdigest()
             hashes_calculated += 1
             
             if Blockchain.meets_difficulty(computed_hash, target):
