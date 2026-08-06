@@ -168,7 +168,15 @@ class Wallet:
 
     def sign_transaction(self, transaction):
         message = transaction.get_signing_data()
-        return binascii.hexlify(self.private_key.sign(message)).decode()
+        sig = self.private_key.sign(message)
+        
+        # Vynucení Low-S pravidla (BIP 62) aby síť naši vlastní transakci nezahodila
+        r, s = ecdsa.util.sigdecode_string(sig, ecdsa.SECP256k1.order)
+        if s > (ecdsa.SECP256k1.order // 2):
+            s = ecdsa.SECP256k1.order - s
+            sig = ecdsa.util.sigencode_string(r, s, ecdsa.SECP256k1.order)
+            
+        return binascii.hexlify(sig).decode()
 
 
 class Transaction:
@@ -238,7 +246,8 @@ class Transaction:
         return tx
 
     def get_size(self):
-        return len(json.dumps(self.to_dict()).encode('utf-8'))
+        # Striktní determinismus velikosti
+        return len(json.dumps(self.to_dict(), separators=(',', ':'), sort_keys=True).encode('utf-8'))
 
     def is_valid_timestamp(self):
         return (get_time() - MEMPOOL_TX_EXPIRATION) <= self.timestamp <= (get_time() + 600)
@@ -251,8 +260,15 @@ class Transaction:
         try:
             vk = ecdsa.VerifyingKey.from_string(binascii.unhexlify(self.public_key), curve=ecdsa.SECP256k1, hashfunc=hashlib.sha3_256)
             message = self.get_signing_data()
-            return vk.verify(binascii.unhexlify(self.signature), message)
-        except (ecdsa.BadSignatureError, binascii.Error, ecdsa.MalformedPointError):
+            
+            # BIP 62 - Low-S rule vynucení pro ochranu před Transaction Malleability
+            sig_bytes = binascii.unhexlify(self.signature)
+            r, s = ecdsa.util.sigdecode_string(sig_bytes, ecdsa.SECP256k1.order)
+            if s > (ecdsa.SECP256k1.order // 2):
+                return False
+                
+            return vk.verify(sig_bytes, message)
+        except (ecdsa.BadSignatureError, binascii.Error, ecdsa.MalformedPointError, ValueError):
             return False
 
     def verify_sender_identity(self):
@@ -310,7 +326,8 @@ class Block:
         return hashlib.sha3_256(raw_string.encode('utf-8')).hexdigest()
 
     def get_size(self):
-        return len(json.dumps(self.to_dict()).encode('utf-8'))
+        # Striktní determinismus velikosti bloku pro zamezení rozštěpení sítě na hranici 1 MB
+        return len(json.dumps(self.to_dict(), separators=(',', ':'), sort_keys=True).encode('utf-8'))
 
     def to_dict(self):
         return {
