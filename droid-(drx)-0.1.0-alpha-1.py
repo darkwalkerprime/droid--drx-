@@ -646,57 +646,47 @@ class Blockchain:
     def get_target(self, new_timestamp=None):
         last_block = self.get_last_block()
         new_block_index = last_block.index + 1
-        current_ts = new_timestamp if new_timestamp is not None else get_time()
-        time_diff = current_ts - last_block.timestamp
-        if time_diff > 3600:
-            eda_target = last_block.target + (last_block.target // 4)
-            new_target = min(eda_target, FIXED_TARGET)
-            if not hasattr(self, 'last_eda_log_idx'):
-                self.last_eda_log_idx = -1
-            if new_block_index != self.last_eda_log_idx:
-                p2p_node.add_log(
-                    f"{Fore.RED}NOUZOVÁ ÚPRAVA TARGETU (EDA) na bloku #{new_block_index}:{Style.RESET_ALL}\n"
-                    f"  Čas od předchozího bloku: {time_diff}s (Limit: 3600s)\n"
-                    f"  Starý target (hex): {hex(last_block.target)[2:]} -> Nový target (hex): {hex(new_target)[2:]}"
-                )
-                self.last_eda_log_idx = new_block_index
-            return new_target
-        if new_block_index < DIFFICULTY_ADJUSTMENT_INTERVAL:
-            return FIXED_TARGET
-        if new_block_index % DIFFICULTY_ADJUSTMENT_INTERVAL != 0:
-            return last_block.target
-        first_index = new_block_index - DIFFICULTY_ADJUSTMENT_INTERVAL
-        first_block = self.get_block(first_index)
-        if not first_block:
-            return FIXED_TARGET
-            
-        time_elapsed = last_block.timestamp - first_block.timestamp
-        if time_elapsed <= 0:
-            time_elapsed = 1
-            
-        min_time = TARGET_BLOCK_TIME // 4
-        max_time = TARGET_BLOCK_TIME * 4
         
-        if time_elapsed < min_time:
-            time_elapsed = min_time
-        if time_elapsed > max_time:
-            time_elapsed = max_time
+        N = DIFFICULTY_ADJUSTMENT_INTERVAL
+        
+        if new_block_index <= N:
+            return FIXED_TARGET
             
-        old_target = last_block.target
-        new_target = (old_target * time_elapsed) // TARGET_BLOCK_TIME
-        new_target = max(1, new_target)
-        new_target = min(new_target, FIXED_TARGET)
+        first_index = new_block_index - N - 1
+        if first_index < 0:
+            return FIXED_TARGET
+            
+        blocks = []
+        for i in range(first_index, new_block_index):
+            b = self.get_block(i)
+            if b is None:
+                return FIXED_TARGET
+            blocks.append(b)
+            
+        sum_target = 0
+        t = 0
+        for i in range(1, N + 1):
+            solve_time = blocks[i].timestamp - blocks[i-1].timestamp
+            solve_time = max(-3 * BLOCK_TIME_SECONDS, min(solve_time, 6 * BLOCK_TIME_SECONDS))
+            t += solve_time * i
+            sum_target += blocks[i].target
+            
+        K = (N * (N + 1)) // 2
+        avg_target = sum_target // N
+        t = max(1, t)
+        
+        new_target = (avg_target * t) // (K * BLOCK_TIME_SECONDS)
+        new_target = max(1, min(new_target, FIXED_TARGET))
         
         if not hasattr(self, 'last_target_log_idx'):
             self.last_target_log_idx = -1
         if new_block_index != self.last_target_log_idx:
-            factor_for_log = time_elapsed / TARGET_BLOCK_TIME
-            p2p_node.add_log(
-                f"{Fore.MAGENTA}ÚPRAVA TARGETU na bloku #{new_block_index}:{Style.RESET_ALL}\n"
-                f"  Čas posledních {DIFFICULTY_ADJUSTMENT_INTERVAL} bloků: {time_elapsed}s (Cíl: {TARGET_BLOCK_TIME}s)\n"
-                f"  Faktor úpravy: {factor_for_log:.4f}\n"
-                f"  Starý target (hex): {hex(old_target)[2:]} -> Nový target (hex): {hex(new_target)[2:]}"
-            )
+            global p2p_node
+            if 'p2p_node' in globals() and p2p_node is not None:
+                p2p_node.add_log(
+                    f"{Fore.MAGENTA}ÚPRAVA TARGETU (LWMA-3) na bloku #{new_block_index}:{Style.RESET_ALL}\n"
+                    f"  Starý target (hex): {hex(last_block.target)[2:]} -> Nový target (hex): {hex(new_target)[2:]}"
+                )
             self.last_target_log_idx = new_block_index
         return new_target
 
@@ -724,50 +714,46 @@ class Blockchain:
         return (timestamps[mid - 1] + timestamps[mid]) // 2
 
     def calculate_expected_target(self, new_block_index, chain_dict=None, new_timestamp=None):
-        if chain_dict is not None:
-            last_block = chain_dict.get(new_block_index - 1) or self.get_block_from_db(new_block_index - 1)
-        else:
-            last_block = self.get_block(new_block_index - 1)
-            
-        if not last_block:
-            return FIXED_TARGET
-            
-        if new_timestamp is not None:
-            time_diff = new_timestamp - last_block.timestamp
-            if time_diff > 3600:
-                eda_target = last_block.target + (last_block.target // 4)
-                return min(eda_target, FIXED_TARGET)
-                
-        if new_block_index < DIFFICULTY_ADJUSTMENT_INTERVAL:
-            return FIXED_TARGET
-        if new_block_index % DIFFICULTY_ADJUSTMENT_INTERVAL != 0:
-            return last_block.target
-            
-        first_index = new_block_index - DIFFICULTY_ADJUSTMENT_INTERVAL
-        if chain_dict is not None:
-            first_block = chain_dict.get(first_index) or self.get_block_from_db(first_index)
-        else:
-             first_block = self.get_block(first_index)
-             
-        if not first_block:
-            return FIXED_TARGET
-            
-        time_elapsed = last_block.timestamp - first_block.timestamp
-        if time_elapsed <= 0:
-            time_elapsed = 1
-            
-        min_time = TARGET_BLOCK_TIME // 4
-        max_time = TARGET_BLOCK_TIME * 4
+        N = DIFFICULTY_ADJUSTMENT_INTERVAL
         
-        if time_elapsed < min_time:
-            time_elapsed = min_time
-        if time_elapsed > max_time:
-            time_elapsed = max_time
+        if new_block_index <= N:
+            return FIXED_TARGET
             
-        old_target = last_block.target
-        new_target = (old_target * time_elapsed) // TARGET_BLOCK_TIME
-        new_target = max(1, new_target)
-        new_target = min(new_target, FIXED_TARGET)
+        first_index = new_block_index - N - 1
+        if first_index < 0:
+            return FIXED_TARGET
+            
+        blocks = []
+        for i in range(first_index, new_block_index):
+            if chain_dict is not None:
+                if i in chain_dict:
+                    blocks.append(chain_dict[i])
+                else:
+                    b = self.get_block_from_db(i)
+                    if b is None: 
+                        return FIXED_TARGET
+                    blocks.append(b)
+            else:
+                b = self.get_block(i)
+                if b is None: 
+                    return FIXED_TARGET
+                blocks.append(b)
+                
+        sum_target = 0
+        t = 0
+        for i in range(1, N + 1):
+            solve_time = blocks[i].timestamp - blocks[i-1].timestamp
+            solve_time = max(-3 * BLOCK_TIME_SECONDS, min(solve_time, 6 * BLOCK_TIME_SECONDS))
+            t += solve_time * i
+            sum_target += blocks[i].target
+            
+        K = (N * (N + 1)) // 2
+        avg_target = sum_target // N
+        t = max(1, t)
+        
+        new_target = (avg_target * t) // (K * BLOCK_TIME_SECONDS)
+        new_target = max(1, min(new_target, FIXED_TARGET))
+        
         return new_target
 
     @staticmethod
@@ -780,8 +766,6 @@ class Blockchain:
         version = block_data.get('version', BLOCK_VERSION)
         chain_id = block_data.get('chain_id', CHAIN_ID)
         original_target = int(target_hex, 16)
-        previous_target = block_data.get('previous_target', FIXED_TARGET)
-        previous_timestamp = block_data.get('previous_timestamp', timestamp)
         target = original_target
         nonce = start_nonce
         hashes_calculated = 0
@@ -792,12 +776,7 @@ class Blockchain:
             if current_time - timestamp > 60:
                 timestamp = int(current_time)
                 nonce = start_nonce
-                time_diff = timestamp - previous_timestamp
-                if time_diff > 3600:
-                    eda_target = previous_target + (previous_target // 4)
-                    target = min(eda_target, FIXED_TARGET)
-                else:
-                    target = original_target
+                target = original_target
                 if worker_id == 0:
                     formatted_time = time.strftime("%d.%m.%Y %H:%M:%S UTC+00:00", time.gmtime(timestamp))
                     sys.stdout.write(f"\n{Fore.YELLOW}Reset PoW nonce{Style.RESET_ALL}\n")
@@ -837,8 +816,6 @@ class Blockchain:
                 'target': hex(block.target)[2:],
                 'version': block.version,
                 'chain_id': block.chain_id,
-                'previous_timestamp': last_block.timestamp,
-                'previous_target': last_block.target
             }
             result_queue = multiprocessing.Queue()
             stop_event = multiprocessing.Event()
