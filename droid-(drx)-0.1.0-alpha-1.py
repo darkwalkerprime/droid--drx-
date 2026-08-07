@@ -3171,19 +3171,25 @@ def main():
                 mempool_size_kb = mempool_size_bytes / 1024
                 mempool_size_mb = mempool_size_kb / 1024
                 tx_count = len(droid_chain.unconfirmed_transactions)
-                print(f"Velikost mempoolu: {Fore.CYAN}{tx_count} TX / {mempool_size_kb:.2f} KB / {mempool_size_mb:.2f} MB{Style.RESET_ALL}")
+                
+                max_mempool_mb = MAX_MEMPOOL_SIZE_BYTES / (1024 * 1024)
+                usage_percent = (mempool_size_bytes / MAX_MEMPOOL_SIZE_BYTES) * 100
+                
+                print(f"Velikost mempoolu: {Fore.CYAN}{mempool_size_kb:.2f} KB / {mempool_size_mb:.2f} MB z {max_mempool_mb:.0f} MB{Style.RESET_ALL}")
+                print(f"Využití mempoolu: {Fore.MAGENTA}{usage_percent:.2f} %{Style.RESET_ALL}")
+                print(f"Počet transakcí: {Fore.CYAN}{tx_count}{Style.RESET_ALL}\n")
                 
                 if not droid_chain.unconfirmed_transactions:
                     print("    Mempool je prázdný.")
                 else:
                     for tx in droid_chain.unconfirmed_transactions:
                         print(f"TX ID: {Fore.CYAN}{tx.tx_id}{Style.RESET_ALL}")
-                        print(f" Od: {tx.from_address}")
-                        print(f" Komu: {tx.to_address}")
+                        print(f" Od: {Fore.CYAN}{tx.from_address}{Style.RESET_ALL}")
+                        print(f" Komu: {Fore.CYAN}{tx.to_address}{Style.RESET_ALL}")
                         print(f" Částka: {Fore.MAGENTA}{format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                         print(f" Poplatek: {Fore.MAGENTA}{format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                         print(f" Nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
-                        print(f" Čas: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}")
+                        print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}{Style.RESET_ALL}")
                         if tx.signature:
                             print(f" Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
                         else:
@@ -3222,18 +3228,24 @@ def main():
                         print(f"{Fore.CYAN}Žádné uložené adresy.{Style.RESET_ALL}")
                     else:
                         for name, addr in address_book.items():
-                            print(f" Jméno: {Fore.GREEN}{name}{Style.RESET_ALL} | Adresa: {Fore.CYAN}{addr}{Style.RESET_ALL}")
+                            balance = droid_chain.get_balance(addr)
+                            balance_dec = Decimal(balance) / Decimal(10 ** DECIMALS)
+                            print(f" Jméno: {Fore.GREEN}{name}{Style.RESET_ALL} | Adresa: {Fore.CYAN}{addr}{Style.RESET_ALL} (Zůstatek: {Fore.MAGENTA}{format(balance_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL})")
                             
                     print(f"\n{Fore.GREEN}1{Style.RESET_ALL} - Přidat adresu")
                     print(f"{Fore.GREEN}2{Style.RESET_ALL} - Smazat adresu")
-                    print(f"{Fore.GREEN}3{Style.RESET_ALL} - Zpět")
-                    sub_choice = input(f"{Fore.BLUE}Zadejte volbu: {Style.RESET_ALL}").strip()
+                    sub_choice = input(f"{Fore.BLUE}Zadejte volbu (Enter pro návrat): {Style.RESET_ALL}").strip()
                     
-                    if sub_choice == "1":
+                    if not sub_choice:
+                        break
+                    elif sub_choice == "1":
                         name = input("Zadejte jméno (alias): ").strip()
                         addr = input("Zadejte adresu: ").strip()
                         if not is_valid_address(addr):
                             print(f"{Fore.RED}Neplatný formát adresy.{Style.RESET_ALL}")
+                        elif addr in address_book.values():
+                            existing_name = next(k for k, v in address_book.items() if v == addr)
+                            print(f"{Fore.RED}Chyba: Tato adresa je již v adresáři uložena pod jménem '{existing_name}'.{Style.RESET_ALL}")
                         else:
                             address_book[name] = addr
                             save_address_book(address_book, password)
@@ -3246,8 +3258,6 @@ def main():
                             print(f"{Fore.GREEN}Adresa '{name}' byla smazána.{Style.RESET_ALL}")
                         else:
                             print(f"{Fore.RED}Jméno '{name}' nenalezeno.{Style.RESET_ALL}")
-                    elif sub_choice == "3":
-                        break
                     else:
                         print(f"{Fore.RED}Neplatná volba.{Style.RESET_ALL}")
                         
@@ -3256,7 +3266,6 @@ def main():
                 wallets[new_wallet.address] = new_wallet
                 print(f"{Fore.GREEN}Nová peněženka byla vytvořena!{Style.RESET_ALL}")
                 print(f" Adresa: {Fore.CYAN}{new_wallet.address}{Style.RESET_ALL}")
-                print(f" Privátní klíč (hex): {Fore.RED}{binascii.hexlify(new_wallet.private_key.to_string()).decode()}{Style.RESET_ALL}")
                 save_data(droid_chain, wallets, password, p2p_node.peers)
                 
             elif choice == "7":
@@ -3271,25 +3280,59 @@ def main():
                 save_data(droid_chain, wallets, password, p2p_node.peers)
                 
             elif choice == "8":
-                address = input(f"Zadejte ADRESU peněženky, jejíž klíč chcete exportovat: ")
-                if address in wallets:
-                    private_key_hex = binascii.hexlify(wallets[address].private_key.to_string()).decode()
-                    print(f"{Fore.GREEN}Privátní klíč pro adresu '{address}':{Style.RESET_ALL} {Fore.RED}{private_key_hex}{Style.RESET_ALL}")
-                else:
-                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Peněženka s adresou '{address}' neexistuje.")
+                if not wallets:
+                    print(f"{Fore.CYAN}Žádné peněženky nebyly nalezeny.{Style.RESET_ALL}")
+                    continue
+                    
+                print(f"\n{Fore.YELLOW}--- Peněženky ---{Style.RESET_ALL}")
+                wallet_list = list(wallets.keys())
+                for i, addr in enumerate(wallet_list, 1):
+                    balance = droid_chain.get_balance(addr)
+                    balance_dec = Decimal(balance) / Decimal(10 ** DECIMALS)
+                    print(f" {i}. {Fore.CYAN}{addr}{Style.RESET_ALL} (Zůstatek: {Fore.MAGENTA}{format(balance_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL})")
+                    
+                try:
+                    selected = int(input(f"\nVyberte číslo peněženky, jejíž klíč chcete exportovat: "))
+                    if 1 <= selected <= len(wallet_list):
+                        address = wallet_list[selected - 1]
+                        confirm = input(f"\n{Fore.YELLOW}Jste si jistí že chcete tento privátní klíč zobrazit? (a/n): {Style.RESET_ALL}").strip().lower()
+                        if confirm == 'a':
+                            private_key_hex = binascii.hexlify(wallets[address].private_key.to_string()).decode()
+                            print(f"\n{Fore.GREEN}Privátní klíč pro adresu '{address}':{Style.RESET_ALL} {Fore.RED}{private_key_hex}{Style.RESET_ALL}")
+                        else:
+                            print(f"\n{Fore.YELLOW}Akce zrušena. Privátní klíč nebyl zobrazen.{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatná volba.")
+                except ValueError:
+                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný vstup. Zadejte číslo.")
                     
             elif choice == "9":
-                address_to_delete = input(f"Zadejte ADRESU peněženky, kterou chcete smazat: ")
-                if address_to_delete in wallets:
-                    confirm = input(f"\n{Fore.YELLOW}Jste si jistí že chcete tuto peněženku smazat? Tato akce je nevratná (a/n): {Style.RESET_ALL}").strip().lower()
-                    if confirm == 'a':
-                        del wallets[address_to_delete]
-                        print(f"\n{Fore.GREEN}Peněženka '{address_to_delete}' byla úspěšně smazána.{Style.RESET_ALL}")
-                        save_data(droid_chain, wallets, password, p2p_node.peers)
+                if not wallets:
+                    print(f"{Fore.CYAN}Žádné peněženky nebyly nalezeny.{Style.RESET_ALL}")
+                    continue
+                    
+                print(f"\n{Fore.YELLOW}--- Peněženky ---{Style.RESET_ALL}")
+                wallet_list = list(wallets.keys())
+                for i, addr in enumerate(wallet_list, 1):
+                    balance = droid_chain.get_balance(addr)
+                    balance_dec = Decimal(balance) / Decimal(10 ** DECIMALS)
+                    print(f" {i}. {Fore.CYAN}{addr}{Style.RESET_ALL} (Zůstatek: {Fore.MAGENTA}{format(balance_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL})")
+                    
+                try:
+                    selected = int(input(f"\nVyberte číslo peněženky, kterou chcete smazat: "))
+                    if 1 <= selected <= len(wallet_list):
+                        address_to_delete = wallet_list[selected - 1]
+                        confirm = input(f"\n{Fore.YELLOW}Jste si jistí že chcete tuto peněženku smazat? Tato akce je nevratná (a/n): {Style.RESET_ALL}").strip().lower()
+                        if confirm == 'a':
+                            del wallets[address_to_delete]
+                            print(f"\n{Fore.GREEN}Peněženka '{address_to_delete}' byla úspěšně smazána.{Style.RESET_ALL}")
+                            save_data(droid_chain, wallets, password, p2p_node.peers)
+                        else:
+                            print(f"\n{Fore.YELLOW}Akce zrušena. Peněženka nebyla smazána.{Style.RESET_ALL}")
                     else:
-                        print(f"\n{Fore.YELLOW}Akce zrušena. Peněženka nebyla smazána.{Style.RESET_ALL}")
-                else:
-                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Peněženka s adresou '{address_to_delete}' neexistuje.")
+                        print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatná volba.")
+                except ValueError:
+                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný vstup. Zadejte číslo.")
                     
             elif choice == "10":
                 print(f"\n{Fore.YELLOW}--- Blockchain ---{Style.RESET_ALL}")
@@ -3446,14 +3489,17 @@ def main():
                         print(f" Potvrzení: {format_confirmations(confirmations)}")
                     else:
                         print(f" Potvrzení: {Fore.RED}0 (v mempoolu){Style.RESET_ALL}")
-                    print(f" Od: {tx.from_address}")
-                    print(f" Komu: {tx.to_address}")
-                    print(f" Částka: {format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
-                    print(f" Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
-                    print(f" Nonce: {tx.nonce}")
-                    print(f" Čas: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}")
-                    print(f" Veřejný klíč: {tx.public_key}")
-                    print(f" Podpis: {tx.signature}")
+                    print(f" Od: {Fore.CYAN}{tx.from_address}{Style.RESET_ALL}")
+                    print(f" Komu: {Fore.CYAN}{tx.to_address}{Style.RESET_ALL}")
+                    print(f" Částka: {Fore.MAGENTA}{format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                    print(f" Poplatek: {Fore.MAGENTA}{format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                    print(f" Nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
+                    print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}{Style.RESET_ALL}")
+                    print(f" Veřejný klíč: {Fore.CYAN}{tx.public_key}{Style.RESET_ALL}")
+                    if tx.signature:
+                        print(f" Podpis: {Fore.BLUE}{tx.signature}{Style.RESET_ALL}")
+                    else:
+                        print(f" Podpis: {Fore.RED}žádný{Style.RESET_ALL}")
                     if tx.data:
                         print(f" Zpráva: {Fore.YELLOW}{tx.data}{Style.RESET_ALL}")
                     print("-" * 20)
@@ -3500,15 +3546,15 @@ def main():
                             direction = f"{Fore.GREEN}Přijato{Style.RESET_ALL}"
                         confirmations = droid_chain.max_block_index - block_index + 1
                         print(f"TX ID: {Fore.CYAN}{tx.tx_id}{Style.RESET_ALL}")
-                        print(f" Blok: #{block_index}")
+                        print(f" Blok: {Fore.CYAN}#{block_index}{Style.RESET_ALL}")
                         print(f" Potvrzení: {format_confirmations(confirmations)}")
                         print(f" Směr: {direction}")
-                        print(f" Od: {tx.from_address}")
-                        print(f" Komu: {tx.to_address}")
-                        print(f" Částka: {format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
+                        print(f" Od: {Fore.CYAN}{tx.from_address}{Style.RESET_ALL}")
+                        print(f" Komu: {Fore.CYAN}{tx.to_address}{Style.RESET_ALL}")
+                        print(f" Částka: {Fore.MAGENTA}{format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                         if tx.from_address != "COINBASE":
-                            print(f" Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
-                        print(f" Čas: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}")
+                            print(f" Poplatek: {Fore.MAGENTA}{format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                        print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}{Style.RESET_ALL}")
                         print("-" * 20)
                         
                 pending_list = [
@@ -3526,11 +3572,11 @@ def main():
                         print(f" Blok: {Fore.YELLOW}čekající{Style.RESET_ALL}")
                         print(f" Potvrzení: {Fore.RED}0 (čekající){Style.RESET_ALL}")
                         print(f" Směr: {direction}")
-                        print(f" Od: {tx.from_address}")
-                        print(f" Komu: {tx.to_address}")
-                        print(f" Částka: {format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
-                        print(f" Poplatek: {format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
-                        print(f" Čas: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}")
+                        print(f" Od: {Fore.CYAN}{tx.from_address}{Style.RESET_ALL}")
+                        print(f" Komu: {Fore.CYAN}{tx.to_address}{Style.RESET_ALL}")
+                        print(f" Částka: {Fore.MAGENTA}{format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                        print(f" Poplatek: {Fore.MAGENTA}{format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                        print(f" Čas: {Fore.CYAN}{time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(tx.timestamp))}{Style.RESET_ALL}")
                         print("-" * 20)
                         
                 confirmed_balance = droid_chain.get_confirmed_balance(address)
@@ -3556,9 +3602,12 @@ def main():
             elif choice == "14":
                 total_supply = droid_chain.get_total_supply()
                 max_supply = MAX_SUPPLY
+                percentage = (Decimal(total_supply) / Decimal(max_supply)) * 100
+                
                 print(f"\n{Fore.YELLOW}--- Celková nabídka mincí ---{Style.RESET_ALL}")
                 print(f" Celková nabídka: {Fore.CYAN}{format(Decimal(total_supply) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                 print(f" Maximální nabídka: {Fore.CYAN}{format(Decimal(max_supply) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                print(f" Vytěženo: {Fore.MAGENTA}{percentage:.4f} %{Style.RESET_ALL}")
                 
             elif choice == "15":
                 if not p2p_node.peers:
@@ -3591,16 +3640,16 @@ def main():
                 with p2p_node.peers_lock:
                     current_peers = list(p2p_node.peers)
                 if current_peers:
-                    print("   --- Uložené uzly ---")
+                    print(f"\n{Fore.YELLOW}--- Uložené uzly ---{Style.RESET_ALL}")
                     for i, peer in enumerate(current_peers, 1):
                         peer_str = f"[{peer[0]}]:{peer[1]}" if ':' in peer[0] else f"{peer[0]}:{peer[1]}"
-                        print(f" {i}. {peer_str}")
+                        print(f" {i}. {Fore.CYAN}{peer_str}{Style.RESET_ALL}")
                     try:
-                        idx = int(input("   Zadejte číslo uzlu k odstranění: ").strip())
+                        idx = int(input(f"\n{Fore.BLUE}Zadejte číslo uzlu k odstranění: {Style.RESET_ALL}").strip())
                         if 1 <= idx <= len(current_peers):
                             peer_to_remove = current_peers[idx - 1]
                             peer_str_rm = f"[{peer_to_remove[0]}]:{peer_to_remove[1]}" if ':' in peer_to_remove[0] else f"{peer_to_remove[0]}:{peer_to_remove[1]}"
-                            block_ip = input(f"Chcete IP adresu uzlu ({peer_to_remove[0]}) před smazáním i zablokovat? (a/n): ").strip().lower()
+                            block_ip = input(f"\n{Fore.YELLOW}Chcete IP adresu uzlu ({Fore.CYAN}{peer_to_remove[0]}{Fore.YELLOW}) před smazáním i zablokovat? (a/n): {Style.RESET_ALL}").strip().lower()
                             with p2p_node.peers_lock:
                                 if peer_to_remove in p2p_node.peers:
                                     p2p_node.peers.remove(peer_to_remove)
@@ -3610,39 +3659,39 @@ def main():
                             if block_ip == 'a':
                                 p2p_node.blacklist.add(peer_to_remove[0])
                                 save_blacklist(p2p_node.blacklist)
-                                print(f"{Fore.GREEN}Uzel {peer_str_rm} byl smazán a jeho IP zablokována.{Style.RESET_ALL}")
+                                print(f"\n{Fore.GREEN}Uzel {Fore.CYAN}{peer_str_rm}{Fore.GREEN} byl smazán a jeho IP zablokována.{Style.RESET_ALL}")
                             else:
-                                print(f"{Fore.GREEN}Uzel {peer_str_rm} byl smazán.{Style.RESET_ALL}")
+                                print(f"\n{Fore.GREEN}Uzel {Fore.CYAN}{peer_str_rm}{Fore.GREEN} byl smazán.{Style.RESET_ALL}")
                         else:
-                            print(f"{Fore.RED}Neplatné číslo uzlu.{Style.RESET_ALL}")
+                            print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatné číslo uzlu.")
                     except ValueError:
-                        print(f"{Fore.RED}Neplatný vstup.{Style.RESET_ALL}")
+                        print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný vstup. Zadejte číslo.")
                 else:
-                    print(f"{Fore.YELLOW}Žádné uzly nejsou uloženy.{Style.RESET_ALL}")
+                    print(f"\n{Fore.YELLOW}Žádné uzly nejsou uloženy.{Style.RESET_ALL}")
                     
             elif choice == "18":
                 if p2p_node.blacklist:
-                    print("--- Zablokované IP adresy ---")
+                    print(f"\n{Fore.YELLOW}--- Zablokované IP adresy ---{Style.RESET_ALL}")
                     blocked_list = list(p2p_node.blacklist)
                     for i, ip in enumerate(blocked_list, 1):
-                        print(f" {i}. {ip}")
+                        print(f" {i}. {Fore.CYAN}{ip}{Style.RESET_ALL}")
                     try:
-                        idx = int(input("   Zadejte číslo IP adresy k odblokování: ").strip())
+                        idx = int(input(f"\n{Fore.BLUE}Zadejte číslo IP adresy k odblokování: {Style.RESET_ALL}").strip())
                         if 1 <= idx <= len(blocked_list):
                             ip_to_remove = blocked_list[idx - 1]
-                            confirm = input(f"\nChcete tuto IP adresu ({ip_to_remove}) odblokovat? (a/n): ").strip().lower()
+                            confirm = input(f"\n{Fore.YELLOW}Chcete tuto IP adresu ({Fore.CYAN}{ip_to_remove}{Fore.YELLOW}) odblokovat? (a/n): {Style.RESET_ALL}").strip().lower()
                             if confirm == 'a':
                                 p2p_node.blacklist.remove(ip_to_remove)
                                 save_blacklist(p2p_node.blacklist)
-                                print(f"{Fore.GREEN}IP adresa {ip_to_remove} byla odblokována.{Style.RESET_ALL}")
+                                print(f"\n{Fore.GREEN}IP adresa {Fore.CYAN}{ip_to_remove}{Fore.GREEN} byla odblokována.{Style.RESET_ALL}")
                             else:
-                                print(f"{Fore.YELLOW}Akce zrušena. IP adresa zůstává zablokovaná.{Style.RESET_ALL}")
+                                print(f"\n{Fore.YELLOW}Akce zrušena. IP adresa zůstává zablokovaná.{Style.RESET_ALL}")
                         else:
-                            print(f"{Fore.RED}Neplatné číslo IP adresy.{Style.RESET_ALL}")
+                            print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatné číslo IP adresy.")
                     except ValueError:
-                        print(f"{Fore.RED}Neplatný vstup.{Style.RESET_ALL}")
+                        print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný vstup. Zadejte číslo.")
                 else:
-                    print(f"{Fore.YELLOW}Žádné IP adresy nejsou zablokovány.{Style.RESET_ALL}")
+                    print(f"\n{Fore.YELLOW}Žádné IP adresy nejsou zablokovány.{Style.RESET_ALL}")
                     
             elif choice == "19":
                 show_p2p_log()
