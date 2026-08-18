@@ -13,7 +13,7 @@ import select
 from colorama import Fore, Style, init
 import struct
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import getpass
@@ -37,6 +37,7 @@ MAX_SUPPLY = 100_000_000 * (10 ** DECIMALS)
 BLOCK_REWARD = 50 * (10 ** DECIMALS)
 HALVING_INTERVAL_BLOCKS = 1_000_000
 BLOCK_TIME_SECONDS = 60
+COINBASE_MATURITY = 100
 TX_FEE_MIN = int(0.00000001 * (10 ** DECIMALS))
 TX_FEE_MAX = int(0.01 * (10 ** DECIMALS))
 MIN_TX_AMOUNT = int(0.00000001 * (10 ** DECIMALS))
@@ -53,14 +54,15 @@ ADDRESS_BOOK_FILE = 'address_book.json.enc'
 BLACKLIST_FILE = 'blacklist.json'
 P2P_HOST = '0.0.0.0'
 
-GENESIS_ADDRESS = "DRX5eed3a1ebfcda2a258e09af660d5cc056cd3c57cbe164bd312000762bc7368ce4026"
-GENESIS_ADDRESS_EXPECTED_HASH = "804e96365ba33513ad0d5065c751448eab3a285f23e97c6de6d36b7d7a7cf887"
+GENESIS_ADDRESS = "DRXf4fc20af1250719b255554a2382feb510b8022c7eeb0376f84b8cc03a1fce1b6a3fd1e3f"
+GENESIS_ADDRESS_EXPECTED_HASH = "8f46fa50b96e72c0156c846b6ac7b48445b17217d70be4c639b0f9f9582b71b2"
 GENESIS_TIMESTAMP = 1785614400
-GENESIS_BLOCK_EXPECTED_HASH = "00000ac311b2aaa4c74fb7cc193ca9ba0fa55bae0483cde9892cc4a657a87a50"
+GENESIS_BLOCK_EXPECTED_HASH = "00000c7956722b6e6935f3bcc421fa89730ebcfc287eaf94d24ce882ca924a24"
 GENESIS_AMOUNT = 50 * (10 ** DECIMALS)
 
 MAX_BLOCK_SIZE_BYTES = 1 * 1024 * 1024
 MAX_MEMPOOL_SIZE_BYTES = 10 * 1024 * 1024
+MAX_PENDING_TX_PER_ADDRESS = 100
 CONFIRMATIONS_THRESHOLD = 6
 NTP_SERVERS = ['pool.ntp.org', 'time.nist.gov', 'time.google.com']
 LAST_BLOCKS_TO_KEEP = 100
@@ -163,12 +165,13 @@ class Wallet:
     def public_key_to_address(public_key_bytes):
         address_hash = hashlib.sha3_256(public_key_bytes).hexdigest()
         base_address = f"{TICKER}{address_hash}"
-        checksum = hashlib.sha3_256(base_address.encode()).hexdigest()[:4]
+        checksum = hashlib.sha3_256(base_address.encode()).hexdigest()[:8]
         return base_address + checksum
 
     def sign_transaction(self, transaction):
         message = transaction.get_signing_data()
-        sig = self.private_key.sign(message)
+        # Deterministické podepisování RFC 6979
+        sig = self.private_key.sign_deterministic(message, hashfunc=hashlib.sha3_256)
         
         # Vynucení Low-S pravidla (BIP 62) aby síť naši vlastní transakci nezahodila
         r, s = ecdsa.util.sigdecode_string(sig, ecdsa.SECP256k1.order)
@@ -194,19 +197,34 @@ class Transaction:
         self.tx_id = tx_id or self.compute_hash()
 
     def get_signing_data(self):
-        pk_str = self.public_key if self.public_key else ""
-        data_str = self.data if self.data else ""
-        
-        raw_string = f"{self.chain_id}|{self.from_address}|{self.to_address}|{self.amount}|{self.fee}|{self.timestamp}|{self.nonce}|{pk_str}|{data_str}"
-        return raw_string.encode('utf-8')
+        data = {
+            'amount': self.amount,
+            'chain_id': self.chain_id,
+            'data': self.data,
+            'fee': self.fee,
+            'from_address': self.from_address,
+            'nonce': self.nonce,
+            'public_key': self.public_key,
+            'timestamp': self.timestamp,
+            'to_address': self.to_address
+        }
+        return json.dumps(data, separators=(',', ':'), sort_keys=True).encode('utf-8')
 
     def compute_hash(self):
-        pk_str = self.public_key if self.public_key else ""
-        sig_str = self.signature if self.signature else ""
-        data_str = self.data if self.data else ""
-        
-        raw_string = f"{self.chain_id}|{self.from_address}|{self.to_address}|{self.amount}|{self.fee}|{self.timestamp}|{self.nonce}|{pk_str}|{sig_str}|{data_str}"
-        return hashlib.sha3_256(raw_string.encode('utf-8')).hexdigest()
+        # Transaction malleability ochrana: Počítáme tx_id čistě bez parametru signature
+        data = {
+            'amount': self.amount,
+            'chain_id': self.chain_id,
+            'data': self.data,
+            'fee': self.fee,
+            'from_address': self.from_address,
+            'nonce': self.nonce,
+            'public_key': self.public_key,
+            'timestamp': self.timestamp,
+            'to_address': self.to_address
+        }
+        raw_bytes = json.dumps(data, separators=(',', ':'), sort_keys=True).encode('utf-8')
+        return hashlib.sha3_256(raw_bytes).hexdigest()
 
     def to_dict(self):
         return {
@@ -246,7 +264,6 @@ class Transaction:
         return tx
 
     def get_size(self):
-        # Striktní determinismus velikosti
         return len(json.dumps(self.to_dict(), separators=(',', ':'), sort_keys=True).encode('utf-8'))
 
     def is_valid_timestamp(self):
@@ -279,19 +296,30 @@ class Transaction:
         try:
             public_key_bytes = binascii.unhexlify(self.public_key)
             generated_address = Wallet.public_key_to_address(public_key_bytes)
-            if len(self.from_address) != 71:
+            if len(self.from_address) != 75:
                 return False
             return self.from_address == generated_address
         except binascii.Error:
             return False
 
 def compute_merkle_leaf_hash(tx):
-    pk_str = tx.public_key if tx.public_key else ""
-    sig_str = tx.signature if tx.signature else ""
-    data_str = tx.data if tx.data else ""
-    
-    raw_string = f"{tx.chain_id}|{tx.from_address}|{tx.to_address}|{tx.amount}|{tx.fee}|{tx.timestamp}|{tx.nonce}|{pk_str}|{sig_str}|{data_str}"
-    return hashlib.sha3_256(raw_string.encode('utf-8')).hexdigest()
+    # Pro Merkle tree zachováváme zahrnutí signatury pro zajištění validity podepsaných dat napříč blokem
+    data = {
+        'amount': tx.amount,
+        'chain_id': tx.chain_id,
+        'data': tx.data,
+        'fee': tx.fee,
+        'from_address': tx.from_address,
+        'nonce': tx.nonce,
+        'public_key': tx.public_key,
+        'signature': tx.signature,
+        'timestamp': tx.timestamp,
+        'to_address': tx.to_address
+    }
+    raw_bytes = json.dumps(data, separators=(',', ':'), sort_keys=True).encode('utf-8')
+    return hashlib.sha3_256(raw_bytes).hexdigest()
+
+MERKLE_ZERO_HASH = "0" * 64
 
 def compute_merkle_root(transactions):
     if not transactions:
@@ -299,7 +327,7 @@ def compute_merkle_root(transactions):
     tx_hashes = [compute_merkle_leaf_hash(tx) for tx in transactions]
     while len(tx_hashes) > 1:
         if len(tx_hashes) % 2 != 0:
-            tx_hashes.append(tx_hashes[-1])
+            tx_hashes.append(MERKLE_ZERO_HASH)
         new_hashes = []
         for i in range(0, len(tx_hashes), 2):
             combined = tx_hashes[i] + tx_hashes[i + 1]
@@ -322,11 +350,20 @@ class Block:
         self.hash = self.compute_hash()
 
     def compute_hash(self):
-        raw_string = f"{self.version}|{self.chain_id}|{self.index}|{self.timestamp}|{self.merkle_root}|{self.previous_hash}|{hex(self.target)[2:]}|{self.nonce}"
-        return hashlib.sha3_256(raw_string.encode('utf-8')).hexdigest()
+        data = {
+            'chain_id': self.chain_id,
+            'index': self.index,
+            'merkle_root': self.merkle_root,
+            'nonce': self.nonce,
+            'previous_hash': self.previous_hash,
+            'target': hex(self.target)[2:],
+            'timestamp': self.timestamp,
+            'version': self.version
+        }
+        raw_bytes = json.dumps(data, separators=(',', ':'), sort_keys=True).encode('utf-8')
+        return hashlib.sha3_256(raw_bytes).hexdigest()
 
     def get_size(self):
-        # Striktní determinismus velikosti bloku pro zamezení rozštěpení sítě na hranici 1 MB
         return len(json.dumps(self.to_dict(), separators=(',', ':'), sort_keys=True).encode('utf-8'))
 
     def to_dict(self):
@@ -374,6 +411,7 @@ class Blockchain:
         self.mining_in_progress = False
         self.balance_map = {}
         self.nonce_map = {}
+        self.immature_rewards = {}
         self.total_supply = 0
         self.orphan_pool = {}
         self.orphan_parents = defaultdict(list)
@@ -387,18 +425,34 @@ class Blockchain:
             current_time = get_time()
             valid_transactions = []
             expired_transactions = []
+            
+            txs_by_addr = defaultdict(list)
             for tx in self.unconfirmed_transactions:
-                if (current_time - tx.timestamp) <= MEMPOOL_TX_EXPIRATION:
-                    valid_transactions.append(tx)
-                else:
-                    expired_transactions.append(tx)
-            self.unconfirmed_transactions = valid_transactions
+                txs_by_addr[tx.from_address].append(tx)
+                
+            for addr, txs in txs_by_addr.items():
+                txs.sort(key=lambda t: t.nonce)
+                expired_nonce_threshold = None
+                for tx in txs:
+                    if (current_time - tx.timestamp) > MEMPOOL_TX_EXPIRATION:
+                        if expired_nonce_threshold is None:
+                            expired_nonce_threshold = tx.nonce
+                        expired_transactions.append(tx)
+                    else:
+                        if expired_nonce_threshold is not None and tx.nonce > expired_nonce_threshold:
+                            expired_transactions.append(tx)
+                        else:
+                            valid_transactions.append(tx)
+
+            valid_tx_ids = {t.tx_id for t in valid_transactions}
+            self.unconfirmed_transactions = [t for t in self.unconfirmed_transactions if t.tx_id in valid_tx_ids]
+
             if expired_transactions:
                 save_mempool(self.unconfirmed_transactions)
                 global p2p_node
                 if 'p2p_node' in globals() and p2p_node is not None:
                     for tx in expired_transactions:
-                        p2p_node.add_log(f"{Fore.YELLOW}Upozornění: Transakce {tx.tx_id} vypršela a byla odstraněna z mempoolu.{Style.RESET_ALL}")
+                        p2p_node.add_log(f"{Fore.YELLOW}Upozornění: Transakce {tx.tx_id} byla odstraněna z mempoolu (expirace nebo navazující).{Style.RESET_ALL}")
 
     def create_genesis_block(self):
         genesis_tx = Transaction(
@@ -412,20 +466,28 @@ class Blockchain:
             timestamp=GENESIS_TIMESTAMP,
             data="BTC: 000000000000000000009c26a9609e1956765cb1a89fb4cdd2411b75f208dd76"
         )
-        genesis_block = Block(0, [genesis_tx], "0", FIXED_TARGET, nonce=518174, timestamp=GENESIS_TIMESTAMP, version=BLOCK_VERSION, chain_id=CHAIN_ID)
+        genesis_block = Block(0, [genesis_tx], "0", FIXED_TARGET, nonce=592486, timestamp=GENESIS_TIMESTAMP, version=BLOCK_VERSION, chain_id=CHAIN_ID)
         self.chain.append(genesis_block)
         self.max_block_index = 0
         self.update_state_with_block(genesis_block)
         print(f"{Fore.GREEN}Genesis blok vytvořen a přidán do řetězce!{Style.RESET_ALL}")
 
     def update_state_with_block(self, block):
+        target_index = block.index - COINBASE_MATURITY
+        if target_index in self.immature_rewards:
+            reward_data = self.immature_rewards.pop(target_index)
+            mature_address = reward_data['address']
+            mature_amount = reward_data['amount']
+            self.balance_map[mature_address] = self.balance_map.get(mature_address, 0) + mature_amount
+
         for tx in block.transactions:
             if tx.from_address == "COINBASE":
-                self.balance_map[tx.to_address] = self.balance_map.get(tx.to_address, 0) + tx.amount
+                self.immature_rewards[block.index] = {'address': tx.to_address, 'amount': tx.amount}
             else:
                 self.balance_map[tx.from_address] = self.balance_map.get(tx.from_address, 0) - tx.amount - tx.fee
                 self.balance_map[tx.to_address] = self.balance_map.get(tx.to_address, 0) + tx.amount
                 self.nonce_map[tx.from_address] = max(self.nonce_map.get(tx.from_address, -1), tx.nonce)
+                
         self.cumulative_work += (1 << 256) // block.target if block.target > 0 else 0
         halvings = block.index // HALVING_INTERVAL_BLOCKS
         if block.index == 0:
@@ -443,6 +505,7 @@ class Blockchain:
         c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index")
         self.balance_map = {}
         self.nonce_map = {}
+        self.immature_rewards = {}
         self.cumulative_work = 0
         self.total_supply = 0
         for row in c:
@@ -506,9 +569,11 @@ class Blockchain:
         return self.get_block_from_db(prev_index)
 
     def get_next_nonce(self, address):
-        confirmed_nonce = self.nonce_map.get(address, -1)
-        pending_count = sum(1 for tx in self.unconfirmed_transactions if tx.from_address == address)
-        return confirmed_nonce + 1 + pending_count
+        expected_nonce = self.nonce_map.get(address, -1) + 1
+        mempool_nonces = {tx.nonce for tx in self.unconfirmed_transactions if tx.from_address == address}
+        while expected_nonce in mempool_nonces:
+            expected_nonce += 1
+        return expected_nonce
 
     def get_pending_balance(self, wallet_address):
         balance_change = 0
@@ -558,28 +623,16 @@ class Blockchain:
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nepovolená zpráva v ne-coinbase transakci.")
                 return False
             
+            pending_count = sum(1 for tx in self.unconfirmed_transactions if tx.from_address == transaction.from_address)
+            if pending_count >= MAX_PENDING_TX_PER_ADDRESS:
+                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Dosažen limit maximálního počtu nepotvrzených transakcí pro jednu adresu ({MAX_PENDING_TX_PER_ADDRESS}).")
+                return False
+                
             mempool_size = sum(tx.get_size() for tx in self.unconfirmed_transactions)
             tx_size = transaction.get_size()
             if mempool_size + tx_size > MAX_MEMPOOL_SIZE_BYTES:
-                new_ratio = transaction.fee / tx_size
-                sorted_pool = sorted(self.unconfirmed_transactions, key=lambda t: t.fee / t.get_size())
-                freed_space = 0
-                to_remove = set()
-                
-                for t in sorted_pool:
-                    if (t.fee / t.get_size()) < new_ratio:
-                        to_remove.add(t.tx_id)
-                        freed_space += t.get_size()
-                        if mempool_size - freed_space + tx_size <= MAX_MEMPOOL_SIZE_BYTES:
-                            break
-                    else:
-                        break
-                        
-                if mempool_size - freed_space + tx_size > MAX_MEMPOOL_SIZE_BYTES:
-                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Mempool je plný a nová transakce nemá dostatečný poplatek k nahrazení jiných.")
-                    return False
-                    
-                self.unconfirmed_transactions = [t for t in self.unconfirmed_transactions if t.tx_id not in to_remove]
+                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Mempool je plný.")
+                return False
                 
             if not transaction.is_valid_timestamp():
                 print(f"{Fore.RED}Chyba ověření transakce:{Style.RESET_ALL} Timestamp transakce je neplatný.")
@@ -676,6 +729,13 @@ class Blockchain:
         t = max(1, t)
         
         new_target = (avg_target * t) // (K * BLOCK_TIME_SECONDS)
+        
+        prev_target = last_block.target
+        if new_target > prev_target * 4:
+            new_target = prev_target * 4
+        elif new_target < prev_target // 4:
+            new_target = prev_target // 4
+            
         new_target = max(1, min(new_target, FIXED_TARGET))
         
         if not hasattr(self, 'last_target_log_idx'):
@@ -752,6 +812,13 @@ class Blockchain:
         t = max(1, t)
         
         new_target = (avg_target * t) // (K * BLOCK_TIME_SECONDS)
+        
+        prev_target = blocks[-1].target
+        if new_target > prev_target * 4:
+            new_target = prev_target * 4
+        elif new_target < prev_target // 4:
+            new_target = prev_target // 4
+            
         new_target = max(1, min(new_target, FIXED_TARGET))
         
         return new_target
@@ -784,8 +851,18 @@ class Blockchain:
                     sys.stdout.write(f"{Fore.MAGENTA}Target:{Style.RESET_ALL} {hex(target)[2:]}\n\n")
                     sys.stdout.flush()
             
-            raw_string = f"{version}|{chain_id}|{index}|{timestamp}|{merkle_root}|{previous_hash}|{hex(target)[2:]}|{nonce}"
-            computed_hash = hashlib.sha3_256(raw_string.encode('utf-8')).hexdigest()
+            data = {
+                'chain_id': chain_id,
+                'index': index,
+                'merkle_root': merkle_root,
+                'nonce': nonce,
+                'previous_hash': previous_hash,
+                'target': hex(target)[2:],
+                'timestamp': timestamp,
+                'version': version
+            }
+            raw_bytes = json.dumps(data, separators=(',', ':'), sort_keys=True).encode('utf-8')
+            computed_hash = hashlib.sha3_256(raw_bytes).hexdigest()
             hashes_calculated += 1
             
             if Blockchain.meets_difficulty(computed_hash, target):
@@ -1045,17 +1122,22 @@ class Blockchain:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nesprávná coinbase odměna.{Style.RESET_ALL}")
                 return False
                 
+            target_index = block.index - COINBASE_MATURITY
+            simulated_mature_balance = defaultdict(int)
+            if target_index in self.immature_rewards:
+                simulated_mature_balance[self.immature_rewards[target_index]['address']] += self.immature_rewards[target_index]['amount']
+
             temp_balance_changes = defaultdict(int)
             for tx in block.transactions:
                 if tx.from_address != "COINBASE":
-                    current_balance = self.balance_map.get(tx.from_address, 0) + temp_balance_changes[tx.from_address]
+                    current_balance = self.balance_map.get(tx.from_address, 0) + simulated_mature_balance[tx.from_address] + temp_balance_changes[tx.from_address]
                     if current_balance < tx.amount + tx.fee:
                         p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nedostatečný zůstatek pro transakci {tx.tx_id} od {tx.from_address}.{Style.RESET_ALL}")
                         return False
                     temp_balance_changes[tx.from_address] -= (tx.amount + tx.fee)
                     temp_balance_changes[tx.to_address] += tx.amount
                 else:
-                    temp_balance_changes[tx.to_address] += tx.amount
+                    pass
                     
             block.hash = proof
             
@@ -1166,7 +1248,8 @@ class Blockchain:
             new_block_transactions = [mining_reward]
             current_block_size = 0
             
-            dummy_block = Block(self.max_block_index + 1, [], self.get_last_block().hash, self.get_target(new_timestamp=mining_reward.timestamp), version=BLOCK_VERSION, chain_id=CHAIN_ID)
+            # Bezpečná alokace s ohledem na maximální velikost budoucí nonce (sys.maxsize místo 0)
+            dummy_block = Block(self.max_block_index + 1, [], self.get_last_block().hash, self.get_target(new_timestamp=mining_reward.timestamp), nonce=sys.maxsize, version=BLOCK_VERSION, chain_id=CHAIN_ID)
             current_block_size += dummy_block.get_size()
             current_block_size += mining_reward.get_size()
             total_fees = 0
@@ -1179,12 +1262,17 @@ class Blockchain:
                 
             for sender in tx_by_sender:
                 tx_by_sender[sender].sort(key=lambda tx: tx.nonce)
+            
             pq = []
+            expected_nonces = {sender: self.nonce_map.get(sender, -1) + 1 for sender in tx_by_sender.keys()}
             
             for sender, txs in tx_by_sender.items():
                 if txs:
                     first_tx = txs[0]
-                    heapq.heappush(pq, (-first_tx.fee, first_tx.timestamp, first_tx.tx_id, sender))
+                    # Kontrola na návaznost hned při přidávání prvního prvku (ochrana před dírami)
+                    if first_tx.nonce == expected_nonces[sender]:
+                        heapq.heappush(pq, (-first_tx.fee, first_tx.timestamp, first_tx.tx_id, sender))
+            
             selected_txs = []
             
             while pq:
@@ -1194,14 +1282,20 @@ class Blockchain:
                 tx = tx_by_sender[sender].pop(0)
                 tx_size = tx.get_size()
                 if current_block_size + tx_size > MAX_BLOCK_SIZE_BYTES:
-                    tx_by_sender[sender].insert(0, tx)
+                    # Transakce se nevejde. S tímto odesílatelem musíme rovnou skončit, 
+                    # jinak by v bloku vznikla mezera v nonce.
                     continue
+                    
                 selected_txs.append(tx)
                 current_block_size += tx_size
                 total_fees += tx.fee
+                expected_nonces[sender] += 1
+                
                 if tx_by_sender[sender]:
                     next_tx = tx_by_sender[sender][0]
-                    heapq.heappush(pq, (-next_tx.fee, next_tx.timestamp, next_tx.tx_id, sender))
+                    # Striktní kontrola následné nonce před vložením do fronty (zamezení mrtvé smyčce)
+                    if next_tx.nonce == expected_nonces[sender]:
+                        heapq.heappush(pq, (-next_tx.fee, next_tx.timestamp, next_tx.tx_id, sender))
                     
             tx_id_set = set()
             nonce_map = {}
@@ -1299,6 +1393,7 @@ class Blockchain:
         nonce_maps = {}
         total_supply = 0
         balance_map = {}
+        immature_rewards = {}
         cumulative_work = 0
         
         chain_window = {}
@@ -1358,6 +1453,8 @@ class Blockchain:
                     return False, None
                     
                 genesis_tx = current_block.transactions[0]
+                if not is_valid_address(genesis_tx.to_address):
+                    return False, None
                 if genesis_tx.to_address != GENESIS_ADDRESS or genesis_tx.amount != GENESIS_AMOUNT or genesis_tx.timestamp != GENESIS_TIMESTAMP:
                     return False, None
                 if current_block.merkle_root != compute_merkle_root(current_block.transactions):
@@ -1366,7 +1463,7 @@ class Blockchain:
                     return False, None
                     
                 total_supply += GENESIS_AMOUNT
-                balance_map[genesis_tx.to_address] = balance_map.get(genesis_tx.to_address, 0) + genesis_tx.amount
+                immature_rewards[0] = {'address': genesis_tx.to_address, 'amount': genesis_tx.amount}
                 cumulative_work += (1 << 256) // current_block.target if current_block.target > 0 else 0
                 seen_tx_ids.add(genesis_tx.tx_id)
                 previous_block = current_block
@@ -1485,6 +1582,11 @@ class Blockchain:
                 else:
                     nonce_maps[sender] = set(nonces_in_block)
 
+            target_index = current_block.index - COINBASE_MATURITY
+            if target_index in immature_rewards:
+                reward_data = immature_rewards.pop(target_index)
+                balance_map[reward_data['address']] = balance_map.get(reward_data['address'], 0) + reward_data['amount']
+
             temp_balance_changes = defaultdict(int)
             for tx in current_block.transactions:
                 if tx.from_address != "COINBASE":
@@ -1495,7 +1597,7 @@ class Blockchain:
                     temp_balance_changes[tx.from_address] -= (tx.amount + tx.fee)
                     temp_balance_changes[tx.to_address] += tx.amount
                 else:
-                    temp_balance_changes[tx.to_address] += tx.amount
+                    immature_rewards[current_block.index] = {'address': tx.to_address, 'amount': tx.amount}
             
             for addr, change in temp_balance_changes.items():
                 balance_map[addr] = balance_map.get(addr, 0) + change
@@ -1507,7 +1609,8 @@ class Blockchain:
             'balance_map': balance_map,
             'nonce_map': final_nonce_map,
             'total_supply': total_supply,
-            'cumulative_work': cumulative_work
+            'cumulative_work': cumulative_work,
+            'immature_rewards': immature_rewards
         }
         return True, state_dict
 
@@ -1610,6 +1713,7 @@ class Blockchain:
             self.nonce_map = new_state['nonce_map']
             self.total_supply = new_state['total_supply']
             self.cumulative_work = new_state['cumulative_work']
+            self.immature_rewards = new_state.get('immature_rewards', {})
             self.max_block_index = new_length - 1
             
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
@@ -1711,12 +1815,12 @@ def load_address_book(password):
             salt = data[:16]
             nonce = data[16:28]
             ciphertext_and_tag = data[28:]
-            kdf = PBKDF2HMAC(
-                algorithm=hashes.SHA256(),
-                length=32,
+            kdf = Argon2id(
                 salt=salt,
-                iterations=200000,
-                backend=default_backend()
+                length=32,
+                iterations=3,
+                lanes=4,
+                memory_cost=65536
             )
             key = kdf.derive(password.encode())
             aesgcm = AESGCM(key)
@@ -1731,12 +1835,12 @@ def save_address_book(address_book, password):
     try:
         data_json = json.dumps(address_book, indent=4).encode()
         salt = os.urandom(16)
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
+        kdf = Argon2id(
             salt=salt,
-            iterations=200000,
-            backend=default_backend()
+            length=32,
+            iterations=3,
+            lanes=4,
+            memory_cost=65536
         )
         key = kdf.derive(password.encode())
         nonce = os.urandom(12)
@@ -1828,12 +1932,12 @@ def save_wallets_enc(wallets, password):
     }
     data_json = json.dumps(wallet_data).encode()
     salt = os.urandom(16)
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
+    kdf = Argon2id(
         salt=salt,
-        iterations=200000,
-        backend=default_backend()
+        length=32,
+        iterations=3,
+        lanes=4,
+        memory_cost=65536
     )
     key = kdf.derive(password.encode())
     nonce = os.urandom(12)
@@ -1911,12 +2015,12 @@ def load_data():
             salt = data[:16]
             nonce = data[16:28]
             ciphertext_and_tag = data[28:]
-            kdf = PBKDF2HMAC(
-                algorithm=hashes.SHA256(),
-                length=32,
+            kdf = Argon2id(
                 salt=salt,
-                iterations=200000,
-                backend=default_backend()
+                length=32,
+                iterations=3,
+                lanes=4,
+                memory_cost=65536
             )
             key = kdf.derive(password.encode())
             aesgcm = AESGCM(key)
@@ -2043,6 +2147,7 @@ def load_data():
     droid_chain.nonce_map = chain_state['nonce_map']
     droid_chain.total_supply = chain_state['total_supply']
     droid_chain.cumulative_work = chain_state['cumulative_work']
+    droid_chain.immature_rewards = chain_state.get('immature_rewards', {})
     print(f"{Fore.GREEN}Blockchain validován úspěšně.{Style.RESET_ALL}")
     droid_chain.unconfirmed_transactions = load_mempool(droid_chain)
     return droid_chain, wallets, peers, password
@@ -2891,11 +2996,11 @@ class P2PNode:
 def is_valid_address(address):
     if not isinstance(address, str) or not address.startswith(TICKER):
         return False
-    if len(address) != 71:
+    if len(address) != 75:
         return False
-    base = address[:-4]
-    expected_checksum = hashlib.sha3_256(base.encode()).hexdigest()[:4]
-    return address[-4:] == expected_checksum and all(c in '0123456789abcdef' for c in address[3:])
+    base = address[:-8]
+    expected_checksum = hashlib.sha3_256(base.encode()).hexdigest()[:8]
+    return address[-8:] == expected_checksum and all(c in '0123456789abcdef' for c in address[3:])
 
 def show_p2p_log():
     print(f"\n{Fore.YELLOW}--- Log P2P sítě (stiskněte Enter pro návrat) ---{Style.RESET_ALL}")
@@ -2930,6 +3035,9 @@ def print_menu():
     print(f"{Fore.GREEN}20{Style.RESET_ALL} - Ukončit a uložit")
 
 def verify_genesis_address():
+    if not is_valid_address(GENESIS_ADDRESS):
+        print(f"{Fore.RED}Chyba: Genesis adresa nemá platný formát! Program se ukončuje.{Style.RESET_ALL}")
+        sys.exit(1)
     current_hash = hashlib.sha3_256(GENESIS_ADDRESS.encode()).hexdigest()
     if current_hash != GENESIS_ADDRESS_EXPECTED_HASH:
         print(f"{Fore.RED}Chyba: Genesis adresa byla změněna! Program se ukončuje.{Style.RESET_ALL}")
@@ -3059,7 +3167,7 @@ def main():
                         pending_incoming_dec = Decimal(pending_incoming_sum) / Decimal(10 ** DECIMALS)
                         
                         print(f"Adresa: {Fore.CYAN}{address}{Style.RESET_ALL}")
-                        print(f" Celkový zůstatek: {Fore.MAGENTA}{format(total_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                        print(f" Potvrzený zůstatek: {Fore.MAGENTA}{format(total_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                         
                         if pending_outgoing:
                             print(f" Pending (-): {Fore.RED}-{format(pending_outgoing_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
@@ -3203,7 +3311,7 @@ def main():
                         
             elif choice == "4":
                 if not p2p_node.get_online_peers():
-                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Těžba není možné. Musíte být připojen k alespoň jednomu dalšímu uzlu.")
+                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Těžba není možná. Musíte být připojen k alespoň jednomu dalšímu uzlu.")
                     continue
                 if not wallets:
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Žádné peněženky nejsou dostupné. Nejdříve vytvořte nebo importujte peněženku.")
@@ -3237,13 +3345,18 @@ def main():
                             
                     print(f"\n{Fore.GREEN}1{Style.RESET_ALL} - Přidat adresu")
                     print(f"{Fore.GREEN}2{Style.RESET_ALL} - Smazat adresu")
-                    print(f"{Fore.GREEN}3{Style.RESET_ALL} - Zpět")
-                    sub_choice = input(f"{Fore.BLUE}Zadejte volbu: {Style.RESET_ALL}").strip()
+                    sub_choice = input(f"{Fore.BLUE}Zadejte volbu (nebo stiskněte Enter pro návrat): {Style.RESET_ALL}").strip()
                     
-                    if sub_choice == "1":
+                    if sub_choice == "":
+                        break
+                    elif sub_choice == "1":
                         name = input("Zadejte jméno (alias): ").strip()
                         addr = input("Zadejte adresu: ").strip()
-                        if not is_valid_address(addr):
+                        if name in address_book:
+                            print(f"{Fore.RED}Tento alias již existuje.{Style.RESET_ALL}")
+                        elif addr in address_book.values():
+                            print(f"{Fore.RED}Tato adresa je již v adresáři uložena.{Style.RESET_ALL}")
+                        elif not is_valid_address(addr):
                             print(f"{Fore.RED}Neplatný formát adresy.{Style.RESET_ALL}")
                         else:
                             address_book[name] = addr
@@ -3257,8 +3370,6 @@ def main():
                             print(f"{Fore.GREEN}Adresa '{name}' byla smazána.{Style.RESET_ALL}")
                         else:
                             print(f"{Fore.RED}Jméno '{name}' nenalezeno.{Style.RESET_ALL}")
-                    elif sub_choice == "3":
-                        break
                     else:
                         print(f"{Fore.RED}Neplatná volba.{Style.RESET_ALL}")
                         
@@ -3267,7 +3378,7 @@ def main():
                 wallets[new_wallet.address] = new_wallet
                 print(f"{Fore.GREEN}Nová peněženka byla vytvořena!{Style.RESET_ALL}")
                 print(f" Adresa: {Fore.CYAN}{new_wallet.address}{Style.RESET_ALL}")
-                print(f" Privátní klíč (hex): {Fore.RED}{binascii.hexlify(new_wallet.private_key.to_string()).decode()}{Style.RESET_ALL}")
+                print(f" {Fore.RED}Informace: Privátní klíč byl bezpečně uložen do souboru.{Style.RESET_ALL}")
                 save_data(droid_chain, wallets, password, p2p_node.peers)
                 
             elif choice == "7":
@@ -3276,6 +3387,9 @@ def main():
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný formát privátního klíče.")
                     continue
                 imported_wallet = Wallet(private_key=key_hex)
+                if imported_wallet.address in wallets:
+                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Privátní klíč k této adrese už existuje v seznamu peněženek.")
+                    continue
                 wallets[imported_wallet.address] = imported_wallet
                 print(f"{Fore.GREEN}Peněženka byla úspěšně importována!{Style.RESET_ALL}")
                 print(f" Adresa: {Fore.CYAN}{imported_wallet.address}{Style.RESET_ALL}")
@@ -3284,8 +3398,12 @@ def main():
             elif choice == "8":
                 address = input(f"Zadejte ADRESU peněženky, jejíž klíč chcete exportovat: ")
                 if address in wallets:
-                    private_key_hex = binascii.hexlify(wallets[address].private_key.to_string()).decode()
-                    print(f"{Fore.GREEN}Privátní klíč pro adresu '{address}':{Style.RESET_ALL} {Fore.RED}{private_key_hex}{Style.RESET_ALL}")
+                    bezp_otazka = input(f"{Fore.YELLOW}Opravdu si přejete exportovat privátní klíč? (a/n): {Style.RESET_ALL}").strip().lower()
+                    if bezp_otazka == 'a':
+                        private_key_hex = binascii.hexlify(wallets[address].private_key.to_string()).decode()
+                        print(f"{Fore.GREEN}Privátní klíč pro adresu '{address}':{Style.RESET_ALL} {Fore.RED}{private_key_hex}{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.YELLOW}Export privátního klíče byl zrušen.{Style.RESET_ALL}")
                 else:
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Peněženka s adresou '{address}' neexistuje.")
                     
