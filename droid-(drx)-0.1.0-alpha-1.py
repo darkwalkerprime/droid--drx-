@@ -28,6 +28,7 @@ import ipaddress
 from decimal import Decimal, ROUND_HALF_UP
 import platform
 import copy
+from types import SimpleNamespace
 
 init(autoreset=True)
 
@@ -38,7 +39,8 @@ MAX_SUPPLY = 100_000_000 * (10 ** DECIMALS)
 BLOCK_REWARD = 50 * (10 ** DECIMALS)
 HALVING_INTERVAL_BLOCKS = 1_000_000
 BLOCK_TIME_SECONDS = 60
-COINBASE_MATURITY = 100
+COINBASE_MATURITY = 1000
+MAX_REORG_DEPTH = 1000
 TX_FEE_MIN = int(0.00000001 * (10 ** DECIMALS))
 TX_FEE_MAX = int(0.01 * (10 ** DECIMALS))
 MIN_TX_AMOUNT = int(0.00000001 * (10 ** DECIMALS))
@@ -58,15 +60,23 @@ P2P_HOST = '0.0.0.0'
 GENESIS_ADDRESS = "DRXf4fc20af1250719b255554a2382feb510b8022c7eeb0376f84b8cc03a1fce1b6a3fd1e3f"
 GENESIS_ADDRESS_EXPECTED_HASH = "8f46fa50b96e72c0156c846b6ac7b48445b17217d70be4c639b0f9f9582b71b2"
 GENESIS_TIMESTAMP = 1785614400
-GENESIS_BLOCK_EXPECTED_HASH = "000001434c648a7952a30ce19be22f559604312088f4a963ffd00edf9edbb719"
+# Genesis konstanty jsou ověřené a platí i po zavedení state_root do hlavičky:
+# nonce 38083 dává hash 0000013c... včetně state_root
+# c6253efc7a5da68207e84ab2d5d238e33c23e9945cf411c0c622cb0adfca380a a splňuje
+# FIXED_TARGET. verify_genesis_block() i CHECKPOINTS[0] projdou.
+# Samotný state_root genesis bloku se dopočítá automaticky v create_genesis_block().
+# Při JAKÉKOLI změně obsahu genesis bloku (adresa, částka, čas, data, target,
+# version, chain_id) je nutné obě hodnoty níže znovu vytěžit a přepsat.
+GENESIS_NONCE = 38083
+GENESIS_BLOCK_EXPECTED_HASH = "0000013c6d9294c2cb086690a83283f868121f1ff9713e44d115c32ca687a1c9"
 GENESIS_AMOUNT = 50 * (10 ** DECIMALS)
 
 MAX_BLOCK_SIZE_BYTES = 1 * 1024 * 1024
 MAX_MEMPOOL_SIZE_BYTES = 10 * 1024 * 1024
 MAX_PENDING_TX_PER_ADDRESS = 100
-CONFIRMATIONS_THRESHOLD = 6
+CONFIRMATIONS_THRESHOLD = 1001
 NTP_SERVERS = ['pool.ntp.org', 'time.nist.gov', 'time.google.com']
-LAST_BLOCKS_TO_KEEP = 200
+LAST_BLOCKS_TO_KEEP = 1200
 MAX_PEERS = 20
 RATE_LIMIT_REQUESTS = 10
 RATE_LIMIT_WINDOW = 1
@@ -328,8 +338,165 @@ def compute_merkle_root(transactions):
         tx_hashes = new_hashes
     return tx_hashes[0]
 
+# ---------------------------------------------------------------------------
+# STATE ROOT - Sparse Merkle Tree (SMT) nad účty
+# ---------------------------------------------------------------------------
+# Konsenzuální commitment k celému stavu řetězce. Hlavička bloku nese state_root
+# = stav PO aplikaci daného bloku (ethereum sémantika). Protože přechod stavu
+# nezávisí na nonce ani na hashi bloku, těžař root spočítá ještě před PoW a
+# ostatní uzly ho po aplikaci bloku ověří.
+#
+# Struktura: sparse Merkle tree hloubky 256, pozice listu je dána
+# sha3_256(adresa). Podstrom s jediným listem se "sbalí" na hash toho listu
+# (jellyfish varianta) - díky tomu je strom mělký (~log2(n)) a výpočet je
+# O(n log n) místo O(n*256). Sbalení je bezpečné, protože list hashuje i svůj
+# vlastní klíč, takže ho nelze přesunout jinam ve stromě.
+#
+# Doménové prefixy oddělují hash listu od hashe vnitřního uzlu (ochrana proti
+# záměně typu uzlu).
+#
+# KANONICKÉ PRAVIDLO: účet je součástí stavu, právě když má nenulový zůstatek
+# NEBO záznam v nonce_map. Nulové zůstatky se do rootu nepočítají, takže
+# nezáleží na tom, jestli v paměti zbyl klíč s hodnotou 0 - jinak by uzel po
+# reorgu došel k jinému rootu než uzel po lineárním sync.
+
+SMT_EMPTY_HASH = b'\x00' * 32
+SMT_LEAF_PREFIX = b'\x00'
+SMT_NODE_PREFIX = b'\x01'
+SMT_MAX_DEPTH = 256
+STATE_ROOT_DOMAIN = b'DRX/state/v1'
+IMMATURE_ROOT_DOMAIN = b'DRX/immature/v1'
+EMPTY_STATE_ROOT = None
+
+def encode_account(address, balance, nonce):
+    if not isinstance(balance, int) or not isinstance(nonce, int):
+        raise ValueError(f"Stav účtu {address} má neceločíselné hodnoty.")
+    if balance < 0:
+        raise ValueError(f"Záporný zůstatek u adresy {address}.")
+    if balance > MAX_SUPPLY:
+        raise ValueError(f"Zůstatek adresy {address} překračuje MAX_SUPPLY.")
+    if nonce < -1:
+        raise ValueError(f"Neplatný nonce {nonce} u adresy {address}.")
+    addr_bytes = str(address).encode('utf-8')
+    return (struct.pack('!I', len(addr_bytes)) + addr_bytes +
+            struct.pack('!Q', balance) +
+            struct.pack('!q', nonce))
+
+def smt_key(address):
+    return hashlib.sha3_256(str(address).encode('utf-8')).digest()
+
+def smt_leaf_hash(address, balance, nonce):
+    return hashlib.sha3_256(
+        SMT_LEAF_PREFIX + smt_key(address) + encode_account(address, balance, nonce)
+    ).digest()
+
+def _smt_bit(key, depth):
+    return (key[depth >> 3] >> (7 - (depth & 7))) & 1
+
+def _smt_subtree_root(items, depth):
+    if not items:
+        return SMT_EMPTY_HASH
+    if len(items) == 1:
+        return items[0][1]
+    if depth >= SMT_MAX_DEPTH:
+        # Nedosažitelné bez kolize sha3-256, ošetřeno jen proti nekonečné rekurzi.
+        h = hashlib.sha3_256(SMT_NODE_PREFIX)
+        for _, leaf_hash in items:
+            h.update(leaf_hash)
+        return h.digest()
+    left = []
+    right = []
+    for item in items:
+        if _smt_bit(item[0], depth):
+            right.append(item)
+        else:
+            left.append(item)
+    return hashlib.sha3_256(
+        SMT_NODE_PREFIX + _smt_subtree_root(left, depth + 1) + _smt_subtree_root(right, depth + 1)
+    ).digest()
+
+def compute_accounts_root(balance_map, nonce_map):
+    addresses = set(nonce_map.keys())
+    for address, balance in balance_map.items():
+        if balance:
+            addresses.add(address)
+    items = []
+    for address in addresses:
+        items.append((
+            smt_key(address),
+            smt_leaf_hash(address, balance_map.get(address, 0), nonce_map.get(address, -1))
+        ))
+    items.sort(key=lambda item: item[0])
+    return _smt_subtree_root(items, 0)
+
+def compute_immature_root(immature_rewards):
+    h = hashlib.sha3_256(IMMATURE_ROOT_DOMAIN)
+    for block_index in sorted(immature_rewards.keys(), key=int):
+        reward = immature_rewards[block_index]
+        addr_bytes = str(reward['address']).encode('utf-8')
+        h.update(struct.pack('!Q', int(block_index)))
+        h.update(struct.pack('!I', len(addr_bytes)) + addr_bytes)
+        h.update(struct.pack('!Q', int(reward['amount'])))
+    return h.digest()
+
+def compute_state_root(balance_map, nonce_map, immature_rewards, total_supply):
+    return hashlib.sha3_256(
+        STATE_ROOT_DOMAIN +
+        compute_accounts_root(balance_map, nonce_map) +
+        compute_immature_root(immature_rewards) +
+        struct.pack('!Q', int(total_supply))
+    ).hexdigest()
+
+def compute_state_root_from(state):
+    # Přijímá jak dict (get_state_at, is_valid_chain), tak objekt s atributy
+    # (Blockchain, SimpleNamespace shadow).
+    if isinstance(state, dict):
+        return compute_state_root(
+            state['balance_map'], state['nonce_map'],
+            state.get('immature_rewards', {}), state['total_supply']
+        )
+    return compute_state_root(
+        state.balance_map, state.nonce_map, state.immature_rewards, state.total_supply
+    )
+
+def make_state_shadow(base):
+    # Mělká kopie stavu pro spekulativní aplikaci bloku přes
+    # update_state_with_block(state_target=...). Hodnoty balance_map i nonce_map
+    # jsou inty (immutable) a u immature_rewards se vnitřní dicty nikdy nemutují,
+    # jen nahrazují celé záznamy - stejný předpoklad, na kterém stojí i
+    # get_state_at().
+    if isinstance(base, dict):
+        return SimpleNamespace(
+            balance_map=dict(base['balance_map']),
+            nonce_map=dict(base['nonce_map']),
+            immature_rewards=dict(base.get('immature_rewards', {})),
+            total_supply=base['total_supply'],
+            cumulative_work=base.get('cumulative_work', 0),
+            undo_logs={},
+            state_checkpoints={}
+        )
+    return SimpleNamespace(
+        balance_map=dict(base.balance_map),
+        nonce_map=dict(base.nonce_map),
+        immature_rewards=dict(base.immature_rewards),
+        total_supply=base.total_supply,
+        cumulative_work=getattr(base, 'cumulative_work', 0),
+        undo_logs={},
+        state_checkpoints={}
+    )
+
+def prune_zero_balances(balance_map, addresses):
+    # Kanonizace stavu: účet s nulovým zůstatkem v mapě nedržíme. Root ho stejně
+    # ignoruje, ale díky tomuhle je i samotná balance_map stejná bez ohledu na
+    # to, jestli vznikla lineárním sync nebo reorgem.
+    for address in addresses:
+        if balance_map.get(address) == 0:
+            del balance_map[address]
+
+EMPTY_STATE_ROOT = compute_state_root({}, {}, {}, 0)
+
 class Block:
-    def __init__(self, index, transactions, previous_hash, target, nonce=0, timestamp=None, version=BLOCK_VERSION, chain_id=CHAIN_ID):
+    def __init__(self, index, transactions, previous_hash, target, nonce=0, timestamp=None, version=BLOCK_VERSION, chain_id=CHAIN_ID, state_root=None):
         self.version = version
         self.chain_id = chain_id
         self.index = index
@@ -339,6 +506,7 @@ class Block:
         self.previous_hash = previous_hash
         self.target = target
         self.nonce = nonce
+        self.state_root = state_root
         self.hash = self.compute_hash()
 
     def compute_hash(self):
@@ -352,7 +520,9 @@ class Block:
         target_bytes = int(self.target).to_bytes(32, byteorder='big', signed=False)
         b += target_bytes
         
-        for s in [self.previous_hash, self.merkle_root]:
+        # state_root je součástí hlavičky, takže spadá i pod PoW. Blok bez něj
+        # (starý formát) se zahashuje jako délka 0 a neprojde kontrolou hashe.
+        for s in [self.previous_hash, self.merkle_root, self.state_root]:
             if s is None:
                 b += struct.pack('!I', 0)
             else:
@@ -371,6 +541,7 @@ class Block:
             'timestamp': self.timestamp,
             'transactions': [tx.to_dict() for tx in self.transactions],
             'merkle_root': self.merkle_root,
+            'state_root': self.state_root,
             'previous_hash': self.previous_hash,
             'target': hex(self.target)[2:],
             'nonce': self.nonce,
@@ -390,7 +561,8 @@ class Block:
             nonce=data.get('nonce', 0), 
             timestamp=ts,
             version=data.get('version', BLOCK_VERSION),
-            chain_id=data.get('chain_id', CHAIN_ID)
+            chain_id=data.get('chain_id', CHAIN_ID),
+            state_root=data.get('state_root')
         )
         block.hash = data['hash']
         block.merkle_root = data.get('merkle_root', compute_merkle_root(transactions))
@@ -465,15 +637,36 @@ class Blockchain:
             timestamp=GENESIS_TIMESTAMP,
             data="BTC: 000000000000000000009c26a9609e1956765cb1a89fb4cdd2411b75f208dd76"
         )
-        genesis_block = Block(0, [genesis_tx], "0", FIXED_TARGET, nonce=489606, timestamp=GENESIS_TIMESTAMP, version=BLOCK_VERSION, chain_id=CHAIN_ID)
+        genesis_block = Block(0, [genesis_tx], "0", FIXED_TARGET, nonce=GENESIS_NONCE, timestamp=GENESIS_TIMESTAMP, version=BLOCK_VERSION, chain_id=CHAIN_ID)
+
+        # state_root genesis bloku je deterministický, dopočítá se sám: coinbase
+        # odměna jde do immature_rewards, takže accounts_root je prázdný strom a
+        # total_supply = GENESIS_AMOUNT. Ručně je potřeba doplnit jen GENESIS_NONCE
+        # a GENESIS_BLOCK_EXPECTED_HASH (viz poznámka u konstant).
+        genesis_shadow = make_state_shadow(
+            {'balance_map': {}, 'nonce_map': {}, 'immature_rewards': {}, 'total_supply': 0, 'cumulative_work': 0}
+        )
+        self.update_state_with_block(genesis_block, state_target=genesis_shadow)
+        genesis_block.state_root = compute_state_root_from(genesis_shadow)
+        genesis_block.hash = genesis_block.compute_hash()
+
         self.chain.append(genesis_block)
         self.max_block_index = 0
         self.update_state_with_block(genesis_block)
         print(f"{Fore.GREEN}Genesis blok vytvořen a přidán do řetězce!{Style.RESET_ALL}")
+        print(f"  State root: {Fore.CYAN}{genesis_block.state_root}{Style.RESET_ALL}")
+        print(f"  Hash: {Fore.CYAN}{genesis_block.hash}{Style.RESET_ALL}")
 
-    def update_state_with_block(self, block):
-        if not hasattr(self, 'undo_logs'):
-            self.undo_logs = {}
+    def update_state_with_block(self, block, state_target=None):
+        # state_target umožňuje zapisovat stav (balance_map, nonce_map, undo_logs, ...)
+        # do jiného nosiče než self (využívá is_valid_chain, aby v jediném průchodu
+        # zároveň validovala i stavěla state, aniž by mutovala self dřív, než je
+        # celý řetězec ověřen jako platný). Výchozí chování (state_target=None) je
+        # beze změny a zapisuje přímo do self, stejně jako doposud.
+        target = state_target if state_target is not None else self
+
+        if not hasattr(target, 'undo_logs'):
+            target.undo_logs = {}
             
         undo_data = {
             'balance_changes': defaultdict(int),
@@ -484,61 +677,71 @@ class Blockchain:
             'total_supply_change': 0
         }
 
+        touched_addresses = set()
+
         target_index = block.index - COINBASE_MATURITY
-        if target_index in self.immature_rewards:
-            reward_data = self.immature_rewards.pop(target_index)
+        if target_index in target.immature_rewards:
+            reward_data = target.immature_rewards.pop(target_index)
             mature_address = reward_data['address']
             mature_amount = reward_data['amount']
-            self.balance_map[mature_address] = self.balance_map.get(mature_address, 0) + mature_amount
+            target.balance_map[mature_address] = target.balance_map.get(mature_address, 0) + mature_amount
+            touched_addresses.add(mature_address)
             
             undo_data['immature_restores'][target_index] = reward_data
             undo_data['balance_changes'][mature_address] -= mature_amount
 
         for tx in block.transactions:
             if tx.from_address == "COINBASE":
-                self.immature_rewards[block.index] = {'address': tx.to_address, 'amount': tx.amount}
+                target.immature_rewards[block.index] = {'address': tx.to_address, 'amount': tx.amount}
                 undo_data['immature_removes'].append(block.index)
             else:
-                self.balance_map[tx.from_address] = self.balance_map.get(tx.from_address, 0) - tx.amount - tx.fee
-                self.balance_map[tx.to_address] = self.balance_map.get(tx.to_address, 0) + tx.amount
+                target.balance_map[tx.from_address] = target.balance_map.get(tx.from_address, 0) - tx.amount - tx.fee
+                target.balance_map[tx.to_address] = target.balance_map.get(tx.to_address, 0) + tx.amount
+                touched_addresses.add(tx.from_address)
+                touched_addresses.add(tx.to_address)
                 
                 undo_data['balance_changes'][tx.from_address] += (tx.amount + tx.fee)
                 undo_data['balance_changes'][tx.to_address] -= tx.amount
                 
                 if tx.from_address not in undo_data['nonce_restores']:
-                    undo_data['nonce_restores'][tx.from_address] = self.nonce_map.get(tx.from_address, -1)
-                self.nonce_map[tx.from_address] = max(self.nonce_map.get(tx.from_address, -1), tx.nonce)
-                
+                    undo_data['nonce_restores'][tx.from_address] = target.nonce_map.get(tx.from_address, -1)
+                target.nonce_map[tx.from_address] = max(target.nonce_map.get(tx.from_address, -1), tx.nonce)
+
+        # Kanonizace stavu (viz prune_zero_balances). rollback_state() a
+        # get_state_at() nulové účty mazaly už dřív, dopředná aplikace bloku ne -
+        # dva uzly ve stejném logickém stavu tak měly různou balance_map.
+        prune_zero_balances(target.balance_map, touched_addresses)
+
         work = (1 << 256) // block.target if block.target > 0 else 0
-        self.cumulative_work += work
+        target.cumulative_work += work
         undo_data['cumulative_work_change'] = work
 
         halvings = block.index // HALVING_INTERVAL_BLOCKS
         subsidy = GENESIS_AMOUNT if block.index == 0 else BLOCK_REWARD // (2 ** halvings)
-        subsidy = max(0, min(subsidy, MAX_SUPPLY - self.total_supply))
+        subsidy = max(0, min(subsidy, MAX_SUPPLY - target.total_supply))
             
-        self.total_supply += subsidy
+        target.total_supply += subsidy
         undo_data['total_supply_change'] = subsidy
 
-        self.undo_logs[block.index] = undo_data
-        while len(self.undo_logs) > LAST_BLOCKS_TO_KEEP:
-            oldest = min(self.undo_logs.keys())
-            del self.undo_logs[oldest]
+        target.undo_logs[block.index] = undo_data
+        while len(target.undo_logs) > LAST_BLOCKS_TO_KEEP:
+            oldest = min(target.undo_logs.keys())
+            del target.undo_logs[oldest]
             
         # Perodické databázové checkpointy pro zrychlení rebuild_state
         if block.index > 0 and block.index % 1000 == 0:
-            if not hasattr(self, 'state_checkpoints'):
-                self.state_checkpoints = {}
-            self.state_checkpoints[block.index] = {
-                'balance_map': self.balance_map.copy(),
-                'nonce_map': self.nonce_map.copy(),
-                'immature_rewards': copy.deepcopy(self.immature_rewards),
-                'total_supply': self.total_supply,
-                'cumulative_work': self.cumulative_work
+            if not hasattr(target, 'state_checkpoints'):
+                target.state_checkpoints = {}
+            target.state_checkpoints[block.index] = {
+                'balance_map': target.balance_map.copy(),
+                'nonce_map': target.nonce_map.copy(),
+                'immature_rewards': copy.deepcopy(target.immature_rewards),
+                'total_supply': target.total_supply,
+                'cumulative_work': target.cumulative_work
             }
-            checkpoint_keys = sorted(self.state_checkpoints.keys())
+            checkpoint_keys = sorted(target.state_checkpoints.keys())
             while len(checkpoint_keys) > 5:
-                del self.state_checkpoints[checkpoint_keys.pop(0)]
+                del target.state_checkpoints[checkpoint_keys.pop(0)]
 
     def rollback_state(self, to_index):
         if not hasattr(self, 'undo_logs'):
@@ -660,7 +863,7 @@ class Blockchain:
             self.total_supply = 0
             self.undo_logs = {}
         
-        query = "SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index >= ?"
+        query = "SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ?"
         params = [start_index]
         if up_to_index is not None:
             query += " AND block_index <= ?"
@@ -679,7 +882,7 @@ class Blockchain:
                 'hash': row[6],
                 'merkle_root': row[7],
                 'version': row[8],
-                'chain_id': row[9]
+                'chain_id': row[9], 'state_root': row[10]
             }
             block = Block.from_dict(block_data)
             self.update_state_with_block(block)
@@ -692,7 +895,7 @@ class Blockchain:
         conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         c = conn.cursor()
-        c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index = ?", (index,))
+        c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index = ?", (index,))
         row = c.fetchone()
         conn.close()
         if row:
@@ -706,7 +909,7 @@ class Blockchain:
                 'hash': row[6],
                 'merkle_root': row[7],
                 'version': row[8],
-                'chain_id': row[9]
+                'chain_id': row[9], 'state_root': row[10]
             }
             return Block.from_dict(block_data)
         return None
@@ -851,11 +1054,20 @@ class Blockchain:
         finally:
             self.lock.release()
 
-    def is_tx_id_in_chain(self, tx_id):
+    def is_tx_id_in_chain(self, tx_id, exclude_from_index=None):
+        # exclude_from_index: ignoruj transakce zapsané v blocích od tohoto indexu
+        # výš. Používá add_block() při mini-reorgu - nahrazovaný blok je v DB ještě
+        # přítomný, ale už do řetězce nepatří, takže jeho transakce nesmí platit
+        # jako duplicita. Bez toho by konkurenční blok obsahující tytéž uživatelské
+        # transakce jako současný vrchol byl chybně odmítnut.
         conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         c = conn.cursor()
-        c.execute("SELECT 1 FROM transactions WHERE tx_id = ? LIMIT 1", (tx_id,))
+        if exclude_from_index is None:
+            c.execute("SELECT 1 FROM transactions WHERE tx_id = ? LIMIT 1", (tx_id,))
+        else:
+            c.execute("SELECT 1 FROM transactions WHERE tx_id = ? AND block_index < ? LIMIT 1",
+                      (tx_id, exclude_from_index))
         row = c.fetchone()
         conn.close()
         return row is not None
@@ -955,6 +1167,7 @@ class Blockchain:
         index = block_data['index']
         timestamp = block_data['timestamp']
         merkle_root = block_data['merkle_root']
+        state_root = block_data['state_root']
         previous_hash = block_data['previous_hash']
         target_hex = block_data['target']
         version = block_data.get('version', BLOCK_VERSION)
@@ -988,7 +1201,9 @@ class Blockchain:
             target_bytes = int(target).to_bytes(32, byteorder='big', signed=False)
             b += target_bytes
             
-            for s in [previous_hash, merkle_root]:
+            # Musí odpovídat Block.compute_hash(), jinak by vytěžený hash
+            # neprošel vlastní validací v add_block().
+            for s in [previous_hash, merkle_root, state_root]:
                 if s is None:
                     b += struct.pack('!I', 0)
                 else:
@@ -1022,6 +1237,7 @@ class Blockchain:
                 'index': block.index,
                 'timestamp': block.timestamp,
                 'merkle_root': block.merkle_root,
+                'state_root': block.state_root,
                 'previous_hash': block.previous_hash,
                 'target': hex(block.target)[2:],
                 'version': block.version,
@@ -1150,13 +1366,34 @@ class Blockchain:
                     
             if block.index != previous_block.index + 1:
                 return False
+
+            # Základní stav, proti kterému se blok validuje = stav po bloku
+            # block.index - 1. Při mini-reorgu (níže) se odpojuje současný vrchol,
+            # takže self.balance_map / nonce_map / immature_rewards ještě obsahují
+            # blok, který se má nahradit; get_state_at() ho přes undo log odroluje.
+            base_state = self.get_state_at(block.index - 1)
+            if base_state is None:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nelze rekonstruovat stav pro blok #{block.index}.{Style.RESET_ALL}")
+                return False
+            base_balance_map = base_state['balance_map']
+            base_nonce_map = base_state['nonce_map']
+            base_immature_rewards = base_state['immature_rewards']
+            base_total_supply = base_state['total_supply']
                 
             median_time_past = self.get_median_time_past(block.index)
             if not block.is_valid_timestamp(median_time_past):
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku:{Style.RESET_ALL} Timestamp bloku je neplatný.")
                 return False
                 
-            if block.target != self.get_target(new_timestamp=block.timestamp):
+            # Target se MUSÍ počítat pro výšku validovaného bloku. get_target() si
+            # uvnitř bere get_last_block(), takže vrací pravidlo pro tip.index + 1.
+            # V přímém pokračování to vyjde, ale při mini-reorgu je
+            # block.index == tip.index a platný konkurenční blok byl zamítán s
+            # "Nesprávný target bloku" - mini-reorg tak nad výškou N+1 nikdy
+            # neproběhl a add_block aplikoval jiné pravidlo než validate_fork
+            # a is_valid_chain. calculate_expected_target() čte bloky
+            # [index-N-1, index-1], tedy vždy jen společné předky.
+            if block.target != self.calculate_expected_target(block.index):
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nesprávný target bloku.{Style.RESET_ALL}")
                 return False
                 
@@ -1185,7 +1422,7 @@ class Blockchain:
                 if not is_valid_address(tx.to_address):
                     p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku:{Style.RESET_ALL} Neplatný formát adresy příjemce ({tx.to_address}).")
                     return False
-                if self.is_tx_id_in_chain(tx.tx_id):
+                if self.is_tx_id_in_chain(tx.tx_id, exclude_from_index=block.index):
                     p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku:{Style.RESET_ALL} Duplicitní TX ID {tx.tx_id} v bloku.")
                     return False
                     
@@ -1206,7 +1443,7 @@ class Blockchain:
                         nonce_map[tx.from_address] = {tx.nonce}
                         
             for sender, nonces_in_block in nonce_map.items():
-                expected_nonce = self.nonce_map.get(sender, -1) + 1
+                expected_nonce = base_nonce_map.get(sender, -1) + 1
                 for tx_nonce in sorted(nonces_in_block):
                     if tx_nonce != expected_nonce:
                         p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Neplatná posloupnost nonce {tx_nonce} pro adresu {sender} (očekávána přesně {expected_nonce}).{Style.RESET_ALL}")
@@ -1240,9 +1477,18 @@ class Blockchain:
                 return False
                 
             coinbase_tx = coinbase_txs[0]
+
+            # Nonce coinbase transakce musí být rovna výšce bloku. Je to jediné, co
+            # dělá tx_id coinbase transakcí unikátní napříč celým řetězcem (obdoba
+            # BIP30) - bez tohoto pravidla na tom stála jen konvence těžaře v mine()
+            # a dva bloky téhož těžaře se stejnou odměnou i časem by kolidovaly.
+            if coinbase_tx.nonce != block.index:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nonce coinbase transakce ({coinbase_tx.nonce}) musí být rovna výšce bloku ({block.index}).{Style.RESET_ALL}")
+                return False
+
             halvings = block.index // HALVING_INTERVAL_BLOCKS
             expected_reward = BLOCK_REWARD // (2 ** halvings) if block.index > 0 else GENESIS_AMOUNT
-            expected_reward = max(0, min(expected_reward, MAX_SUPPLY - self.get_total_supply()))
+            expected_reward = max(0, min(expected_reward, MAX_SUPPLY - base_total_supply))
                 
             total_fees = sum(tx.fee for tx in block.transactions if tx.from_address != "COINBASE")
             if coinbase_tx.amount != expected_reward + total_fees:
@@ -1251,13 +1497,13 @@ class Blockchain:
                 
             target_index = block.index - COINBASE_MATURITY
             simulated_mature_balance = defaultdict(int)
-            if target_index in self.immature_rewards:
-                simulated_mature_balance[self.immature_rewards[target_index]['address']] += self.immature_rewards[target_index]['amount']
+            if target_index in base_immature_rewards:
+                simulated_mature_balance[base_immature_rewards[target_index]['address']] += base_immature_rewards[target_index]['amount']
 
             temp_balance_changes = defaultdict(int)
             for tx in block.transactions:
                 if tx.from_address != "COINBASE":
-                    current_balance = self.balance_map.get(tx.from_address, 0) + simulated_mature_balance[tx.from_address] + temp_balance_changes[tx.from_address]
+                    current_balance = base_balance_map.get(tx.from_address, 0) + simulated_mature_balance[tx.from_address] + temp_balance_changes[tx.from_address]
                     if current_balance < tx.amount + tx.fee:
                         p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nedostatečný zůstatek pro transakci {tx.tx_id} od {tx.from_address}.{Style.RESET_ALL}")
                         return False
@@ -1265,6 +1511,20 @@ class Blockchain:
                     temp_balance_changes[tx.to_address] += tx.amount
                 else:
                     pass
+
+            # Ověření state rootu: blok se spekulativně aplikuje na kopii
+            # základního stavu a výsledný root se porovná s hlavičkou. Teprve po
+            # shodě se blok zapisuje do DB a promítá do self.
+            try:
+                shadow_state = make_state_shadow(base_state)
+                self.update_state_with_block(block, state_target=shadow_state)
+                expected_state_root = compute_state_root_from(shadow_state)
+            except ValueError as e:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Neplatný stav po aplikaci bloku #{block.index} ({e}).{Style.RESET_ALL}")
+                return False
+            if block.state_root != expected_state_root:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nesprávný state root bloku #{block.index} (očekáván {expected_state_root}, přijat {block.state_root}).{Style.RESET_ALL}")
+                return False
 
             if is_mini_reorg:
                 p2p_node.add_log(f"{Fore.YELLOW}Detekován lepší konkurenční blok na stejné výšce. Provádím bleskový mini-reorg (Undo).{Style.RESET_ALL}")
@@ -1297,9 +1557,9 @@ class Blockchain:
                 transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
                 target_hex = hex(block.target)[2:]
                 c.execute('''
-                    INSERT OR REPLACE INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id))
+                    INSERT OR REPLACE INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id, block.state_root))
                 
                 for tx in block.transactions:
                     c.execute('INSERT OR REPLACE INTO transactions (tx_id, block_index) VALUES (?, ?)', (tx.tx_id, block.index))
@@ -1327,6 +1587,13 @@ class Blockchain:
                 tx for tx in self.unconfirmed_transactions
                 if tx.tx_id not in confirmed_tx_ids
             ]
+
+            # Transakce odpojeného bloku, které nový vrchol nepřebírá, musí zpět do
+            # mempoolu - jinak by mini-reorgem nenávratně zmizely. Volá se až tady,
+            # protože recycle_orphan_transactions() se ptá is_tx_id_in_chain() a
+            # add_transaction() validuje proti stavu; obojí už je aktuální.
+            if is_mini_reorg and block_to_remove is not None:
+                self.recycle_orphan_transactions([block_to_remove])
             
             self.resolve_orphans(block.hash)
             return True
@@ -1439,7 +1706,8 @@ class Blockchain:
                     target=target,
                     nonce=sys.maxsize,
                     version=BLOCK_VERSION,
-                    chain_id=CHAIN_ID
+                    chain_id=CHAIN_ID,
+                    state_root="0" * 64
                 )
                 test_block.merkle_root = "0" * 64
                 
@@ -1486,6 +1754,18 @@ class Blockchain:
                 version=BLOCK_VERSION,
                 chain_id=CHAIN_ID
             )
+
+            # State root se počítá až nad finálním seznamem transakcí, ale ještě
+            # před PoW - přechod stavu nezávisí na nonce, takže root je v tuhle
+            # chvíli už jednoznačně určený a může vstoupit do hashovaného headeru.
+            try:
+                mining_shadow = make_state_shadow(self)
+                self.update_state_with_block(new_block, state_target=mining_shadow)
+                new_block.state_root = compute_state_root_from(mining_shadow)
+            except ValueError as e:
+                print(f"{Fore.RED}Kritická chyba: Nelze spočítat state root pro nový blok ({e}).{Style.RESET_ALL}")
+                return False
+            new_block.hash = new_block.compute_hash()
             
             new_block.nonce = sys.maxsize
             if new_block.get_size() > MAX_BLOCK_SIZE_BYTES:
@@ -1594,6 +1874,11 @@ class Blockchain:
                 return False, None, {}
 
             coinbase_tx = coinbase_txs[0]
+
+            # Stejné pravidlo jako v add_block(): nonce coinbase = výška bloku.
+            if coinbase_tx.nonce != current_block.index:
+                return False, None, {}
+
             halvings = current_block.index // HALVING_INTERVAL_BLOCKS
             expected_reward = BLOCK_REWARD // (2 ** halvings)
             expected_reward = max(0, min(expected_reward, MAX_SUPPLY - total_supply))
@@ -1671,10 +1956,13 @@ class Blockchain:
                     undo_data['nonce_restores'][sender] = nonce_map.get(sender, -1)
                 nonce_map[sender] = expected_nonce - 1
 
+            touched_addresses = set()
+
             target_index = current_block.index - COINBASE_MATURITY
             if target_index in immature_rewards:
                 reward_data = immature_rewards.pop(target_index)
                 balance_map[reward_data['address']] = balance_map.get(reward_data['address'], 0) + reward_data['amount']
+                touched_addresses.add(reward_data['address'])
                 
                 undo_data['immature_restores'][target_index] = reward_data
                 undo_data['balance_changes'][reward_data['address']] -= reward_data['amount']
@@ -1697,6 +1985,17 @@ class Blockchain:
             for addr, change in temp_balance_changes.items():
                 balance_map[addr] = balance_map.get(addr, 0) + change
                 undo_data['balance_changes'][addr] -= change
+                touched_addresses.add(addr)
+
+            prune_zero_balances(balance_map, touched_addresses)
+
+            # Stav po tomto bloku musí odpovídat state rootu v jeho hlavičce.
+            try:
+                expected_state_root = compute_state_root(balance_map, nonce_map, immature_rewards, total_supply)
+            except ValueError:
+                return False, None, {}
+            if current_block.state_root != expected_state_root:
+                return False, None, {}
 
             new_undo_logs[current_block.index] = undo_data
             previous_block = current_block
@@ -1720,10 +2019,23 @@ class Blockchain:
 
         seen_tx_ids = set()
         nonce_maps = {}
-        total_supply = 0
-        balance_map = {}
-        immature_rewards = {}
-        cumulative_work = 0
+        
+        # Nosič stavu (balance_map, nonce_map, immature_rewards, total_supply,
+        # cumulative_work, undo_logs, state_checkpoints), do kterého zapisuje
+        # update_state_with_block(). Díky tomu se validace a stavba stavu
+        # (dříve dělaná odděleně přes rebuild_state) provádí v jediném průchodu
+        # řetězcem, a přitom se self nezmění, dokud není celý řetězec ověřen
+        # jako platný (důležité pro replace_chain, který ověřuje navrhovaný
+        # řetězec ještě před jeho přijetím).
+        state = SimpleNamespace(
+            balance_map={},
+            nonce_map={},
+            immature_rewards={},
+            total_supply=0,
+            cumulative_work=0,
+            undo_logs={},
+            state_checkpoints={}
+        )
         
         chain_window = {}
         previous_block = None
@@ -1736,7 +2048,7 @@ class Blockchain:
                 conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                 conn.execute("PRAGMA journal_mode=WAL;")
                 c = conn.cursor()
-                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index")
+                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks ORDER BY block_index")
                 for row in c:
                     yield Block.from_dict({
                         'index': row[0],
@@ -1748,7 +2060,7 @@ class Blockchain:
                         'hash': row[6],
                         'merkle_root': row[7],
                         'version': row[8],
-                        'chain_id': row[9]
+                        'chain_id': row[9], 'state_root': row[10]
                     })
                 conn.close()
 
@@ -1782,16 +2094,22 @@ class Blockchain:
                     return False, None
                     
                 genesis_tx = current_block.transactions[0]
-                if not is_valid_address(genesis_tx.to_address) or genesis_tx.to_address != GENESIS_ADDRESS or genesis_tx.amount != GENESIS_AMOUNT or genesis_tx.timestamp != GENESIS_TIMESTAMP:
+                if not is_valid_address(genesis_tx.to_address) or genesis_tx.to_address != GENESIS_ADDRESS or genesis_tx.amount != GENESIS_AMOUNT or genesis_tx.timestamp != GENESIS_TIMESTAMP or genesis_tx.nonce != 0:
                     return False, None
                 if current_block.merkle_root != compute_merkle_root(current_block.transactions):
                     return False, None
                 if genesis_tx.data != "BTC: 000000000000000000009c26a9609e1956765cb1a89fb4cdd2411b75f208dd76":
                     return False, None
                     
-                total_supply += GENESIS_AMOUNT
-                immature_rewards[0] = {'address': genesis_tx.to_address, 'amount': genesis_tx.amount}
-                cumulative_work += (1 << 256) // current_block.target if current_block.target > 0 else 0
+                self.update_state_with_block(current_block, state_target=state)
+                try:
+                    expected_state_root = compute_state_root_from(state)
+                except ValueError as e:
+                    p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Neplatný stav po genesis bloku ({e}).{Style.RESET_ALL}")
+                    return False, None
+                if current_block.state_root != expected_state_root:
+                    p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nesprávný state root genesis bloku (očekáván {expected_state_root}).{Style.RESET_ALL}")
+                    return False, None
                 seen_tx_ids.add(genesis_tx.tx_id)
                 previous_block = current_block
                 continue
@@ -1839,17 +2157,21 @@ class Blockchain:
                 return False, None
 
             coinbase_tx = coinbase_txs[0]
+
+            # Stejné pravidlo jako v add_block() a validate_fork():
+            # nonce coinbase = výška bloku.
+            if coinbase_tx.nonce != current_block.index:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nonce coinbase transakce ({coinbase_tx.nonce}) v bloku #{current_block.index} neodpovídá výšce bloku.{Style.RESET_ALL}")
+                return False, None
+
             halvings = current_block.index // HALVING_INTERVAL_BLOCKS
             expected_reward = BLOCK_REWARD // (2 ** halvings)
-            expected_reward = max(0, min(expected_reward, MAX_SUPPLY - total_supply))
+            expected_reward = max(0, min(expected_reward, MAX_SUPPLY - state.total_supply))
                 
             total_fees = sum(tx.fee for tx in current_block.transactions if tx.from_address != "COINBASE")
             if coinbase_tx.amount != expected_reward + total_fees:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nesprávná coinbase odměna v bloku #{current_block.index}.{Style.RESET_ALL}")
                 return False, None
-                
-            total_supply += expected_reward
-            cumulative_work += (1 << 256) // current_block.target if current_block.target > 0 else 0
 
             block_tx_ids = set()
             block_nonce_map = {}
@@ -1911,35 +2233,55 @@ class Blockchain:
                 else:
                     nonce_maps[sender] = set(nonces_in_block)
 
+            # Kontrola dostatečnosti zůstatku PŘED aplikací bloku na stav. Čte se
+            # ze stavu naakumulovaného přes předchozí bloky (state.balance_map),
+            # samotná mutace (maturace immature reward, odečty/připsání částek,
+            # nonce_map, total_supply, cumulative_work) proběhne až níže přes
+            # update_state_with_block, a to pouze pokud tato kontrola projde.
             target_index = current_block.index - COINBASE_MATURITY
-            if target_index in immature_rewards:
-                reward_data = immature_rewards.pop(target_index)
-                balance_map[reward_data['address']] = balance_map.get(reward_data['address'], 0) + reward_data['amount']
+            pending_mature_amount = 0
+            if target_index in state.immature_rewards:
+                pending_mature_amount = state.immature_rewards[target_index]['amount']
+                pending_mature_address = state.immature_rewards[target_index]['address']
 
             temp_balance_changes = defaultdict(int)
+            if target_index in state.immature_rewards:
+                temp_balance_changes[pending_mature_address] += pending_mature_amount
+
             for tx in current_block.transactions:
                 if tx.from_address != "COINBASE":
-                    current_balance = balance_map.get(tx.from_address, 0) + temp_balance_changes[tx.from_address]
+                    current_balance = state.balance_map.get(tx.from_address, 0) + temp_balance_changes[tx.from_address]
                     if current_balance < tx.amount + tx.fee:
                         p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nedostatečný zůstatek pro transakci {tx.tx_id} od {tx.from_address} v bloku #{current_block.index}.{Style.RESET_ALL}")
                         return False, None
                     temp_balance_changes[tx.from_address] -= (tx.amount + tx.fee)
                     temp_balance_changes[tx.to_address] += tx.amount
-                else:
-                    immature_rewards[current_block.index] = {'address': tx.to_address, 'amount': tx.amount}
-            
-            for addr, change in temp_balance_changes.items():
-                balance_map[addr] = balance_map.get(addr, 0) + change
-                
+
+            self.update_state_with_block(current_block, state_target=state)
+
+            try:
+                expected_state_root = compute_state_root_from(state)
+            except ValueError as e:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Neplatný stav po bloku #{current_block.index} ({e}).{Style.RESET_ALL}")
+                return False, None
+            if current_block.state_root != expected_state_root:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Nesprávný state root bloku #{current_block.index} (očekáván {expected_state_root}, v bloku {current_block.state_root}).{Style.RESET_ALL}")
+                return False, None
+
             previous_block = current_block
 
-        final_nonce_map = {addr: max(nonces) for addr, nonces in nonce_maps.items()}
         state_dict = {
-            'balance_map': balance_map,
-            'nonce_map': final_nonce_map,
-            'total_supply': total_supply,
-            'cumulative_work': cumulative_work,
-            'immature_rewards': immature_rewards
+            'balance_map': state.balance_map,
+            'nonce_map': state.nonce_map,
+            'total_supply': state.total_supply,
+            'cumulative_work': state.cumulative_work,
+            'immature_rewards': state.immature_rewards,
+            # Přidáno navíc oproti původnímu state_dict, aby load_data() při startu
+            # uzlu nemusela po validaci volat ještě rebuild_state() pro druhý
+            # průchod řetězcem jen kvůli undo_logs/state_checkpoints. Volající kód,
+            # který čte jen původní klíče (replace_chain), je tímto nedotčen.
+            'undo_logs': state.undo_logs,
+            'state_checkpoints': state.state_checkpoints
         }
         return True, state_dict
 
@@ -1960,6 +2302,13 @@ class Blockchain:
             print(f"{Fore.RED}System is busy (lock timeout). Try again later.{Style.RESET_ALL}")
             return False
         try:
+            reorg_depth = self.max_block_index - fork_index + 1
+            if reorg_depth > MAX_REORG_DEPTH:
+                global p2p_node
+                if 'p2p_node' in globals() and hasattr(p2p_node, 'add_log'):
+                    p2p_node.add_log(f"{Fore.RED}Reorg zamítnut: hloubka {reorg_depth} překračuje limit MAX_REORG_DEPTH ({MAX_REORG_DEPTH}).{Style.RESET_ALL}")
+                return False
+
             new_chain_tail = [Block.from_dict(b) for b in new_blocks_data]
             
             current_cum_work = self.get_cumulative_work()
@@ -1991,12 +2340,12 @@ class Blockchain:
                         conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                         conn.execute("PRAGMA journal_mode=WAL;")
                         c = conn.cursor()
-                        c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index < ? ORDER BY block_index", (fork_index,))
+                        c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index < ? ORDER BY block_index", (fork_index,))
                         for row in c:
                             yield Block.from_dict({
                                 'index': row[0], 'timestamp': row[1], 'transactions': json.loads(row[2]),
                                 'previous_hash': row[3], 'target': row[4], 'nonce': row[5], 'hash': row[6],
-                                'merkle_root': row[7], 'version': row[8], 'chain_id': row[9]
+                                'merkle_root': row[7], 'version': row[8], 'chain_id': row[9], 'state_root': row[10]
                             })
                         conn.close()
                         for b in new_chain_tail: yield b
@@ -2025,7 +2374,6 @@ class Blockchain:
                         elif tx.tx_id not in new_tx_ids:
                             orphaned_transactions.append(tx)
                 
-                reorg_depth = self.max_block_index - fork_index + 1
                 if reorg_depth > 0:
                     p2p_node.add_log(
                         f"{Fore.MAGENTA}REORG: hloubka {reorg_depth} bloků "
@@ -2038,8 +2386,8 @@ class Blockchain:
             for block in new_chain_tail:
                 transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
                 target_hex = hex(block.target)[2:]
-                c.execute("INSERT INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id))
+                c.execute("INSERT INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id, block.state_root))
                 for tx in block.transactions:
                     c.execute("INSERT INTO transactions (tx_id, block_index) VALUES (?, ?)", (tx.tx_id, block.index))
             conn.commit()
@@ -2065,12 +2413,12 @@ class Blockchain:
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
             c = conn.cursor()
-            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index >= ? ORDER BY block_index", (self.max_block_index - LAST_BLOCKS_TO_KEEP + 1,))
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ? ORDER BY block_index", (self.max_block_index - LAST_BLOCKS_TO_KEEP + 1,))
             rows = c.fetchall()
             self.chain = [Block.from_dict({
                 'index': row[0], 'timestamp': row[1], 'transactions': json.loads(row[2]),
                 'previous_hash': row[3], 'target': row[4], 'nonce': row[5], 'hash': row[6],
-                'merkle_root': row[7], 'version': row[8], 'chain_id': row[9]
+                'merkle_root': row[7], 'version': row[8], 'chain_id': row[9], 'state_root': row[10]
             }) for row in rows]
             conn.close()
 
@@ -2134,10 +2482,8 @@ class Blockchain:
         return None, None
 
 def format_confirmations(count):
-    if count == 0:
+    if count <= 1000:
         return f"{Fore.RED}{count}{Style.RESET_ALL}"
-    elif 1 <= count <= 5:
-        return f"{Fore.YELLOW}{count}{Style.RESET_ALL}"
     else:
         return f"{Fore.GREEN}{count}{Style.RESET_ALL}"
 
@@ -2225,6 +2571,22 @@ def save_blacklist(blacklist):
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
+def ensure_state_root_column(conn, table='blocks'):
+    # Migrace DB vytvořené ještě bez sloupce state_root. Staré bloky dostanou
+    # NULL, takže je is_valid_chain() při startu odmítne - což je správně, jde
+    # o konsenzuální změnu a takový řetězec už neplatí.
+    try:
+        c = conn.cursor()
+        c.execute(f"PRAGMA table_info({table})")
+        columns = [row[1] for row in c.fetchall()]
+        if columns and 'state_root' not in columns:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN state_root TEXT")
+            conn.commit()
+            return True
+    except Exception:
+        pass
+    return False
+
 def save_data(droid_chain, wallets, password, peers):
     try:
         with droid_chain.lock:
@@ -2242,7 +2604,8 @@ def save_data(droid_chain, wallets, password, peers):
                     block_hash TEXT,
                     merkle_root TEXT,
                     version INTEGER,
-                    chain_id INTEGER
+                    chain_id INTEGER,
+                    state_root TEXT
                 )
             ''')
             c.execute('''
@@ -2258,9 +2621,9 @@ def save_data(droid_chain, wallets, password, peers):
                 transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
                 target_hex = hex(block.target)[2:]
                 c.execute('''
-                    INSERT OR REPLACE INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id))
+                    INSERT OR REPLACE INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id, block.state_root))
                 for tx in block.transactions:
                     c.execute('INSERT OR REPLACE INTO transactions (tx_id, block_index) VALUES (?, ?)', (tx.tx_id, block.index))
             conn.commit()
@@ -2434,7 +2797,8 @@ def load_data():
                     block_hash TEXT,
                     merkle_root TEXT,
                     version INTEGER,
-                    chain_id INTEGER
+                    chain_id INTEGER,
+                    state_root TEXT
                 )
              ''')
             c.execute('''
@@ -2445,6 +2809,9 @@ def load_data():
                 )
             ''')
             c.execute('CREATE INDEX IF NOT EXISTS idx_transactions_tx_id ON transactions(tx_id)')
+
+            if ensure_state_root_column(conn):
+                print(f"{Fore.YELLOW}Databáze byla rozšířena o sloupec state_root. Bloky uložené ve starém formátu neprojdou validací a řetězec bude potřeba stáhnout znovu.{Style.RESET_ALL}")
 
             c.execute("SELECT COUNT(*) FROM transactions")
             if c.fetchone()[0] == 0:
@@ -2458,7 +2825,7 @@ def load_data():
 
             c.execute("SELECT MAX(block_index) FROM blocks")
             droid_chain.max_block_index = c.fetchone()[0] or 0
-            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index > ? ORDER BY block_index", (droid_chain.max_block_index - LAST_BLOCKS_TO_KEEP,))
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index > ? ORDER BY block_index", (droid_chain.max_block_index - LAST_BLOCKS_TO_KEEP,))
             rows = c.fetchall()
             droid_chain.chain = [Block.from_dict({
                 'index': row[0],
@@ -2470,7 +2837,7 @@ def load_data():
                 'hash': row[6],
                 'merkle_root': row[7],
                 'version': row[8],
-                'chain_id': row[9]
+                'chain_id': row[9], 'state_root': row[10]
             }) for row in rows]
             conn.close()
             print(f"{Fore.GREEN}Blockchain byl načten z databáze.{Style.RESET_ALL}")
@@ -2496,10 +2863,14 @@ def load_data():
     droid_chain.total_supply = chain_state['total_supply']
     droid_chain.cumulative_work = chain_state['cumulative_work']
     droid_chain.immature_rewards = chain_state.get('immature_rewards', {})
-    
-    # Naplnění undo logs pro aktuální stav po validaci, pro bleskový mini-reorg při běhu
-    if droid_chain.max_block_index > 0:
-        droid_chain.rebuild_state()
+
+    # is_valid_chain() nyní v rámci téhož průchodu řetězcem rovnou staví i
+    # undo_logs a state_checkpoints (dříve to vyžadovalo druhý, samostatný
+    # průchod přes rebuild_state()/update_state_with_block() po validaci).
+    # Tím se sloučily dva průchody řetězcem do jednoho a ušetří se CPU čas
+    # potřebný na start uzlu.
+    droid_chain.undo_logs = chain_state.get('undo_logs', {})
+    droid_chain.state_checkpoints = chain_state.get('state_checkpoints', {})
 
     print(f"{Fore.GREEN}Blockchain validován úspěšně.{Style.RESET_ALL}")
     droid_chain.unconfirmed_transactions = load_mempool(droid_chain)
@@ -2608,7 +2979,8 @@ class P2PNode:
                 block_hash TEXT,
                 merkle_root TEXT,
                 version INTEGER,
-                chain_id INTEGER
+                chain_id INTEGER,
+                state_root TEXT
             )
         ''')
         conn.commit()
@@ -2621,7 +2993,7 @@ class P2PNode:
             conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
             c = conn.cursor()
-            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM sync_blocks ORDER BY block_index")
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM sync_blocks ORDER BY block_index")
             
             blocks_data = []
             for row in c:
@@ -2635,7 +3007,7 @@ class P2PNode:
                     'hash': row[6],
                     'merkle_root': row[7],
                     'version': row[8],
-                    'chain_id': row[9]
+                    'chain_id': row[9], 'state_root': row[10]
                 })
             conn.close()
         except Exception as e:
@@ -2911,7 +3283,7 @@ class P2PNode:
                         start_index = row[0] + 1
                         break
                         
-            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_index >= ? ORDER BY block_index LIMIT 10", (start_index,))
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ? ORDER BY block_index LIMIT 10", (start_index,))
             blocks_data = []
             for row in c:
                 blocks_data.append({
@@ -2924,7 +3296,7 @@ class P2PNode:
                     'hash': row[6],
                     'merkle_root': row[7],
                     'version': row[8],
-                    'chain_id': row[9]
+                    'chain_id': row[9], 'state_root': row[10]
                 })
             conn.close()
             
@@ -2992,16 +3364,26 @@ class P2PNode:
                     conn.close()
                     
                     if (not row or row[0] != first_block_data['previous_hash']) and first_block_index != 0:
-                        self.awaiting_full_chain = True
-                        request = {'type': 'request_full_chain'}
-                        requester_addr = self.resolve_peer_addr(addr)
-                        if requester_addr:
-                            self.add_log(f"{Fore.RED}Nedokážu navázat přijaté bloky. Fallback na full sync...{Style.RESET_ALL}")
-                            self.send_to_peer(requester_addr, request)
+                        if self.blockchain.max_block_index == 0:
+                            self.awaiting_full_chain = True
+                            request = {'type': 'request_full_chain'}
+                            requester_addr = self.resolve_peer_addr(addr)
+                            if requester_addr:
+                                self.add_log(f"{Fore.RED}Nedokážu navázat přijaté bloky. Fallback na full sync...{Style.RESET_ALL}")
+                                self.send_to_peer(requester_addr, request)
+                            else:
+                                self.send_data_to_peers(request)
+                            return
                         else:
-                            self.send_data_to_peers(request)
-                        return
-                        
+                            self.add_log(f"{Fore.RED}Varování: Detekován pokus o hluboký reorg / long-range útok. Fallback na fullsync zamítnut.{Style.RESET_ALL}")
+                            if addr:
+                                self.blacklist.add(addr[0])
+                                save_blacklist(self.blacklist)
+                            self.syncing_fork = False
+                            self.fork_start_index = None
+                            self.fork_sync_start = 0
+                            return
+
                     self.syncing_fork = True
                     self.fork_start_index = first_block_index
                     self.fork_sync_start = time.time()
@@ -3063,9 +3445,9 @@ class P2PNode:
                     tx_json = json.dumps(bd['transactions'])
                     c.execute('''
                         INSERT OR REPLACE INTO sync_blocks 
-                        (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (bd['index'], bd['timestamp'], tx_json, bd['previous_hash'], bd['target'], bd['nonce'], bd['hash'], bd['merkle_root'], bd.get('version', BLOCK_VERSION), bd.get('chain_id', CHAIN_ID)))
+                        (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (bd['index'], bd['timestamp'], tx_json, bd['previous_hash'], bd['target'], bd['nonce'], bd['hash'], bd['merkle_root'], bd.get('version', BLOCK_VERSION), bd.get('chain_id', CHAIN_ID), bd.get('state_root')))
                 conn.commit()
                 conn.close()
                 
@@ -3085,7 +3467,7 @@ class P2PNode:
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
             c = conn.cursor()
-            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index LIMIT 10")
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks ORDER BY block_index LIMIT 10")
             chain_data = []
             for row in c:
                 chain_data.append({
@@ -3098,7 +3480,7 @@ class P2PNode:
                     'hash': row[6],
                     'merkle_root': row[7],
                     'version': row[8],
-                    'chain_id': row[9]
+                    'chain_id': row[9], 'state_root': row[10]
                 })
             conn.close()
             response = {'type': 'response_full_chain', 'data': chain_data}
@@ -3862,7 +4244,7 @@ def main():
                 conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                 conn.execute("PRAGMA journal_mode=WAL;")
                 c = conn.cursor()
-                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks ORDER BY block_index")
+                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks ORDER BY block_index")
                 
                 total_size = 0
                 all_addresses = set()
@@ -3878,7 +4260,7 @@ def main():
                         'hash': row[6],
                         'merkle_root': row[7],
                         'version': row[8],
-                        'chain_id': row[9]
+                        'chain_id': row[9], 'state_root': row[10]
                     }
                     block = Block.from_dict(block_data)
                     total_size += block.get_size()
@@ -3894,6 +4276,7 @@ def main():
                     print(f" Chain ID: {Fore.CYAN}{block.chain_id}{Style.RESET_ALL}")
                     print(f" Hash: {Fore.MAGENTA}{block.hash}{Style.RESET_ALL}")
                     print(f" Merkle root: {Fore.CYAN}{block.merkle_root}{Style.RESET_ALL}")
+                    print(f" State root: {Fore.CYAN}{block.state_root}{Style.RESET_ALL}")
                     print(f" Cílová obtížnost: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
                     print(f" Předchozí hash: {Fore.MAGENTA}{block.previous_hash}{Style.RESET_ALL}")
                     print(f" PoW nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
@@ -3947,7 +4330,7 @@ def main():
                     conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                     conn.execute("PRAGMA journal_mode=WAL;")
                     c = conn.cursor()
-                    c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id FROM blocks WHERE block_hash = ?", (search_input,))
+                    c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_hash = ?", (search_input,))
                     row = c.fetchone()
                     conn.close()
                     if row:
@@ -3961,7 +4344,7 @@ def main():
                             'hash': row[6],
                             'merkle_root': row[7],
                             'version': row[8],
-                            'chain_id': row[9]
+                            'chain_id': row[9], 'state_root': row[10]
                         }
                         block = Block.from_dict(block_data)
                     else:
@@ -3975,6 +4358,7 @@ def main():
                     print(f" Chain ID: {Fore.CYAN}{block.chain_id}{Style.RESET_ALL}")
                     print(f" Hash: {Fore.MAGENTA}{block.hash}{Style.RESET_ALL}")
                     print(f" Merkle root: {Fore.CYAN}{block.merkle_root}{Style.RESET_ALL}")
+                    print(f" State root: {Fore.CYAN}{block.state_root}{Style.RESET_ALL}")
                     print(f" Cílová obtížnost: {Fore.CYAN}{target_hex}{Style.RESET_ALL}")
                     print(f" Předchozí hash: {Fore.MAGENTA}{block.previous_hash}{Style.RESET_ALL}")
                     print(f" PoW nonce: {Fore.CYAN}{block.nonce}{Style.RESET_ALL}")
