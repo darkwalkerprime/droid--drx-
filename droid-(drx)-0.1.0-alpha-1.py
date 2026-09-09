@@ -84,9 +84,13 @@ GENESIS_ADDRESS = "DRXf4fc20af1250719b255554a2382feb510b8022c7eeb0376f84b8cc03a1
 GENESIS_ADDRESS_EXPECTED_HASH = "8f46fa50b96e72c0156c846b6ac7b48445b17217d70be4c639b0f9f9582b71b2"
 GENESIS_TIMESTAMP = 1785614400
 # Genesis konstanty jsou ověřené a platí i po zavedení state_root do hlavičky:
-# nonce 38083 dává hash 0000013c... včetně state_root
-# c6253efc7a5da68207e84ab2d5d238e33c23e9945cf411c0c622cb0adfca380a a splňuje
-# FIXED_TARGET. verify_genesis_block() i CHECKPOINTS[0] projdou.
+# nonce 3622 dává hash
+# 0000092d034dfef99d334ec7afbefce860b0aa2ba5b72f8ea43e808a9e903cd7 včetně
+# state_root c6253efc7a5da68207e84ab2d5d238e33c23e9945cf411c0c622cb0adfca380a
+# a splňuje FIXED_TARGET. verify_genesis_block() i CHECKPOINTS[0] projdou.
+# (Dřív tu stálo "nonce 38083 dává hash 0000013c..." - hodnoty ze starší
+# verze, které přežily přepočet genesis bloku. Kód sám byl správně, jen
+# komentář lhal. Přepočítáno a ověřeno proti create_genesis_block().)
 # Samotný state_root genesis bloku se dopočítá automaticky v create_genesis_block().
 # Při JAKÉKOLI změně obsahu genesis bloku (adresa, částka, čas, data, target,
 # version, chain_id) je nutné obě hodnoty níže znovu vytěžit a přepsat.
@@ -579,16 +583,44 @@ class Transaction:
             _check_hex_field(raw_signature, SIGNATURE_HEX_LEN, "Podpis")
             _check_hex_field(raw_public_key, PUBLIC_KEY_HEX_LEN, "Veřejný klíč")
 
+            # OPRAVA D-15: from_address, to_address a data šly do konstruktoru
+            # bez jakékoli kontroly typu. get_signing_data() na nich dělá
+            # str(s).encode('utf-8'), takže from_address = None, to_address = 12345
+            # i data = {'a': 1} prošly a jen se zahashovala jejich textová podoba.
+            # Zachytí je sice až is_valid_address() a zákaz `data` v konsenzu, ale
+            # spoléhat se na obranu v druhé linii je přesně to, kvůli čemu vznikla
+            # OPRAVA #4: co je součástí podpisových dat, má mít tvar ověřený
+            # JEŠTĚ PŘED tím, než se z toho počítá tx_id.
+            #
+            # 'data' zůstává povolené jako řetězec - nese ho genesis coinbase
+            # ("BTC: ..."). Pro všechny ostatní transakce ho konsenzus zakazuje
+            # (musí být None), to se kontroluje v add_block/validate_fork/is_valid_chain.
+            raw_from = data['from_address']
+            raw_to = data['to_address']
+            if not isinstance(raw_from, str):
+                raise ValueError(
+                    f"Pole 'from_address' musí být řetězec (je {type(raw_from).__name__})."
+                )
+            if not isinstance(raw_to, str):
+                raise ValueError(
+                    f"Pole 'to_address' musí být řetězec (je {type(raw_to).__name__})."
+                )
+            raw_payload = data.get('data')
+            if raw_payload is not None and not isinstance(raw_payload, str):
+                raise ValueError(
+                    f"Pole 'data' musí být řetězec nebo None (je {type(raw_payload).__name__})."
+                )
+
             tx = Transaction(
-                data['from_address'],
-                data['to_address'],
+                raw_from,
+                raw_to,
                 amount,
                 fee,
                 nonce=nonce,
                 public_key=raw_public_key,
                 signature=raw_signature,
                 timestamp=timestamp,
-                data=data.get('data'),
+                data=raw_payload,
                 chain_id=chain_id
             )
             # OPRAVA F-02: tvrdý strop na velikost jedné transakce. Zbylá volná
@@ -1238,7 +1270,33 @@ class Block:
                         f"{label} je mimo povolený rozsah ({minimum} až {(1 << bits) - 1}): {value}."
                     )
 
-            transactions = [Transaction.from_dict(tx_data) for tx_data in data['transactions']]
+            # OPRAVA D-15: kontrakt "ven jde vždy ValueError" neplatil pro pole
+            # 'transactions'. Iterovalo se přes data['transactions'] bez kontroly
+            # typu a každá položka šla rovnou do Transaction.from_dict(), která
+            # na ní volá .get(). Odtud:
+            #     transactions = 'retezec' -> iterace po znacích -> 'r'.get()
+            #     transactions = [None]    -> None.get()
+            #     transactions = [42]      -> (42).get()
+            # ve všech případech AttributeError, a ta NENÍ v tuple na konci téhle
+            # funkce (ani v tom v replace_chain, ř. 3923), takže propadla ven.
+            #
+            # Měřitelný důsledek byl nesymetrický postih: blok s vadným targetem
+            # dal ValueError -> handler new_block banoval, blok s
+            # transactions=[None] dal AttributeError -> spadlo celé spojení
+            # v obecném except handle_client_connection, tedy BEZ banu. Odesílatel
+            # stejně vadného bloku tak vyklouzl podle toho, které pole zkazil.
+            #
+            # Tvar se proto ověřuje JEŠTĚ PŘED konstrukcí, stejným vzorem jako
+            # u ostatních polí. Kontroluje se jen TVAR, ne platnost.
+            raw_txs = data['transactions']
+            if not isinstance(raw_txs, list):
+                raise ValueError("Pole 'transactions' musí být seznam.")
+            for tx_data in raw_txs:
+                if not isinstance(tx_data, dict):
+                    raise ValueError(
+                        f"Položka v 'transactions' není objekt (je {type(tx_data).__name__})."
+                    )
+            transactions = [Transaction.from_dict(tx_data) for tx_data in raw_txs]
 
             raw_target = data['target']
             target = int(raw_target, 16) if isinstance(raw_target, str) else int(raw_target)
@@ -1260,19 +1318,66 @@ class Block:
             chain_id = data.get('chain_id', CHAIN_ID)
             _check_uint(chain_id, 32, "chain_id bloku")
 
+            # OPRAVA D-15: textová pole hlavičky se dosud nekontrolovala vůbec.
+            # compute_hash() na ně dělá str(s).encode('utf-8'), takže
+            # previous_hash = None i previous_hash = ['a'] prošly bez výjimky
+            # a zahashovaly se jako "None" resp. "['a']". Dnes je zachytí až
+            # kontrola hashe o vrstvu níž - to je ale obrana v druhé linii,
+            # ne v konstruktoru. Navíc block.hash putuje do meets_difficulty(),
+            # kde se dělá int(hash, 16): nehexadecimální hodnota tam vyhodí
+            # ValueError na místě, které s ní nepočítá (viz D-02).
+            #
+            # Pravidlo pro 'hash' je záměrně TOTOŽNÉ s _valid_block_dict(),
+            # aby obě branky říkaly o tvaru bloku totéž.
+            def _check_str(value, label, allow_none=False):
+                if value is None:
+                    if allow_none:
+                        return
+                    raise ValueError(f"{label} nesmí být None.")
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"{label} musí být řetězec (je {type(value).__name__})."
+                    )
+
+            raw_hash = data['hash']
+            _check_str(raw_hash, "Hash bloku")
+            if len(raw_hash) != 64 or any(c not in '0123456789abcdef' for c in raw_hash):
+                raise ValueError("Hash bloku není 64 znaků malého hexa.")
+
+            raw_previous_hash = data['previous_hash']
+            # Délka se NEvynucuje: genesis má previous_hash = "0".
+            _check_str(raw_previous_hash, "Pole 'previous_hash'")
+
+            # state_root smí chybět (starý formát bloku bez něj). Takový blok se
+            # zahashuje jako délka 0 a neprojde kontrolou hashe - to je původní
+            # a záměrné chování, jen se k němu nesmí přidat jiný typ než řetězec.
+            raw_state_root = data.get('state_root')
+            _check_str(raw_state_root, "Pole 'state_root'", allow_none=True)
+
+            # merkle_root smí CHYBĚT (dopočítá se), ale je-li uveden, musí to být
+            # řetězec. Přítomnost se testuje přes 'in', ne přes .get() s default
+            # hodnotou - jinak by se explicitní None tiše přepsalo dopočtenou
+            # hodnotou a blok s prázdným merkle rootem by nově PROŠEL kontrolou,
+            # která ho dřív odmítala.
+            if 'merkle_root' in data:
+                raw_merkle_root = data['merkle_root']
+                _check_str(raw_merkle_root, "Pole 'merkle_root'")
+            else:
+                raw_merkle_root = compute_merkle_root(transactions)
+
             block = Block(
                 index=data['index'],
                 transactions=transactions,
-                previous_hash=data['previous_hash'],
+                previous_hash=raw_previous_hash,
                 target=target,
                 nonce=nonce,
                 timestamp=ts,
                 version=version,
                 chain_id=chain_id,
-                state_root=data.get('state_root')
+                state_root=raw_state_root
             )
-            block.hash = data['hash']
-            block.merkle_root = data.get('merkle_root', compute_merkle_root(transactions))
+            block.hash = raw_hash
+            block.merkle_root = raw_merkle_root
             return block
         except (KeyError, ValueError, TypeError, struct.error, OverflowError) as e:
             # struct.error a OverflowError jsou tu proto, aby kontrakt platil
@@ -2905,24 +3010,90 @@ class Blockchain:
         self.orphan_pool_bytes += size
         self.orphan_parents[block.previous_hash].append(block.hash)
 
+    def _orphan_children_items(self, parent_hash):
+        # OPRAVA D-18: snímek dvojic (rodič, potomek) pro zásobník
+        # resolve_orphans(). Pořadí je OBRÁCENÉ, aby se z LIFO odebíraly ve
+        # stejném pořadí, v jakém je procházela původní rekurze.
+        #
+        # Čte se přes .get(), ne přes indexaci - orphan_parents je defaultdict
+        # a indexace by pro neznámý hash vyrobila prázdnou položku, kterou by
+        # pak `parent_hash not in self.orphan_parents` neodfiltrovalo.
+        deti = self.orphan_parents.get(parent_hash)
+        if not deti:
+            return []
+        return [(parent_hash, ch) for ch in reversed(deti)]
+
     def resolve_orphans(self, parent_hash):
+        # OPRAVA D-18: rekurze nahrazena zásobníkem.
+        #
+        # Rekurze tu byla VZÁJEMNÁ, ne jen přímá: resolve_orphans() volalo
+        # add_block() a add_block() hned po zápisu bloku volá resolve_orphans()
+        # zpátky. Na každý článek řetězu navazujících orphanů tedy padly dva
+        # rámce Pythonu. Strop poolu 16 MiB při ~400 B na prázdný blok dovolí
+        # až ~41 900 orphanů, zatímco limit rekurze je 1 000 - řetěz delší než
+        # ~500 orphanů shodil RecursionError uprostřed přidávání bloků.
+        #
+        # Cenu útoku drží PoW (každý orphan musí splnit FIXED_TARGET), takže
+        # je to teoretická mez, ne levný útok. Přepsat to je ale pár řádků.
+        #
+        # POŘADÍ ZŮSTÁVÁ STEJNÉ jako u rekurze - do hloubky, sourozenci zleva
+        # doprava. Není to kosmetika: kdyby se přešlo na frontu (do šířky),
+        # přidaly by se konkurenční větve v jiném pořadí a add_block() by dělal
+        # mini-reorgy jinak, tedy jiný výsledný řetězec.
+        #
+        # Stav _orphan_pending_parents je sdílený přes self, ale resolve_orphans()
+        # má jediného vnějšího volajícího - add_block() - a ten po celou dobu
+        # drží self.lock (RLock), takže se sem dvě vlákna nedostanou.
+        predane_zvenci = getattr(self, '_orphan_pending_parents', None)
+        if predane_zvenci is not None:
+            # Vnořené volání z add_block(). Místo zanoření jen předáme hash
+            # vnější smyčce a vrátíme se - hloubka zásobníku Pythonu tím
+            # zůstává konstantní bez ohledu na délku řetězu orphanů.
+            predane_zvenci.append(parent_hash)
+            return
+
         if parent_hash not in self.orphan_parents:
             return
-        for child_hash in list(self.orphan_parents[parent_hash]):
-            if child_hash in self.orphan_pool:
+
+        self._orphan_pending_parents = []
+        try:
+            zasobnik = self._orphan_children_items(parent_hash)
+            while zasobnik:
+                ocekavany_rodic, child_hash = zasobnik.pop()
+                if child_hash not in self.orphan_pool:
+                    continue
                 child_block = self.orphan_pool[child_hash]
                 # OPRAVA D-01: odebrání jde přes _drop_orphan(), aby se s blokem
                 # uklidila i jeho velikost z orphan_pool_bytes. Původní kód dělal
                 # pop() přímo, což by po zavedení bajtového stropu nechalo čítač
                 # trvale nafouknutý a pool by se postupně sám uzavřel.
                 self._drop_orphan(child_hash)
-                if child_block.previous_hash == parent_hash:
-                    if self.add_block(child_block, child_block.hash):
-                        p2p_node.add_log(f"{Fore.GREEN}Orphan blok {child_block.index} přidán do chainu.{Style.RESET_ALL}")
-                        self.resolve_orphans(child_block.hash)
-                    else:
-                        self.recycle_orphan_transactions([child_block])
-                        p2p_node.add_log(f"{Fore.RED}Orphan blok {child_block.index} nevalidní, zahazuji a recykluji tx.{Style.RESET_ALL}")
+                if child_block.previous_hash != ocekavany_rodic:
+                    continue
+
+                self._orphan_pending_parents.clear()
+                pridano = self.add_block(child_block, child_block.hash)
+                # Hashe, na které by původní kód rekurzoval: co nám předalo
+                # vnořené volání z add_block(), plus blok samotný (to dělal
+                # řádek self.resolve_orphans(child_block.hash)).
+                predane = list(self._orphan_pending_parents)
+                self._orphan_pending_parents.clear()
+
+                if pridano:
+                    p2p_node.add_log(f"{Fore.GREEN}Orphan blok {child_block.index} přidán do chainu.{Style.RESET_ALL}")
+                    if child_block.hash not in predane:
+                        predane.append(child_block.hash)
+                else:
+                    self.recycle_orphan_transactions([child_block])
+                    p2p_node.add_log(f"{Fore.RED}Orphan blok {child_block.index} nevalidní, zahazuji a recykluji tx.{Style.RESET_ALL}")
+
+                # Potomci jdou NA VRCH zásobníku, aby se prošli dřív než
+                # sourozenci právě zpracovaného bloku - tím vzniká totéž
+                # pořadí do hloubky, jaké dávala rekurze.
+                for h in reversed(predane):
+                    zasobnik.extend(self._orphan_children_items(h))
+        finally:
+            self._orphan_pending_parents = None
 
     def recycle_orphan_transactions(self, orphaned_blocks):
         orphaned_transactions = []
@@ -3210,9 +3381,27 @@ class Blockchain:
             return False
 
     def validate_fork(self, fork_index, new_chain_tail):
+        # OPRAVA D-16: návratová hodnota rozlišuje TŘI stavy, ne dva.
+        #
+        #   True  - fork je platný, jde s ním state_dict a undo logy
+        #   False - fork je PROKAZATELNĚ NEPLATNÝ; volající ho má rovnou zahodit
+        #   None  - NEVÍM: nepodařilo se sestavit výchozí stav pro fork_index-1,
+        #           takže se o platnosti nedalo rozhodnout. Teprve tady má smysl
+        #           fallback na is_valid_chain() od genesis.
+        #
+        # Dřív se vracelo (False, None, {}) v obou nerozhodných i zamítavých
+        # případech a replace_chain() je nerozlišoval (podmínka
+        # `not is_valid and new_state is None` je při selhání splněná VŽDY).
+        # Každý neplatný fork tak spustil revalidaci CELÉHO řetězce od genesis
+        # včetně všech podpisů: fork o 2 blocích s vadou až v posledním
+        # protlačil is_valid_chain přes 42 bloků. Zesílení roste lineárně
+        # s délkou řetězce a útočník ho pořizuje za cenu dvou bloků - na mobilu
+        # je to citelné. Fallback je nově vyhrazený jen pro stav "nevím".
         state = self.get_state_at(fork_index - 1)
         if state is None:
-            return False, None, {}
+            # Stav se nedá odrolovat (undo logy tak hluboko nesahají). O forku
+            # to neříká nic - rozhodne až fallback.
+            return None, None, {}
             
         balance_map = state['balance_map']
         nonce_map = state['nonce_map']
@@ -3222,7 +3411,11 @@ class Blockchain:
         
         previous_block = self.get_block(fork_index - 1)
         if not previous_block:
-            return False, None, {}
+            # OPRAVA D-16: chybí blok v NAŠÍ databázi, ne v dodaném forku.
+            # Je to tedy taky "nevím", ne důkaz neplatnosti - fork proti němu
+            # nikdy nebyl ověřen. Fallback nad kompletním řetězcem tuhle díru
+            # najde a odmítne, ale rozhodnutí patří jemu.
+            return None, None, {}
             
         chain_window = {}
         new_undo_logs = {}
@@ -3947,7 +4140,15 @@ class Blockchain:
                 new_undo_logs = {}
             else:
                 is_valid, new_state, new_undo_logs = self.validate_fork(fork_index, new_chain_tail)
-                if not is_valid and new_state is None:
+                # OPRAVA D-16: fallback JEN na "nevím" (is_valid is None).
+                # Rozlišení `is None` musí zůstat explicitní - False i None jsou
+                # obě nepravdivé, takže `not is_valid` by fallback spustilo zas
+                # pro oba případy a oprava by byla zpátky na začátku.
+                if is_valid is None:
+                    if 'p2p_node' in globals() and p2p_node is not None and hasattr(p2p_node, 'add_log'):
+                        p2p_node.add_log(
+                            f"{Fore.YELLOW}Výchozí stav pro fork od #{fork_index} nelze sestavit, "
+                            f"ověřuji celý řetězec od genesis.{Style.RESET_ALL}")
                     def proposed_chain_iterator():
                         conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                         conn.execute("PRAGMA journal_mode=WAL;")
@@ -3965,7 +4166,9 @@ class Blockchain:
                     new_undo_logs = {}
             
             if not is_valid:
-                return False
+                # OPRAVA D-16: dřív se zamítalo tiše, takže v logu nešlo odlišit
+                # "fork je neplatný" od "sem se výpočet vůbec nedostal".
+                return _reject(f"navrhovaný fork od #{fork_index} neprošel ověřením.")
 
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -5629,9 +5832,20 @@ class P2PNode:
         vrátí None) místo abychom čekali na watchdog.
         """
         rounds = 0
+        # OPRAVA D-17: jakmile smyčka jednou běží ve fork režimu, musí poznat,
+        # že jí byl fork pod rukama zrušen (_abort_fork_sync po vadné dávce
+        # nebo watchdog). Bez toho by další kolo poslalo locator od NAŠEHO
+        # vrcholu, tedy začalo běžný sync s uzlem, kterého jsme právě zabanovali
+        # - a odpověď na něj by založila "nový fork" nad zahozeným bufferem.
+        fork_mode_seen = False
         while self.running and rounds < max_rounds:
             rounds += 1
-            tip = self.sync_buffer_tip() if getattr(self, 'syncing_fork', False) else None
+            in_fork = bool(getattr(self, 'syncing_fork', False))
+            if fork_mode_seen and not in_fork:
+                self.add_log(f"{Fore.YELLOW}Řízený sync s {peer} ukončen: fork byl mezitím zrušen.{Style.RESET_ALL}")
+                return False
+            fork_mode_seen = fork_mode_seen or in_fork
+            tip = self.sync_buffer_tip() if in_fork else None
             if tip:
                 req = {'type': 'request_blocks', 'data': {'locator_hashes': [tip[1]]}}
             else:
@@ -5656,17 +5870,64 @@ class P2PNode:
 
         Uzly zkoušíme po jednom, dokud jeden nedodá pokračování. Broadcast tu
         být nesmí - víc odpovědí na tutéž žádost vedlo na ban poctivého uzlu.
+
+        OPRAVA D-17: tahle metoda byla mrtvý kód. Dvě podmínky si protiřečily:
+        pokračovalo se JEN když syncing_fork == False (vstupní podmínka smyčky),
+        ale sync_blocks_from_peer() čte špičku bufferu JEN když syncing_fork
+        == True. Větev `if tip:` tam tedy byla nedosažitelná a odešel locator
+        od NAŠEHO vrcholu. Odpověď pak neprošla testem
+        `first_block_index == buffer_tip[0] + 1` v handleru response_blocks,
+        spadla do větve "nový fork" a zavolala discard_sync_buffer().
+
+        Následek: rozpracovaný buffer se při každém pokusu zahodil, přenesený
+        pokrok byl nulový a hluboký reorg se nad hraničním RTT nedotáhl nikdy -
+        přesně ten failure mode, kvůli kterému OPRAVA #6c vznikla. ETAPA 3 ji
+        při přepisu vyřadila.
+
+        Příznaky se proto nastavují PŘED voláním smyčky a při neúspěchu zase
+        uvolňují, aby uzel neuvázl v syncing_fork bez běžícího stahování.
         """
-        for peer in kandidati:
-            if not self.running or getattr(self, 'syncing_fork', False):
-                return
-            tip = self.sync_buffer_tip()
-            if not tip:
-                return
-            self.add_log(f"{Fore.CYAN}Zkouším obnovit fork sync přes {peer} od #{tip[0]}.{Style.RESET_ALL}")
-            if self.sync_blocks_from_peer(peer):
-                return
-        self.add_log(f"{Fore.YELLOW}Žádný uzel nedodal pokračování forku. Buffer zůstává pro další pokus.{Style.RESET_ALL}")
+        try:
+            for peer in kandidati:
+                if not self.running:
+                    return
+                # Buffer i fork_start_index se čtou ZNOVU pro každý pokus:
+                # předchozí kolo mohlo skončit _abort_fork_sync(), který buffer
+                # zahodil a fork_start_index vynuloval. Bez fork_start_index by
+                # process_sync_buffer() stejně porovnával začátek bufferu s None
+                # a všechno zahodil, takže nemá smysl pokračovat.
+                tip = self.sync_buffer_tip()
+                if not tip or self.fork_start_index is None:
+                    return
+                self.add_log(f"{Fore.CYAN}Zkouším obnovit fork sync přes {peer} od #{tip[0]}.{Style.RESET_ALL}")
+                # syncing_fork musí být nastavené PŘED smyčkou - jinak se locator
+                # nepostaví od špičky bufferu.
+                self.syncing_fork = True
+                # fork_sync_start se posouvá, aby watchdog (FORK_SYNC_IDLE_TIMEOUT)
+                # nesestřelil pokus, který právě začal.
+                self.fork_sync_start = time.time()
+                # Uzel, kterého se ptáme, se stává zdrojem forku. Opožděné dávky od
+                # ostatních pak _store_fork_batch_inner() ignoruje BEZ postihu.
+                self.fork_peer_ip = peer[0]
+                if self.sync_blocks_from_peer(peer):
+                    return
+                # Neúspěch: příznaky uvolníme, ať se uzel nezasekne v syncing_fork
+                # s nikým na druhé straně. Buffer a fork_start_index ZŮSTÁVAJÍ -
+                # o ně při timeoutu nejde, jde jen o to, že přestalo přicházet.
+                self.syncing_fork = False
+                self.fork_peer_ip = None
+            self.add_log(f"{Fore.YELLOW}Žádný uzel nedodal pokračování forku. Buffer zůstává pro další pokus.{Style.RESET_ALL}")
+        finally:
+            # Táž pojistka jako u _store_fork_batch (OPRAVA D-02): žádná cesta,
+            # která nastaví stavový příznak, nesmí skončit dřív, než ho uklidí.
+            # Tohle vlákno je JEDINÉ, které obnovené stahování řídí - jakmile
+            # z metody odejde, dotazy už nikdo neposílá. Kdyby tu syncing_fork
+            # zůstalo viset, periodický sync by mlčel celý FORK_SYNC_IDLE_TIMEOUT.
+            # Při úspěchu ho uklidil už process_sync_buffer(), tohle je pro
+            # zbylé cesty ven (early return i výjimka).
+            if getattr(self, 'syncing_fork', False):
+                self.syncing_fork = False
+                self.fork_peer_ip = None
 
     def sync_with_peer(self, peer):
         """ETAPA 1: jedno kolo periodické synchronizace s jedním uzlem."""
@@ -5714,6 +5975,13 @@ class P2PNode:
         if not isinstance(bd['previous_hash'], str):
             return False
         if not isinstance(bd['transactions'], list):
+            return False
+        # OPRAVA D-15: kontroloval se jen typ seznamu, ne typ prvků, takže
+        # transactions = [None] projde touhle brankou a AttributeError vznikne
+        # až uvnitř Block.from_dict(). Branka má zaručit, že za stavovým
+        # příznakem nevznikne neočekávaná výjimka - k tomu musí kontrolovat
+        # tvar do stejné hloubky, v jaké se s daty dál pracuje.
+        if any(not isinstance(t, dict) for t in bd['transactions']):
             return False
         if isinstance(bd['index'], bool) or not isinstance(bd['index'], int):
             return False
@@ -6834,6 +7102,16 @@ class P2PNode:
                         with self.peers_lock:
                             kandidati = list(self.peers)
                         if kandidati:
+                            # OPRAVA D-17: příznak se zvedá JEŠTĚ PŘED startem
+                            # vlákna. Tahle iterace watchdogu totiž o pár řádků
+                            # níž testuje `not syncing_fork` a rozjela by
+                            # souběžně i běžný sync se všemi uzly - dva locatory
+                            # od dvou různých vrcholů naráz. _resume_fork_sync()
+                            # si obojí hned nastaví znovu (a v finally uklidí),
+                            # tohle jen zavírá okno mezi vynulováním výše
+                            # a rozběhnutím vlákna.
+                            self.syncing_fork = True
+                            self.fork_sync_start = time.time()
                             t = threading.Thread(target=self._resume_fork_sync, args=(kandidati,))
                             t.daemon = True
                             t.start()
