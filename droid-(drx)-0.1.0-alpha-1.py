@@ -16,19 +16,31 @@ from colorama import Fore, Style, init
 import struct
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
-from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+# OPRAVA A-6: ověřování podpisů přes OpenSSL. Knihovna cryptography už v
+# závislostech byla (Argon2id a AES-GCM), SECP256K1 i Prehashed(SHA3-256)
+# podporuje, takže formát podpisu ani adresy se nemění.
+from cryptography.hazmat.primitives.asymmetric import ec, utils as asym_utils
+from cryptography.exceptions import InvalidSignature
 import getpass
 import sqlite3
 import bisect
 import heapq
 import multiprocessing
-from collections import defaultdict
-import readline
-import math
+from collections import defaultdict, deque
+# OPRAVA G-11: readline se nikde nevolá a statická analýza ho hlásí jako
+# nepoužitý import - je ale importovaný PRO VEDLEJŠÍ EFEKT: pouhý import
+# napojí readline na vstup input(), a tím převezme obsluhu editace řádku.
+#
+# NEODSTRAŇOVAT. Bez něj si input() neudržuje přehled o skutečné pozici
+# kurzoru a mazání znaku terminál nepřekreslí správně - v příkazové řádce
+# zůstávají "vypálené" znaky, které už nejde smazat. Projevuje se to hlavně
+# u výpisů s ANSI sekvencemi (colorama) a u diakritiky, kde jeden znak není
+# jeden bajt. Jako bonus fungují šipky a historie.
+import readline  # noqa: F401 - importován pro vedlejší efekt (obsluha editace v input())
 import signal
 import ipaddress
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal
 import platform
 import copy
 from types import SimpleNamespace
@@ -45,9 +57,21 @@ BLOCK_TIME_SECONDS = 60
 COINBASE_MATURITY = 1000
 MAX_REORG_DEPTH = 1000
 TX_FEE_MIN = int(0.00000001 * (10 ** DECIMALS))
-# OPRAVA #6b (varianta A): TX_FEE_MAX je nově VÝHRADNĚ mempoolová politika,
-# vynucovaná jen v add_transaction(). Z konsenzu (add_block, validate_fork,
-# is_valid_chain) je horní mez odstraněna.
+# ZMĚNA 1: horní limit transakčního poplatku (dřívější konstanta TX_FEE_MAX,
+# 0,01 DRX) je odstraněn ÚPLNĚ a nenahrazuje ho žádná jiná konstanta ani jiný
+# maximální limit. Po OPRAVĚ #6b (níže) už platil jen jako mempoolová politika
+# v add_transaction() a při zadávání poplatku ve volbě 2 menu - nově neplatí
+# ani tam. Jediné pravidlo pro poplatek v konsenzu (add_block, validate_fork,
+# is_valid_chain) i v mempoolu je fee >= TX_FEE_MIN. Shora je poplatek omezený
+# jen zůstatkem odesílatele, protože amount + fee musí být kryté.
+#
+# Konsenzus se touto změnou NEMĚNÍ (horní mez v něm po #6b už nebyla). Mění se
+# jen to, co uzel přijme do mempoolu, přepošle a vytěží. Uzel se starším kódem
+# transakci s poplatkem nad 0,01 DRX do svého mempoolu nepřijme ani nepřepošle,
+# blok, který ji obsahuje, ale přijme.
+#
+# OPRAVA #6b (varianta A) - původní zdůvodnění odstranění horní meze z konsenzu
+# (add_block, validate_fork, is_valid_chain):
 #
 # Důvod: jako konsenzuální pravidlo dělal strop 0,01 DRX z bloku s vyšším
 # poplatkem NEPLATNÝ blok. Do bloku se vejde ~1 633 transakcí, takže absolutní
@@ -64,7 +88,6 @@ TX_FEE_MIN = int(0.00000001 * (10 ** DECIMALS))
 #
 # Tohle je hard fork. Uzel s tímhle kódem přijme blok, který by starý uzel
 # odmítl. Musí být nasazeno před spuštěním sítě, ne po něm.
-TX_FEE_MAX = int(0.01 * (10 ** DECIMALS))
 MIN_TX_AMOUNT = int(0.00000001 * (10 ** DECIMALS))
 DIFFICULTY_ADJUSTMENT_INTERVAL = 144
 # OPRAVA #15: TARGET_BLOCK_TIME odstraněn - nikde se nepoužíval (LWMA-3 si
@@ -83,19 +106,22 @@ P2P_HOST = '0.0.0.0'
 GENESIS_ADDRESS = "DRXf4fc20af1250719b255554a2382feb510b8022c7eeb0376f84b8cc03a1fce1b6a3fd1e3f"
 GENESIS_ADDRESS_EXPECTED_HASH = "8f46fa50b96e72c0156c846b6ac7b48445b17217d70be4c639b0f9f9582b71b2"
 GENESIS_TIMESTAMP = 1785614400
-# Genesis konstanty jsou ověřené a platí i po zavedení state_root do hlavičky:
-# nonce 3622 dává hash
-# 0000092d034dfef99d334ec7afbefce860b0aa2ba5b72f8ea43e808a9e903cd7 včetně
-# state_root c6253efc7a5da68207e84ab2d5d238e33c23e9945cf411c0c622cb0adfca380a
-# a splňuje FIXED_TARGET. verify_genesis_block() i CHECKPOINTS[0] projdou.
-# (Dřív tu stálo "nonce 38083 dává hash 0000013c..." - hodnoty ze starší
-# verze, které přežily přepočet genesis bloku. Kód sám byl správně, jen
-# komentář lhal. Přepočítáno a ověřeno proti create_genesis_block().)
 # Samotný state_root genesis bloku se dopočítá automaticky v create_genesis_block().
 # Při JAKÉKOLI změně obsahu genesis bloku (adresa, částka, čas, data, target,
 # version, chain_id) je nutné obě hodnoty níže znovu vytěžit a přepsat.
-GENESIS_NONCE = 3622
-GENESIS_BLOCK_EXPECTED_HASH = "0000092d034dfef99d334ec7afbefce860b0aa2ba5b72f8ea43e808a9e903cd7"
+# OPRAVA A-4 (hard fork): zavedení příznakového bajtu v encode_optional_field()
+# změnilo podepisovaná data, a tím i tx_id genesis transakce a merkle root
+# bloku. Genesis byl proto znovu vytěžen:
+#   tx_id genesis  d28c60c67232023b9eb14e91517a6ef2ba57bf42984cf809b382c89652c5f254
+#   merkle root    1454f46084c0419623620b5b6b3cf07b327d054420f79abc93cb0fa9edf48199
+#   state_root     c6253efc7a5da68207e84ab2d5d238e33c23e9945cf411c0c622cb0adfca380a (beze změny -
+#                  state root stojí na SMT účtů, immature odměně a total_supply, ne na tx_id)
+#   nonce 977525 -> hash 000005313da262cac258328eb23d83cf86a3b16764cc4b00a5f9eaefb5404ff8,
+#   splňuje FIXED_TARGET. verify_genesis_block() i CHECKPOINTS[0] projdou.
+# Předchozí hodnoty (nonce 3622, hash 0000092d03...) platily pro staré kódování
+# a s tímhle kódem by neprošly.
+GENESIS_NONCE = 977525
+GENESIS_BLOCK_EXPECTED_HASH = "000005313da262cac258328eb23d83cf86a3b16764cc4b00a5f9eaefb5404ff8"
 GENESIS_AMOUNT = 50 * (10 ** DECIMALS)
 
 MAX_BLOCK_SIZE_BYTES = 1 * 1024 * 1024
@@ -120,6 +146,30 @@ ORPHAN_EXPIRATION = 600
 # MAX_MEMPOOL_SIZE_BYTES - MEMPOOL_PREMIUM_RESERVE_BYTES se podprůměrně
 # platící transakce nedostane vůbec a nemusí se kvůli ní nic vytěsňovat.
 MEMPOOL_PREMIUM_RESERVE_BYTES = MAX_MEMPOOL_SIZE_BYTES // 10
+
+# OPRAVA A-3: sync_buffer.db neměl žádné omezení velikosti - orphan
+# pool má MAX_ORPHAN_POOL_BYTES + expiraci, mempool MAX_MEMPOOL_SIZE_BYTES,
+# peer_listen_ports MAX_PEER_LISTEN_PORTS + TTL, locator MAX_LOCATOR_HASHES,
+# jen buffer forku neměl nic.
+# (OPRAVA G-05/G-06: tady stálo, že sync_buffer.db byl "jediná neomezená
+# struktura v kódu". To NEPLATILO - neomezené byly i p2p_log a blacklist,
+# obojí vzdáleně vyvolatelné. Formulace je opravená, protože takové tvrzení
+# bere čtenář příštího auditu jako hotovou informaci a nekontroluje ho.
+# Dnes má strop p2p_log (MAX_P2P_LOG_ENTRIES) i blacklist
+# (MAX_BLACKLIST_ENTRIES + periodické prořezávání).)
+# _store_fork_batch_inner() zapisoval dávku za
+# dávkou bez počítadla, zatímco replace_chain() na druhém konci tvrdě odmítne
+# cokoli delšího než MAX_REORG_DEPTH + 1. Uzel tedy uměl zapsat 2 500 bloků,
+# z toho 1 499 s předem jistým výsledkem "odmítnuto", a pak celý buffer zahodit
+# - při plných blocích ~2,5 GB zápisu na flash telefonu za jeden útok. Cena pro
+# útočníka je přitom jen PoW, žádné platné transakce ani state root: do bufferu
+# se blok dostane po třech kontrolách (rozsah targetu, meets_difficulty,
+# návaznost uvnitř dávky).
+#
+# Strop je dvojí, protože ani jeden sám nestačí: hloubkový drží buffer v mezích,
+# které replace_chain() vůbec může přijmout, bajtový chrání flash i v případě,
+# že hloubku neumíme spočítat (fork_start_index není znám) nebo jsou bloky plné.
+MAX_SYNC_BUFFER_BYTES = (MAX_REORG_DEPTH + 1) * 64 * 1024
 
 # OPRAVA D-04: add_block() měl jediný pokus o zámek s timeout=5 a při vypršení
 # platný blok zahodil. Blok má přednost před transakcemi, takže se o zámek
@@ -186,6 +236,12 @@ MAX_PEERS = 20
 # PEER_STALE_SECONDS: po jak dlouhé nečinnosti je peer kandidátem na vytlačení.
 MAX_PEERS_PER_SUBNET = 3
 PROTECTED_PEER_SLOTS = 4
+# OPRAVA G-10: strop tabulky peerů pro RUČNÍ zadání. Ruční peer záměrně obchází
+# _can_admit_locked() (je to záchranná cesta z eclipse útoku, kterou nesmí
+# zablokovat plná tabulka), ale úplná absence horní meze znamenala, že self.peers
+# i protected_peers mohly růst bez omezení. PROTECTED_PEER_SLOTS je tedy nově
+# skutečná kvantifikovaná rezerva: ručně smí tabulka přerůst právě o tolik.
+MAX_MANUAL_PEERS_TOTAL = MAX_PEERS + PROTECTED_PEER_SLOTS
 PEER_STALE_SECONDS = 1800
 
 # peer_listen_ports je branka důvěry z OPRAVY #10 - handle_message propouští
@@ -218,7 +274,62 @@ EXPENSIVE_REFILL_PER_SECOND = 4.0
 BAN_DURATION_SECONDS = 3600
 BAN_DURATION_PROTOCOL = 24 * 3600
 
+# OPRAVA G-05: strop P2P logu. Fronta neměla maxsize a vyprazdňovala se JEDINĚ
+# ručně z menu (volba 19) - jiný odtok neexistoval. Uzel běžící bez dozoru,
+# tedy v normálním provozním stavu, paměť nikdy neuvolnil. Přitom skoro každá
+# přijatá zpráva zapíše aspoň řádek, a to VČETNĚ odmítnutých (neznámý typ,
+# chybějící 'data', vyčerpaný rate limit, neprošlá branka důvěry). Útočník
+# tedy nepotřebuje platná data, PoW, minci ani zůstatek: měřením vyšlo 109 B
+# na odmítnutou zprávu, což při trvalém stropu rate limiteru (30 zpráv/s)
+# dělá 3,2 kB/s = 271 MB za den z JEDINÉ IP. Na telefonu OOM kill.
+# 1000 řádků je víc, než kdo v menu přečte, a shora omezuje log na ~110 kB.
+MAX_P2P_LOG_ENTRIES = 1000
+
+# OPRAVA G-06: strop a perioda úklidu blacklistu. Slovník se nikdy neprocházel
+# kvůli úklidu - expirovaný záznam zmizel jedině tehdy, když se náhodou znovu
+# ozvala TÁŽ IP (is_blacklisted). IP, která se už nikdy neozve, zůstala
+# v paměti i v souboru napořád. Útočník s jediným /64 prefixem má 2^64 adres a
+# každou umí zabanovat jedním protokolovým přestupkem (třeba handshake s cizím
+# chain_id), tedy prakticky zdarma. Strop je proto tvrdý: při překročení
+# vypadnou bany s nejbližší expirací (trvalé bany od uživatele nikdy).
+# 2048 položek je pro telefon s MAX_PEERS = 20 bohatě dost; proti útočníkovi
+# s celým /64 prefixem neubrání ŽÁDNÁ velikost, takže strop reálnou ochranu
+# neoslabuje - blacklist je proti opakovaným provinilcům z pár adres.
+MAX_BLACKLIST_ENTRIES = 2048
+# Rezerva nad stropem. Bez ní by se při zaplněném blacklistu musel při KAŽDÉM
+# banu protřídit celý slovník (O(N log N) na jeden ban - naměřeno 0,78 s na
+# 6500 banů, tedy nový CPU žrout na téže cestě, kterou má oprava zlevnit).
+# S rezervou se ořez provede jednou za BLACKLIST_CAP_SLACK banů a amortizovaná
+# cena je O(1). Překročení stropu je tím pádem přechodné a shora omezené.
+BLACKLIST_CAP_SLACK = 256
+BLACKLIST_PRUNE_INTERVAL = 300.0
+# Zápis na disk se dávkuje: ban_peer() volal save_blacklist() s KOMPLETNÍM
+# slovníkem po každém jednotlivém banu, takže N banů znamenalo O(N^2)
+# zapsaných bajtů (měřeno: 1500 banů = 59 kB souboru a 2,0 s čistého I/O).
+# Na flash paměti telefonu je to navíc zbytečné opotřebení. Nově se změna jen
+# označí a na disk ji odnese úklidové vlákno, nejvýš jednou za tento interval.
+# 120 s: při plném blacklistu má soubor ~84 kB, takže i za trvalého útoku se
+# na flash zapisuje nejvýš ~0,7 kB/s. Bany se nikdy neztratí - vypínací cesta
+# i ruční zásahy z menu volají flush_blacklist(force=True).
+BLACKLIST_FLUSH_INTERVAL = 120.0
+
 MAX_MESSAGE_SIZE = 10 * 1024 * 1024
+
+# OPRAVA N-2: strop souběžných PŘÍCHOZÍCH spojení a lhůta na doručení celé zprávy.
+# start_server() dřív spouštěl vlákno na každé spojení bez jakéhokoli stropu a
+# timeout CONNECTION_IDLE_TIMEOUT platil na JEDNO recv(), takže 1 bajt za méně než
+# 120 s držel spojení věčně. Z jediné IP přibývalo 60 + 5 spojení/s bez konce;
+# po vyčerpání deskriptorů selhalo i otevření SQLite a smyčka accept() se točila
+# na 100 % CPU (ověřeno testem t_bug2_slowloris.py).
+MAX_INBOUND_CONNECTIONS = 64
+# OPRAVA N-10: rozpočet odchozích pokusů vyvolaných zprávou 'new_peer'.
+NEW_PEER_CONNECT_CAPACITY = 5
+NEW_PEER_CONNECT_REFILL_PER_SECOND = 1.0 / 30
+MAX_INBOUND_PER_IP = 4
+# Tělo zprávy musí dorazit rychlostí aspoň MIN_RECV_RATE (plus pevná rezerva).
+# 50 kB/s je hluboko pod reálnou mobilní linkou, 10 MiB zpráva má ~240 s.
+MIN_RECV_RATE_BYTES_PER_S = 50 * 1024
+MESSAGE_RECV_GRACE_SECONDS = 30
 
 # OPRAVA #6c: dávka byla 10 bloků a komunikace je striktně sériová
 # (request -> čekání -> response -> request), takže při RTT 143 ms a víc se
@@ -317,6 +428,23 @@ MEMPOOL_TX_EXPIRATION = 86400
 CHECKPOINTS = {
     0: GENESIS_BLOCK_EXPECTED_HASH,
 }
+
+# OPRAVA A-6 (assumevalid): load_data() volá is_valid_chain() BEZPODMÍNEČNĚ při
+# každém spuštění a ověřuje každý podpis od genesis bloku. CHECKPOINTS přitom
+# existovaly, ale používaly se jen k porovnání hashe - ne k přeskočení validace
+# pod checkpointem. Přitom právě to je jejich smysl: hashový řetězec obsah pod
+# checkpointem zavazuje, takže ověřovat podpisy znovu nic nepřidává. Hash bloku,
+# merkle root, state root, target, časy i stav se přehrávají dál - přeskakuje se
+# JEN kryptografie, tedy 97 % nákladu.
+#
+# Předpoklad, na kterém to stojí: hodnoty v CHECKPOINTS jsou součástí binárky
+# a uzel jim věří stejně jako GENESIS_BLOCK_EXPECTED_HASH. Přidávat je proto smí
+# jen ten, kdo vydává kód - a je to dobrá praxe i bez ohledu na rychlost.
+#
+# ASSUMEVALID = False vypne optimalizaci a vynutí ověření každého podpisu od
+# genesis (pro audit, forenzní analýzu nebo nedůvěru k vydané binárce).
+ASSUMEVALID = True
+NEJVYSSI_CHECKPOINT = max(CHECKPOINTS) if CHECKPOINTS else -1
 
 time_offset = 0
 
@@ -418,7 +546,62 @@ def is_valid_private_key(key_hex):
     try:
         ecdsa.SigningKey.from_string(binascii.unhexlify(key_hex), curve=ecdsa.SECP256k1)
         return True
-    except (binascii.Error, ecdsa.BadSignatureError, ecdsa.MalformedPointError):
+    # OPRAVA N-6: unhexlify() nad ne-ASCII řetězcem hází ValueError, který NENÍ
+    # binascii.Error (je to naopak jeho předek) - funkce tak místo False vyhodila.
+    except (ValueError, ecdsa.BadSignatureError, ecdsa.MalformedPointError):
+        return False
+
+# OPRAVA A-6: čistě pythonovská knihovna `ecdsa` stála 97 % času startovní
+# validace řetězce. Naměřeno na 300 blocích s 6 221 transakcemi:
+# is_valid_chain() 13,25 s, z toho 7,45 s v Transaction.verify_signature
+# (3,31 s jen v ellipticcurve._double, 748 720 volání). S ověřováním podpisů
+# 6,63 s, bez nich 0,17 s. Extrapolace na rok provozu (525 600 bloků po 60 s):
+# 6,5 h při 20 tx/blok a 520 h při plných blocích - a to na x86; cílem je ARM
+# v Termuxu. Uzel by po roce provozu nenaběhl.
+#
+# Ověřování proto běží přes OpenSSL: 2,18 -> 0,41 ms na podpis, tedy 5,4x.
+# Formát zůstává bit za bitem stejný:
+#   - veřejný klíč  64 bajtů X||Y (nekomprimovaný, bez prefixu 0x04)
+#   - podpis        64 bajtů r||s, low-S
+#   - hash          SHA3-256 přes get_signing_data(), předaný jako Prehashed
+# Ověřeno křížově: podpis vyrobený knihovnou `ecdsa` projde přes OpenSSL
+# a pozměněná zpráva neprojde.
+#
+# PODEPISOVÁNÍ zůstává na `ecdsa` a `sign_deterministic` (RFC 6979) záměrně.
+# cryptography deterministické ECDSA neumí a volí k náhodně; podpis by tak
+# přestal být reprodukovatelný ze samotného klíče a zprávy. Na výkonu to
+# nesejde - podepisuje se jednou za transakci, ověřuje se při každém startu
+# uzlu za celý řetězec. Chceme-li se `ecdsa` zbavit úplně, je to jediné místo,
+# které je potřeba přepsat, a cenou je právě ztráta determinismu.
+SECP256K1_ORDER = ecdsa.SECP256k1.order
+
+def verify_ecdsa_signature(public_key_hex, signature_hex, message):
+    # Vrací True/False, nikdy nevyhazuje - viz kontrakt Transaction.verify_signature().
+    try:
+        pub = binascii.unhexlify(public_key_hex)
+        sig = binascii.unhexlify(signature_hex)
+    except (binascii.Error, TypeError, ValueError):
+        return False
+    if len(pub) != 64 or len(sig) != 64:
+        return False
+
+    r = int.from_bytes(sig[:32], 'big')
+    s = int.from_bytes(sig[32:], 'big')
+    if r <= 0 or r >= SECP256K1_ORDER or s <= 0 or s >= SECP256K1_ORDER:
+        return False
+    # Malleabilita: vyšší polovina se odmítá stejně jako dřív. Podpis je
+    # součástí listu merkle stromu, takže dvě platné varianty téhož podpisu
+    # by daly dva různé merkle rooty pro tentýž obsah bloku.
+    if s > SECP256K1_ORDER // 2:
+        return False
+
+    try:
+        vk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), b'\x04' + pub)
+        vk.verify(asym_utils.encode_dss_signature(r, s),
+                  hashlib.sha3_256(message).digest(),
+                  ec.ECDSA(asym_utils.Prehashed(hashes.SHA3_256())))
+        return True
+    except (InvalidSignature, ValueError, TypeError):
         return False
 
 class Wallet:
@@ -456,6 +639,33 @@ class Wallet:
         return binascii.hexlify(sig).decode()
 
 
+# OPRAVA A-4: volitelná pole se kódovala jen délkovým prefixem, a None se
+# kódovalo jako DÉLKA 0 - tedy bit za bitem stejně jako prázdný řetězec.
+# Podepisovaná data pro data=None a data="" byla shodná, a tím pádem i tx_id;
+# podpis vytvořený nad jednou variantou platil i pro druhou. Totéž platilo pro
+# public_key, to_address, pole signature v listu merkle stromu a pro
+# state_root i previous_hash v hlavičce bloku.
+#
+# Dnes to není zneužitelné - všechny tři validátory blok s coinbase.data = ""
+# odmítnou, from_dict() vynucuje u hex polí přesnou délku a is_valid_address()
+# prázdnou adresu nepustí. Jenže to je obrana o vrstvu výš, ne vlastnost
+# základu: podpis nebyl závazkem k jednoznačné n-tici hodnot. Přesně proti
+# spoléhání na druhou linii míří OPRAVA #4 i D-15.
+#
+# Nově jeden bajt navíc rozlišuje přítomnost od prázdnoty:
+#   None -> 0x00
+#   ""   -> 0x01 + délka 0
+#   "x"  -> 0x01 + délka 1 + "x"
+#
+# POZOR: mění to tx_id, merkle root i hash genesis bloku. Je to hard fork -
+# nasadit před spuštěním sítě, ne po něm. GENESIS_NONCE
+# a GENESIS_BLOCK_EXPECTED_HASH jsou kvůli tomu přepočítané.
+def encode_optional_field(s):
+    if s is None:
+        return b'\x00'
+    enc = str(s).encode('utf-8')
+    return b'\x01' + struct.pack('!I', len(enc)) + enc
+
 class Transaction:
     def __init__(self, from_address, to_address, amount, fee=0, nonce=0, public_key=None, signature=None, timestamp=None, tx_id=None, data=None, chain_id=CHAIN_ID):
         self.from_address = from_address
@@ -491,12 +701,9 @@ class Transaction:
         b += struct.pack('!Q', int(self.nonce))
         b += struct.pack('!Q', int(self.timestamp))
         
+        # OPRAVA A-4: viz encode_optional_field() - None a "" už nejsou totéž.
         for s in [self.from_address, self.to_address, self.public_key, self.data]:
-            if s is None:
-                b += struct.pack('!I', 0)
-            else:
-                enc = str(s).encode('utf-8')
-                b += struct.pack('!I', len(enc)) + enc
+            b += encode_optional_field(s)
         return b
 
     def compute_hash(self):
@@ -555,8 +762,14 @@ class Transaction:
             if raw_timestamp is None:
                 timestamp = None
             else:
-                timestamp = int(raw_timestamp)
-                _check_uint(timestamp, 64, "Timestamp")
+                # OPRAVA G-01: kontrola běžela až NAD převedenou hodnotou
+                # (`timestamp = int(raw_timestamp)` bylo dřív), takže bool-guard
+                # v _check_uint neměl co zachytit a 'timestamp': true prošlo
+                # jako čas 1, "1785614460" jako číslo a 1785614460.7 se tiše
+                # oříznulo. Kontroluje se proto SYROVÁ hodnota, stejně jako
+                # u amount, fee, nonce a chain_id o pár řádků výš.
+                _check_uint(raw_timestamp, 64, "Timestamp")
+                timestamp = raw_timestamp
 
             # OPRAVA F-02: tvar hex polí se vynucuje JEŠTĚ PŘED konstrukcí.
             # 'signature' nevstupuje do get_signing_data(), takže se nepromítne
@@ -636,10 +849,17 @@ class Transaction:
                     f"vypočtenému hashi obsahu transakce '{tx.tx_id}'."
                 )
             return tx
-        except (KeyError, ValueError, TypeError, struct.error, OverflowError) as e:
+        except (KeyError, ValueError, TypeError, AttributeError, struct.error, OverflowError) as e:
             # struct.error a OverflowError doplněny k původnímu tuple jako
             # pojistka - rozsahové kontroly výše by je už neměly připustit,
             # ale kontrakt "ven jde vždy ValueError" musí platit bezvýhradně.
+            #
+            # OPRAVA G-07: totéž pro AttributeError. Nad ne-dictem padne hned
+            # první `data.get('amount')` a dosud výjimka propadla ven - tedy
+            # přesně to, co OPRAVA D-15 popsala u Block.from_dict. Volající to
+            # sice mají nově ošetřené kontrolou tvaru (_data_shape_ok), tohle
+            # je druhá linie: kontrakt musí platit bez ohledu na to, kdo funkci
+            # zavolá a co jí podá.
             raise ValueError(f"Chyba při deserializaci transakce: {e}")
 
     def get_size(self):
@@ -680,18 +900,10 @@ class Transaction:
         if not self.public_key or not self.signature:
             return False
         try:
-            vk = ecdsa.VerifyingKey.from_string(binascii.unhexlify(self.public_key), curve=ecdsa.SECP256k1, hashfunc=hashlib.sha3_256)
-            message = self.get_signing_data()
-            
-            sig_bytes = binascii.unhexlify(self.signature)
-            r, s = ecdsa.util.sigdecode_string(sig_bytes, ecdsa.SECP256k1.order)
-            if s > (ecdsa.SECP256k1.order // 2):
-                return False
-                
-            return vk.verify(sig_bytes, message)
-        except (ecdsa.BadSignatureError, binascii.Error, ecdsa.MalformedPointError,
-                ecdsa.util.MalformedSignature, ValueError, TypeError, struct.error,
-                OverflowError):
+            # OPRAVA A-6: ověření přes OpenSSL. Kontroly rozsahu r/s i odmítnutí
+            # vyšší poloviny s (malleabilita) jsou uvnitř helperu.
+            return verify_ecdsa_signature(self.public_key, self.signature, self.get_signing_data())
+        except (binascii.Error, ValueError, TypeError, struct.error, OverflowError):
             return False
         except Exception:
             # OPRAVA #3: ecdsa.util.MalformedSignature dědí přímo z Exception
@@ -734,12 +946,10 @@ MERKLE_LEAF_PREFIX = b'\x00'
 MERKLE_NODE_PREFIX = b'\x01'
 
 def compute_merkle_leaf_hash(tx):
-    b = MERKLE_LEAF_PREFIX + tx.get_signing_data()
-    if tx.signature:
-        enc = str(tx.signature).encode('utf-8')
-        b += struct.pack('!I', len(enc)) + enc
-    else:
-        b += struct.pack('!I', 0)
+    # OPRAVA A-4: dřív se testovala PRAVDIVOST podpisu, takže None i "" daly
+    # shodný list. Navíc se tím do listu promítalo i to, že prázdný podpis
+    # nebyl odlišitelný od chybějícího.
+    b = MERKLE_LEAF_PREFIX + tx.get_signing_data() + encode_optional_field(tx.signature)
     return hashlib.sha3_256(b).hexdigest()
 
 MERKLE_ZERO_HASH = "0" * 64
@@ -803,7 +1013,24 @@ def encode_account(address, balance, nonce):
         raise ValueError(f"Zůstatek adresy {address} překračuje MAX_SUPPLY.")
     if nonce < -1:
         raise ValueError(f"Neplatný nonce {nonce} u adresy {address}.")
+    # OPRAVA G-02: chyběla HORNÍ mez. Nonce se balí přes '!q', tedy ZNAMÉNKOVÝ
+    # 64bit (znaménko je tu nutné, protože -1 znamená "účet ještě nemá nonce"),
+    # takže strop je 2^63-1. Transaction.from_dict přitom povoluje až 2^64-1.
+    # Pro nonce >= 2^63 vyhodil struct.pack výjimku struct.error, která NENÍ
+    # podtřídou ValueError - proletěla by tedy přes `except ValueError`
+    # v add_block(), _validate_fork_inner(), _is_valid_chain_inner() i mine().
+    # Prakticky je to nedosažitelné (striktní posloupnost nonce znamená, že
+    # k nonce 2^63 by adresa potřebovala 2^63 předchozích transakcí), ale
+    # kontrakt "ven jde vždy ValueError" má platit bezvýhradně.
+    # Formát packování se ZÁMĚRNĚ nemění - je součástí konsenzu (state root).
+    if nonce > 2**63 - 1:
+        raise ValueError(f"Nonce {nonce} u adresy {address} překračuje rozsah kódování (2^63-1).")
     addr_bytes = str(address).encode('utf-8')
+    # Délka adresy se balí přes '!I'. Adresy jsou jinde omezené na 75 znaků,
+    # tahle mez je jen proto, aby funkce nemohla vyhodit struct.error ani při
+    # volání odjinud.
+    if len(addr_bytes) > 2**32 - 1:
+        raise ValueError(f"Adresa je pro kódování příliš dlouhá ({len(addr_bytes)} B).")
     return (struct.pack('!I', len(addr_bytes)) + addr_bytes +
             struct.pack('!Q', balance) +
             struct.pack('!q', nonce))
@@ -1025,6 +1252,67 @@ class AccountsSMT:
     def root(self):
         return self._subtree(0, len(self.sorted_keys), 0)
 
+    def root_with_changes(self, zmeny):
+        """OPRAVA N-11: kořen stromu PO změnách, aniž by se strom měnil.
+
+        zmeny: {adresa: (zustatek, nonce)} pro účet, který ve stromu je/bude,
+        nebo {adresa: None} pro účet, který ze stromu vypadne. Přepočítají se jen
+        cesty ke změněným listům; nezměněné podstromy se berou z cache základu.
+        Struktura rekurze je TOTOŽNÁ se _subtree() i s referenční
+        _smt_subtree_root(): prázdný podstrom = SMT_EMPTY_HASH, jediný list se
+        sbalí na svůj hash, jinak hash(prefix uzlu | levý | pravý).
+        """
+        nove_listy = {}
+        odebrane = set()
+        for adresa, hodnota in zmeny.items():
+            klic = self.key_of.get(adresa)
+            if klic is None:
+                klic = smt_key(adresa)
+            v_zakladu = klic in self.leaves
+            if hodnota is None:
+                if v_zakladu:
+                    odebrane.add(klic)
+                continue
+            if v_zakladu and self.value_of.get(adresa) == hodnota:
+                continue
+            nove_listy[klic] = smt_leaf_hash(adresa, hodnota[0], hodnota[1])
+        if not nove_listy and not odebrane:
+            return self.root()
+        dotcene = sorted(set(nove_listy) | odebrane)
+        return self._subtree_se_zmenami(0, len(self.sorted_keys), 0, dotcene, nove_listy, odebrane)
+
+    def _subtree_se_zmenami(self, lo, hi, depth, dotcene, nove_listy, odebrane):
+        if not dotcene:
+            return self._subtree(lo, hi, depth)
+        pridane = sum(1 for k in dotcene if k in nove_listy and k not in self.leaves)
+        ubrane = sum(1 for k in dotcene if k in odebrane)
+        pocet = (hi - lo) - ubrane + pridane
+        if pocet == 0:
+            return SMT_EMPTY_HASH
+        if pocet == 1 or depth >= SMT_MAX_DEPTH:
+            listy = {}
+            for i in range(lo, hi):
+                k = self.sorted_keys[i]
+                if k not in odebrane:
+                    listy[k] = nove_listy.get(k, self.leaves[k])
+            for k in dotcene:
+                if k in nove_listy:
+                    listy[k] = nove_listy[k]
+            if pocet == 1:
+                return next(iter(listy.values()))
+            h = hashlib.sha3_256(SMT_NODE_PREFIX)
+            for k in sorted(listy):
+                h.update(listy[k])
+            return h.digest()
+        mid = self._split_point(lo, hi, depth)
+        vlevo = [k for k in dotcene if not _smt_bit(k, depth)]
+        vpravo = [k for k in dotcene if _smt_bit(k, depth)]
+        return hashlib.sha3_256(
+            SMT_NODE_PREFIX
+            + self._subtree_se_zmenami(lo, mid, depth + 1, vlevo, nove_listy, odebrane)
+            + self._subtree_se_zmenami(mid, hi, depth + 1, vpravo, nove_listy, odebrane)
+        ).digest()
+
     def sync_from_maps(self, balance_map, nonce_map, touched=None):
         """Srovná strom s mapami. `touched` = jen dotčené adresy (rychlá cesta).
 
@@ -1068,6 +1356,65 @@ class AccountsSMT:
                 self.set_account(address, zustatek, nonce_map.get(address, -1))
             else:
                 self.remove_account(address)
+
+
+_CHYBI = object()
+
+
+class _PrekryvnaMapa:
+    """OPRAVA N-11: mapa nad jinou mapou bez jejího kopírování.
+
+    Zápisy a mazání jdou do vrstvy `zmeny`, základ zůstává netknutý. Umí přesně
+    to, co s mapami dělá update_state_with_block() a prune_zero_balances()
+    (get, [], []=, del, in, pop, copy); vrstva zároveň říká, které adresy se
+    změnily - to je vstup pro AccountsSMT.root_with_changes().
+    """
+    __slots__ = ('zaklad', 'zmeny')
+
+    def __init__(self, zaklad):
+        self.zaklad = zaklad
+        self.zmeny = {}
+
+    def get(self, klic, default=None):
+        if klic in self.zmeny:
+            v = self.zmeny[klic]
+            return default if v is _CHYBI else v
+        return self.zaklad.get(klic, default)
+
+    def __getitem__(self, klic):
+        v = self.get(klic, _CHYBI)
+        if v is _CHYBI:
+            raise KeyError(klic)
+        return v
+
+    def __setitem__(self, klic, hodnota):
+        self.zmeny[klic] = hodnota
+
+    def __delitem__(self, klic):
+        if klic not in self:
+            raise KeyError(klic)
+        self.zmeny[klic] = _CHYBI
+
+    def __contains__(self, klic):
+        return self.get(klic, _CHYBI) is not _CHYBI
+
+    def pop(self, klic, *default):
+        v = self.get(klic, _CHYBI)
+        if v is _CHYBI:
+            if default:
+                return default[0]
+            raise KeyError(klic)
+        self.zmeny[klic] = _CHYBI
+        return v
+
+    def copy(self):
+        d = dict(self.zaklad)
+        for k, v in self.zmeny.items():
+            if v is _CHYBI:
+                d.pop(k, None)
+            else:
+                d[k] = v
+        return d
 
 
 def build_accounts_smt(balance_map, nonce_map):
@@ -1213,13 +1560,10 @@ class Block:
         b += target_bytes
         
         # state_root je součástí hlavičky, takže spadá i pod PoW. Blok bez něj
-        # (starý formát) se zahashuje jako délka 0 a neprojde kontrolou hashe.
+        # (starý formát) se zahashuje jako 0x00 (chybí) a neprojde kontrolou hashe.
+        # OPRAVA A-4: chybějící pole (0x00) je nově odlišené od prázdného ("").
         for s in [self.previous_hash, self.merkle_root, self.state_root]:
-            if s is None:
-                b += struct.pack('!I', 0)
-            else:
-                enc = str(s).encode('utf-8')
-                b += struct.pack('!I', len(enc)) + enc
+            b += encode_optional_field(s)
         return hashlib.sha3_256(b).hexdigest()
 
     def get_size(self):
@@ -1299,17 +1643,43 @@ class Block:
             transactions = [Transaction.from_dict(tx_data) for tx_data in raw_txs]
 
             raw_target = data['target']
-            target = int(raw_target, 16) if isinstance(raw_target, str) else int(raw_target)
+            # OPRAVA N-5: int(x, 16) bere i "0x…", podtržítka, mezery a "+", a
+            # int(True) je 1 - tentýž blok tak měl několik různých platných JSON
+            # zápisů a brána _valid_block_dict() (cesta syncu) i from_dict()
+            # (cesta new_block) říkaly o tvaru targetu každá něco jiného.
+            # Kanonický tvar je ten, který posílá to_dict(): hex(target)[2:].
+            if isinstance(raw_target, bool):
+                raise ValueError("Target nesmí být bool.")
+            if isinstance(raw_target, str):
+                if (not raw_target or len(raw_target) > 64 or raw_target[0] == '0'
+                        or any(c not in '0123456789abcdef' for c in raw_target)):
+                    raise ValueError(f"Target není kanonický hex řetězec: {raw_target!r}")
+                target = int(raw_target, 16)
+            elif isinstance(raw_target, int):
+                target = raw_target
+            else:
+                raise ValueError(f"Target má neplatný typ ({type(raw_target).__name__}).")
             # Horní mez je dána compute_hash(): target se balí do 32 bajtů.
             # Dolní mez je 1 - target 0 nesplní žádný hash a work by dělil nulou.
             if not (0 < target < (1 << 256)):
                 raise ValueError(f"Target mimo rozsah: {raw_target}")
 
-            ts = int(data['timestamp'])
+            # OPRAVA G-01: pořadí bylo obrácené - `ts = int(data['timestamp'])`
+            # proběhlo PŘED kontrolou, takže _check_uint dostal už hotový int
+            # a jeho bool-guard neměl co zachytit. Ověřeno spuštěním: 'timestamp'
+            # true prošel jako čas 1, "1785614460" jako číslo a 1785614460.7 se
+            # tiše oříznulo. Přímo zneužitelné to nebylo - hash bloku se počítá
+            # až z normalizované hodnoty, takže kontrola hashe o vrstvu níž se
+            # tím obejít nedá - ale byl to rozpor s deklarovaným kontraktem a
+            # normalizační nekonzistence: tentýž blok měl několik různých
+            # platných JSON reprezentací. Kontroluje se proto SYROVÁ hodnota,
+            # stejně jako u index, nonce, version a chain_id.
+            #
             # index/timestamp/nonce jdou do compute_hash() přes struct.pack('!Q'),
             # version a chain_id přes '!I'. Mimo rozsah = struct.error, která také
             # není podtřída ValueError.
-            _check_uint(ts, 64, "Timestamp bloku")
+            _check_uint(data['timestamp'], 64, "Timestamp bloku")
+            ts = data['timestamp']  # _check_uint výše zaručil int (a ne bool)
             _check_uint(data['index'], 64, "Index bloku")
             nonce = data.get('nonce', 0)
             _check_uint(nonce, 64, "Nonce bloku")
@@ -1592,6 +1962,85 @@ class Blockchain:
                 p2p_node.add_log(f"{Fore.YELLOW}Transakce {victim.tx_id} vytěsněna z mempoolu transakcí s vyšší sazbou poplatku.{Style.RESET_ALL}")
         return bool(evicted)
 
+    def _prune_mempool_sequences(self, senders=None, stale_only=False):
+        # ZMĚNA 4: odstranění konfliktních a nevytěžitelných transakcí podle
+        # AKTUÁLNÍHO stavu řetězce (nonce_map, balance_map).
+        #
+        # Problém: add_block() odebíral z mempoolu jen transakce se STEJNÝM
+        # tx_id, jaké má blok. Když ale blok obsahuje JINOU transakci téže
+        # adresy se stejnou nonce (stejná peněženka použitá na dvou uzlech,
+        # znovu odeslaná platba s jiným časem nebo částkou, double-spend),
+        # naše verze v mempoolu zůstala až do expirace (24 h) - a škodila:
+        #   - mine() začíná u adresy transakcí s nejnižší nonce; ta byla
+        #     zastaralá, takže se adresa přeskočila CELÁ a nevytěžily se ani
+        #     její platné navazující transakce,
+        #   - cleanup_mempool() i add_transaction() odečítaly její částku od
+        #     zůstatku, takže platné navazující transakce propadaly jako
+        #     "nedostatečný zůstatek" a nové transakce adresy se odmítaly.
+        #
+        # Pro každou adresu se její transakce projdou v pořadí nonce:
+        #   1) nonce <= nonce_map: nonci už spotřeboval řetězec, transakce se
+        #      nikdy nevytěží. Odstraní se, ale posloupnost NEPŘERUŠUJE.
+        #   2) duplicitní nonce: ponechá se dříve přijatá transakce.
+        #   3) díra v posloupnosti nonce: transakce i všechny navazující jsou
+        #      nevytěžitelné.
+        #   4) kumulovaná částka + poplatek nad zůstatek: transakce i všechny
+        #      navazující padají - stejné pravidlo jako dosud v cleanup_mempool()
+        #      (OPRAVA D-09) a v add_transaction().
+        # Podpis, adresy ani čas se tu znovu neověřují - na stavu řetězce
+        # nezávisí, ověřila je add_transaction() při přijetí a expiraci řeší
+        # cleanup_mempool().
+        #
+        # senders:    adresy ke kontrole; None = všechny adresy v mempoolu.
+        # stale_only: jen krok 1. Používá add_block() před recyklací transakcí
+        #             při mini-reorgu, kdy by díra v posloupnosti mohla být jen
+        #             dočasná (recyklace ji může zaplnit).
+        #
+        # Volající musí držet self.lock. Vrací seznam dvojic (tx, důvod).
+        if senders is None:
+            senders = list(self.mempool_by_sender.keys())
+        odstranit = []
+        for sender in senders:
+            if sender == "COINBASE":
+                continue
+            txs = self.mempool_by_sender.get(sender)
+            if not txs:
+                continue
+            potvrzena_dalsi = self.nonce_map.get(sender, -1) + 1
+            ocekavana = potvrzena_dalsi
+            dostupne = self.balance_map.get(sender, 0)
+            preruseno = None
+            # sorted() je stabilní, takže při shodné nonce zůstává pořadí
+            # přijetí do mempoolu.
+            for tx in sorted(txs, key=lambda t: t.nonce):
+                if tx.nonce < potvrzena_dalsi:
+                    odstranit.append((tx, f"nonce {tx.nonce} už v blockchainu spotřebovala jiná transakce téže adresy"))
+                    continue
+                if stale_only:
+                    continue
+                if preruseno is not None:
+                    odstranit.append((tx, preruseno))
+                    continue
+                if tx.nonce < ocekavana:
+                    odstranit.append((tx, f"duplicitní nonce {tx.nonce}"))
+                    continue
+                if tx.nonce > ocekavana:
+                    odstranit.append((tx, f"díra v posloupnosti nonce, chybí nonce {ocekavana}"))
+                    preruseno = f"navazuje na chybějící transakci s nonce {ocekavana}"
+                    continue
+                if dostupne < tx.amount + tx.fee:
+                    odstranit.append((tx, "nedostatečný zůstatek"))
+                    preruseno = f"navazuje na odstraněnou transakci s nonce {tx.nonce}"
+                    continue
+                dostupne -= (tx.amount + tx.fee)
+                ocekavana += 1
+        if odstranit:
+            # Jedno hromadné odebrání místo _mempool_remove() po jedné: každé
+            # jednotlivé volání přestavuje celý seznam, tedy O(n) na transakci.
+            ids = {tx.tx_id for tx, _ in odstranit}
+            self.unconfirmed_transactions = [t for t in self.unconfirmed_transactions if t.tx_id not in ids]
+        return odstranit
+
     def cleanup_mempool(self):
         with self.lock:
             current_time = get_time()
@@ -1632,34 +2081,173 @@ class Blockchain:
             # Prochází se po adresách a v pořadí nonce: jakmile jedna transakce
             # neprojde, jsou všechny navazující stejně nevytěžitelné (díra
             # v posloupnosti nonce), takže padají s ní.
-            invalid_transactions = []
-            for addr, txs in self.mempool_by_sender.items():
-                if addr == "COINBASE":
-                    continue
-                available = self.balance_map.get(addr, 0)
-                broken = False
-                for tx in sorted(txs, key=lambda t: t.nonce):
-                    if broken or available < tx.amount + tx.fee:
-                        # Jakmile jedna transakce propadne, vznikne v posloupnosti
-                        # nonce díra a všechny navazující jsou nevytěžitelné.
-                        broken = True
-                        invalid_transactions.append(tx)
-                        continue
-                    available -= (tx.amount + tx.fee)
-
-            # Odebírá se až po dokončení iterace - _mempool_remove() mění
-            # mempool_by_sender, přes který se právě prochází.
-            for tx in invalid_transactions:
-                self._mempool_remove(tx)
+            #
+            # ZMĚNA 4: pravidlo D-09 (zůstatek + navazující) se nově provádí
+            # v _prune_mempool_sequences() a je rozšířené o kontrolu nonce:
+            # zastaralé transakce (nonce už spotřebovaná řetězcem), duplicitní
+            # nonce a díry v posloupnosti. Pro mempool bez takových transakcí je
+            # výsledek beze změny. Tady slouží jako pojistka - add_block() tytéž
+            # transakce odstraňuje hned po přijetí bloku.
+            invalid_transactions = self._prune_mempool_sequences()
 
             if expired_transactions or invalid_transactions:
                 save_mempool(self.unconfirmed_transactions)
-                global p2p_node
+                # OPRAVA G-11: `global p2p_node` tu bylo zbytečně - deklarace je nutná jen při PŘIŘAZENÍ, ne při čtení. Odstraněno.
                 if 'p2p_node' in globals() and p2p_node is not None:
                     for tx in expired_transactions:
                         p2p_node.add_log(f"{Fore.YELLOW}Upozornění: Transakce {tx.tx_id} byla odstraněna z mempoolu (expirace nebo navazující).{Style.RESET_ALL}")
-                    for tx in invalid_transactions:
-                        p2p_node.add_log(f"{Fore.YELLOW}Upozornění: Transakce {tx.tx_id} byla odstraněna z mempoolu (nedostatečný zůstatek nebo navazující).{Style.RESET_ALL}")
+                    for tx, duvod in invalid_transactions:
+                        p2p_node.add_log(f"{Fore.YELLOW}Upozornění: Transakce {tx.tx_id} byla odstraněna z mempoolu ({duvod}).{Style.RESET_ALL}")
+
+    def revalidate_stored_mempool(self, kandidati):
+        # ZMĚNA 3: validace uloženého mempoolu při startu uzlu.
+        #
+        # Mempool se při vypnutí už nemaže (ZMĚNA 2), takže mempool.db může po
+        # startu obsahovat transakce, které mezitím přestaly platit: jsou už
+        # vytěžené (například je vytěžil jiný uzel a blok se stihl zapsat, ale
+        # uzel spadl dřív, než uložil mempool), jejich nonce spotřebovala jiná
+        # transakce téže adresy, vypršely, odesílatel na ně už nemá zůstatek,
+        # nebo je záznam poškozený. Volá se z load_mempool() až PO načtení
+        # a validaci blockchainu, tedy nad aktuálním balance_map a nonce_map.
+        #
+        # kandidati: seznam dvojic (tx, allow_expired) v pořadí, v jakém byly
+        # transakce zapsané do mempool.db (ORDER BY rowid). To odpovídá pořadí
+        # jejich původního přijetí do mempoolu.
+        #
+        # Postup:
+        #   1) Transakce, jejichž tx_id už je v blockchainu, se vyřadí jedním
+        #      dávkovým dotazem (tx_ids_in_chain), ne dotazem na každou zvlášť.
+        #   2) Zbytek se rozdělí podle odesílatele a v rámci odesílatele seřadí
+        #      podle nonce. Na pořadí záleží: add_transaction() přijme jen
+        #      transakci s PŘESNĚ následující nonce, takže při načtení v jiném
+        #      pořadí (nonce 7 před 6) by platná navazující transakce propadla.
+        #      Mezi odesílateli se transakce prokládají podle původního pořadí
+        #      zápisu, aby kapacitní politika mempoolu (rezerva pro nadmediánovou
+        #      sazbu, vytěsňování) viděla transakce co nejpodobněji původnímu
+        #      příjmu.
+        #   3) Transakce s očekávanou nonce projde add_transaction(), tedy PŘESNĚ
+        #      týmiž pravidly jako transakce přijatá ze sítě: chain_id, formát
+        #      adres, identita odesílatele, podpis, částka, poplatek (jen
+        #      fee >= TX_FEE_MIN), timestamp a expirace, nonce a zůstatek
+        #      KUMULOVANĚ se všemi už přijatými transakcemi téže adresy.
+        #      Vlastní kopie pravidel tu záměrně není - rozešla by se
+        #      s add_transaction() při první budoucí úpravě.
+        #   4) Chybí-li u adresy platná transakce s očekávanou nonce, vznikne
+        #      v posloupnosti díra a všechny navazující transakce téže adresy
+        #      jsou nevytěžitelné, takže se odstraní také - stejné pravidlo jako
+        #      v cleanup_mempool() a mine(). Transakce, jejíž nonce už spotřeboval
+        #      řetězec, posloupnost nepřerušuje: jen se zahodí jako zastaralá
+        #      a další transakce téže adresy se posuzují normálně.
+        #
+        # Vrací (počet ponechaných, počet odstraněných). Zápis výsledku do
+        # mempool.db zajišťuje volající (load_mempool). Výpisy jdou přes print(),
+        # protože při startu p2p_node (a tedy ani jeho log) ještě neexistuje.
+        with self.lock:
+            odstranene = 0
+
+            def odstran(tx, duvod):
+                nonlocal odstranene
+                odstranene += 1
+                print(f"{Fore.YELLOW}  Odstraněno z mempoolu: {tx.tx_id} - {duvod}{Style.RESET_ALL}")
+
+            # Pojistka proti duplicitnímu tx_id v uložených datech. V mempool.db
+            # je tx_id PRIMARY KEY, takže by k tomu nemělo dojít.
+            videne = set()
+            unikatni = []
+            for poradi, (tx, allow_expired) in enumerate(kandidati):
+                if tx.tx_id in videne:
+                    odstran(tx, "duplicitní TX ID v uloženém mempoolu")
+                    continue
+                videne.add(tx.tx_id)
+                unikatni.append((poradi, tx, allow_expired))
+
+            # 1) Už vytěžené transakce.
+            vytezene = self.tx_ids_in_chain([tx.tx_id for _, tx, _ in unikatni])
+
+            # 2) Rozdělení podle odesílatele; v rámci odesílatele podle nonce,
+            #    při shodné nonce podle pořadí zápisu.
+            zasobniky = defaultdict(list)
+            for poradi, tx, allow_expired in unikatni:
+                if tx.tx_id in vytezene:
+                    odstran(tx, "už je zahrnutá v blockchainu (vytěžená)")
+                    continue
+                if tx.from_address == "COINBASE":
+                    odstran(tx, "COINBASE transakce do mempoolu nepatří")
+                    continue
+                zasobniky[tx.from_address].append((tx.nonce, poradi, tx, allow_expired))
+
+            # Halda vybírá mezi odesílateli toho, jehož nejbližší transakce (v
+            # pořadí nonce) byla zapsaná nejdřív. Pořadí nonce uvnitř adresy tím
+            # zůstává zachované vždy.
+            halda = []
+            pozice = {}
+            for odesilatel, polozky in zasobniky.items():
+                polozky.sort(key=lambda p: (p[0], p[1]))
+                pozice[odesilatel] = 0
+                heapq.heappush(halda, (polozky[0][1], odesilatel))
+
+            prijate = []
+            preruseno = {}
+            while halda:
+                _, odesilatel = heapq.heappop(halda)
+                polozky = zasobniky[odesilatel]
+                i = pozice[odesilatel]
+                pozice[odesilatel] = i + 1
+                if i + 1 < len(polozky):
+                    heapq.heappush(halda, (polozky[i + 1][1], odesilatel))
+                _, _, tx, allow_expired = polozky[i]
+
+                # 4) Po díře v posloupnosti už nic z téže adresy neprojde.
+                if odesilatel in preruseno:
+                    odstran(tx, preruseno[odesilatel])
+                    continue
+
+                # Nonce už spotřebovaná řetězcem: vytěžená byla jiná transakce
+                # téže adresy se stejnou nonce (vlastní tx_id by zachytil krok 1).
+                potvrzena_dalsi = self.nonce_map.get(odesilatel, -1) + 1
+                if tx.nonce < potvrzena_dalsi:
+                    odstran(tx, f"nonce {tx.nonce} už v blockchainu spotřebovala jiná transakce téže adresy (zastaralá)")
+                    continue
+
+                ocekavana = self.get_next_nonce(odesilatel)
+                if tx.nonce < ocekavana:
+                    # Tuto nonce už v mempoolu drží dříve přijatá platná
+                    # transakce téže adresy.
+                    odstran(tx, f"duplicitní nonce {tx.nonce} - tuto nonce už v mempoolu má jiná platná transakce téže adresy")
+                    continue
+                if tx.nonce > ocekavana:
+                    odstran(tx, f"díra v posloupnosti nonce (očekávána {ocekavana}, transakce má {tx.nonce})")
+                    preruseno[odesilatel] = f"navazuje na chybějící nebo odstraněnou transakci s nonce {ocekavana} (díra v posloupnosti nonce)"
+                    continue
+
+                # 3) Plné ověření týmiž pravidly jako transakce ze sítě.
+                puvodni_deadline = tx.mempool_deadline
+                if self.add_transaction(tx, allow_expired=allow_expired):
+                    if allow_expired:
+                        # add_transaction() dá transakci vrácené reorgem novou
+                        # lhůtu počítanou od "teď". Obnova po restartu ale není
+                        # návrat z reorgu: lhůta běží od původního návratu do
+                        # mempoolu a restart ji nesmí prodlužovat. Strop
+                        # "teď + MEMPOOL_TX_EXPIRATION" chrání před nesmyslnou
+                        # hodnotou z poškozeného souboru.
+                        tx.mempool_deadline = min(puvodni_deadline, get_time() + MEMPOOL_TX_EXPIRATION)
+                    prijate.append(tx)
+                else:
+                    # Posloupnost se tu ještě nepřerušuje: může následovat jiný
+                    # kandidát se stejnou nonce. Pokud nenásleduje, zachytí díru
+                    # kontrola "tx.nonce > ocekavana" u další transakce adresy.
+                    odstran(tx, "neprošla ověřením podle aktuálních pravidel (konkrétní důvod je vypsaný o řádek výš)")
+
+            # add_transaction() může při plném mempoolu vytěsnit dříve přijatou
+            # transakci s nižší sazbou poplatku - ta pak v mempoolu už není.
+            ponechane = 0
+            for tx in prijate:
+                if tx.tx_id in self.mempool_by_txid:
+                    ponechane += 1
+                else:
+                    odstran(tx, "vytěsněna z plného mempoolu transakcí s vyšší sazbou poplatku")
+
+            return ponechane, odstranene
 
     def create_genesis_block(self):
         genesis_tx = Transaction(
@@ -1692,6 +2280,40 @@ class Blockchain:
         print(f"{Fore.GREEN}Genesis blok vytvořen a přidán do řetězce!{Style.RESET_ALL}")
         print(f"  State root: {Fore.CYAN}{genesis_block.state_root}{Style.RESET_ALL}")
         print(f"  Hash: {Fore.CYAN}{genesis_block.hash}{Style.RESET_ALL}")
+
+    def state_root_po_bloku(self, block):
+        """OPRAVA N-11: state root po aplikaci bloku na AKTUÁLNÍ vrchol.
+
+        Nic se nekopíruje: mapy jsou překryvné (_PrekryvnaMapa), immature
+        odměny se zkopírují (~COINBASE_MATURITY položek) a kořen SMT se spočítá
+        bez změny stromu přes root_with_changes(). Výsledek je bit za bitem
+        shodný s make_state_shadow() + compute_state_root_from() - ověřeno
+        diferenciálním testem t_fix11_smt_diff.py a regresí nad řetězci.
+        Volat se drženým self.lock. Chyby stavu (záporný zůstatek apod.) jdou
+        ven jako ValueError, stejně jako dřív.
+        """
+        stin = SimpleNamespace(
+            balance_map=_PrekryvnaMapa(self.balance_map),
+            nonce_map=_PrekryvnaMapa(self.nonce_map),
+            immature_rewards=dict(self.immature_rewards),
+            total_supply=self.total_supply,
+            cumulative_work=self.cumulative_work,
+            undo_logs={},
+            state_checkpoints={},
+            accounts_smt=None,
+        )
+        self.update_state_with_block(block, state_target=stin)
+        smt = _state_smt(self)
+        if smt is None:
+            return compute_state_root(stin.balance_map.copy(), stin.nonce_map.copy(),
+                                      stin.immature_rewards, stin.total_supply)
+        zmeny = {}
+        for adresa in set(stin.balance_map.zmeny) | set(stin.nonce_map.zmeny):
+            if adresa in stin.nonce_map or stin.balance_map.get(adresa, 0):
+                zmeny[adresa] = (stin.balance_map.get(adresa, 0), stin.nonce_map.get(adresa, -1))
+            else:
+                zmeny[adresa] = None
+        return _state_root_bytes(smt.root_with_changes(zmeny), stin.immature_rewards, stin.total_supply)
 
     def update_state_with_block(self, block, state_target=None):
         # state_target umožňuje zapisovat stav (balance_map, nonce_map, undo_logs, ...)
@@ -1902,76 +2524,174 @@ class Blockchain:
         return state
 
     def rebuild_state(self, up_to_index=None):
-        conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        c = conn.cursor()
-        
-        target_index = up_to_index if up_to_index is not None else float('inf')
-        start_index = 0
-        closest_checkpoint = 0
-        
-        if hasattr(self, 'state_checkpoints') and self.state_checkpoints:
-            valid_checkpoints = [k for k in self.state_checkpoints.keys() if k <= target_index]
-            if valid_checkpoints:
-                closest_checkpoint = max(valid_checkpoints)
-                
-        if closest_checkpoint > 0:
-            checkpoint = self.state_checkpoints[closest_checkpoint]
-            self.balance_map = checkpoint['balance_map'].copy()
-            self.nonce_map = checkpoint['nonce_map'].copy()
-            self.immature_rewards = copy.deepcopy(checkpoint['immature_rewards'])
-            self.total_supply = checkpoint['total_supply']
-            self.cumulative_work = checkpoint['cumulative_work']
-            self.undo_logs = {k: v for k, v in self.undo_logs.items() if k <= closest_checkpoint}
-            start_index = closest_checkpoint + 1
-        else:
-            self.balance_map = {}
-            self.nonce_map = {}
-            self.immature_rewards = {}
-            self.cumulative_work = 0
-            self.total_supply = 0
-            self.undo_logs = {}
+        # OPRAVA M-2: spojení je nově pod try/finally a Block.from_dict() nad
+        # ŘÁDKY Z VLASTNÍ DB je ošetřená. Dřív tu nebylo ani jedno: poškozený
+        # řádek (ValueError) nebo sqlite3.OperationalError ("disk I/O error",
+        # "database is locked") nechal spojení viset a proletěl ven přes
+        # rollback_state() až z add_block(), který na to nemá žádný try - viz
+        # OPRAVA M-2 v mutační sekci add_block(). Cílová platforma je Termux na
+        # flash paměti, kde I/O chyba není teorie.
+        #
+        # Poškozený řádek se ZÁMĚRNĚ nepřeskakuje: přeskočením by vznikl tiše
+        # nesprávný stav, což je fail-open v konsenzuálním kódu. Místo toho jde
+        # ven MissingChainDataError, tedy týž typ, kterým už kód hlásí "chybí
+        # data nutná pro rozhodnutí" (viz OPRAVA F-05), a volající se podle něj
+        # umí zařídit.
+        conn = None
+        try:
+            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            c = conn.cursor()
 
-        # OPRAVA F-03: mapy se právě celé nahradily, takže se strom staví
-        # jednorázově od nuly. Od téhle chvíle ho update_state_with_block()
-        # udržuje přírůstkově, blok po bloku.
-        self.accounts_smt = build_accounts_smt(self.balance_map, self.nonce_map)
-        
-        query = "SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ?"
-        params = [start_index]
-        if up_to_index is not None:
-            query += " AND block_index <= ?"
-            params.append(up_to_index)
-            
-        c.execute(query + " ORDER BY block_index", tuple(params))
-        
-        for row in c:
-            block_data = {
-                'index': row[0],
-                'timestamp': row[1],
-                'transactions': json.loads(row[2]),
-                'previous_hash': row[3],
-                'target': row[4],
-                'nonce': row[5],
-                'hash': row[6],
-                'merkle_root': row[7],
-                'version': row[8],
-                'chain_id': row[9], 'state_root': row[10]
-            }
-            block = Block.from_dict(block_data)
-            self.update_state_with_block(block)
-        conn.close()
-        
+            target_index = up_to_index if up_to_index is not None else float('inf')
+            start_index = 0
+            closest_checkpoint = 0
+
+            if hasattr(self, 'state_checkpoints') and self.state_checkpoints:
+                valid_checkpoints = [k for k in self.state_checkpoints.keys() if k <= target_index]
+                if valid_checkpoints:
+                    closest_checkpoint = max(valid_checkpoints)
+
+            if closest_checkpoint > 0:
+                checkpoint = self.state_checkpoints[closest_checkpoint]
+                self.balance_map = checkpoint['balance_map'].copy()
+                self.nonce_map = checkpoint['nonce_map'].copy()
+                self.immature_rewards = copy.deepcopy(checkpoint['immature_rewards'])
+                self.total_supply = checkpoint['total_supply']
+                self.cumulative_work = checkpoint['cumulative_work']
+                self.undo_logs = {k: v for k, v in self.undo_logs.items() if k <= closest_checkpoint}
+                start_index = closest_checkpoint + 1
+            else:
+                self.balance_map = {}
+                self.nonce_map = {}
+                self.immature_rewards = {}
+                self.cumulative_work = 0
+                self.total_supply = 0
+                self.undo_logs = {}
+
+            # OPRAVA F-03: mapy se právě celé nahradily, takže se strom staví
+            # jednorázově od nuly. Od téhle chvíle ho update_state_with_block()
+            # udržuje přírůstkově, blok po bloku.
+            self.accounts_smt = build_accounts_smt(self.balance_map, self.nonce_map)
+
+            query = "SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ?"
+            params = [start_index]
+            if up_to_index is not None:
+                query += " AND block_index <= ?"
+                params.append(up_to_index)
+
+            c.execute(query + " ORDER BY block_index", tuple(params))
+
+            for row in c:
+                try:
+                    block_data = {
+                        'index': row[0],
+                        'timestamp': row[1],
+                        'transactions': json.loads(row[2]),
+                        'previous_hash': row[3],
+                        'target': row[4],
+                        'nonce': row[5],
+                        'hash': row[6],
+                        'merkle_root': row[7],
+                        'version': row[8],
+                        'chain_id': row[9], 'state_root': row[10]
+                    }
+                    block = Block.from_dict(block_data)
+                except (ValueError, KeyError, TypeError, struct.error,
+                        OverflowError, json.JSONDecodeError) as e:
+                    raise MissingChainDataError(
+                        f"Blok #{row[0]} v blockchain.db je poškozený a nelze z něj "
+                        f"přehrát stav ({type(e).__name__}: {e})."
+                    ) from e
+                self.update_state_with_block(block)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
         if up_to_index is not None:
             self.max_block_index = up_to_index
 
-    def get_block_from_db(self, index):
-        conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        c = conn.cursor()
-        c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index = ?", (index,))
-        row = c.fetchone()
-        conn.close()
+    def _resync_memory_from_db(self):
+        """OPRAVA M-2: dorovná paměť k databázi a vrátí True/False podle úspěchu.
+
+        Používá se jako ŘÍZENÉ ZOTAVENÍ tam, kde mutace paměti selže ZA commitem.
+        Do commitu vede každá chyba na "blok nebyl přijat" a stav uzlu zůstává
+        netknutý (OPRAVA A-2); za commitem už je blok v DB nezvratně, takže
+        vrátit False nad polovičním přechodem by paměť a DB rozešlo natrvalo -
+        táž třída chyby, kterou popisuje OPRAVA A-1, jen o patro níž.
+
+        Databáze je tu autoritativní: stav se přehraje z ní, okno posledních
+        bloků se načte znovu. Checkpointy i undo logy se zahazují ZÁMĚRNĚ -
+        mohly vzniknout nad větví, kterou právě proběhlý mini-reorg opustil,
+        a přehrát stav z takového checkpointu by chybu jen zakonzervovalo.
+        Přehrání od genesis je pomalé, ale tohle je havarijní cesta, kde má
+        správnost přednost před rychlostí.
+        """
+        conn = None
+        try:
+            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=5.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            c = conn.cursor()
+            c.execute("SELECT MAX(block_index) FROM blocks")
+            row = c.fetchone()
+            tip = row[0] if row and row[0] is not None else None
+            if tip is None:
+                return False
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ? ORDER BY block_index",
+                      (max(0, tip - LAST_BLOCKS_TO_KEEP + 1),))
+            nove_okno = [Block.from_dict({
+                'index': r[0], 'timestamp': r[1], 'transactions': json.loads(r[2]),
+                'previous_hash': r[3], 'target': r[4], 'nonce': r[5], 'hash': r[6],
+                'merkle_root': r[7], 'version': r[8], 'chain_id': r[9], 'state_root': r[10]
+            }) for r in c.fetchall()]
+        except Exception:
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        if not nove_okno or nove_okno[-1].index != tip:
+            return False
+
+        self.state_checkpoints = {}
+        self.undo_logs = {}
+        try:
+            self.rebuild_state(up_to_index=tip)
+        except Exception:
+            return False
+
+        self.chain = nove_okno
+        self.max_block_index = tip
+        return True
+
+    def get_block_from_db(self, index, conn=None):
+        # OPRAVA A-5: volitelné sdílené spojení, stejně jako u tx_ids_in_chain
+        # po OPRAVĚ D-05. Dřív si každé volání otevíralo vlastní connect()
+        # + PRAGMA + dotaz + close(), a protože calculate_expected_target()
+        # potřebuje 145 předchůdců a get_median_time_past() 11, dělalo to při
+        # reorgu do hloubky 50 celkem 6 141 otevření spojení (99,2 % z nich
+        # právě tady) a extrapolovaně ~150 000 při MAX_REORG_DEPTH. Celé pod
+        # self.lock, takže uzel po tu dobu nepřijímal bloky ani netěžil.
+        vlastni_conn = conn is None
+        if vlastni_conn:
+            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+        try:
+            c = conn.cursor()
+            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index = ?", (index,))
+            row = c.fetchone()
+        finally:
+            if vlastni_conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         if row:
             block_data = {
                 'index': row[0],
@@ -1987,6 +2707,65 @@ class Blockchain:
             }
             return Block.from_dict(block_data)
         return None
+
+    def _load_header_window(self, first_index, last_index, chain_dict=None, conn=None):
+        # OPRAVA A-5 (klouzavé okno): okna MTP a LWMA-3 se u sousedních výšek
+        # překrývají z ~99 %, ale kód je četl blok po bloku a každý blok si
+        # otevíral vlastní spojení. Nově jeden dotaz BETWEEN na celý chybějící
+        # rozsah.
+        #
+        # Druhá polovina úspory: oběma funkcím stačí timestamp a target, takže
+        # se sloupec `transactions` vůbec nečte. Dřív se každý blok v okně
+        # deserializoval celý včetně výpočtu tx_id každé transakce - u plných
+        # bloků ~1 600 transakcí na blok, jen aby se z výsledku přečetlo jedno
+        # číslo. Hlavičky proto vracíme jako lehký SimpleNamespace; oba
+        # konzumenti z nich čtou právě .timestamp a .target.
+        #
+        # PRAGMA journal_mode=WAL se tu záměrně nenastavuje: režim žurnálu je
+        # v souboru databáze trvalý, takže na čtecí cestě je to jen zbytečný
+        # zápis navíc v nejteplejší smyčce validace.
+        pamet = chain_dict if chain_dict is not None else {b.index: b for b in self.chain}
+
+        okno = {}
+        chybejici = []
+        for i in range(first_index, last_index + 1):
+            b = pamet.get(i)
+            if b is not None:
+                okno[i] = b
+            else:
+                chybejici.append(i)
+
+        if not chybejici:
+            return okno
+
+        vlastni_conn = conn is None
+        if vlastni_conn:
+            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+        try:
+            c = conn.cursor()
+            c.execute("SELECT block_index, timestamp, target_hex FROM blocks WHERE block_index BETWEEN ? AND ?",
+                      (chybejici[0], chybejici[-1]))
+            for row in c.fetchall():
+                idx = row[0]
+                if idx in okno:
+                    continue
+                try:
+                    target = int(row[2], 16) if isinstance(row[2], str) else int(row[2])
+                    timestamp = int(row[1])
+                except (TypeError, ValueError):
+                    # Nečitelný řádek se chová jako chybějící blok: volající
+                    # vyhodí MissingChainDataError, tedy odmítnutí, ne fail-open.
+                    continue
+                if target <= 0 or timestamp < 0:
+                    continue
+                okno[idx] = SimpleNamespace(index=idx, timestamp=timestamp, target=target)
+        finally:
+            if vlastni_conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return okno
 
     def get_block(self, index):
         for b in self.chain:
@@ -2042,15 +2821,39 @@ class Blockchain:
         if up_to_index is None or up_to_index == self.max_block_index:
             return self.cumulative_work
         total_work = 0
-        conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        c = conn.cursor()
-        c.execute("SELECT target_hex FROM blocks WHERE block_index <= ?", (up_to_index,))
-        for row in c:
-            target = int(row[0], 16)
-            work = (1 << 256) // target if target > 0 else 0
-            total_work += work
-        conn.close()
+        # OPRAVA L-3: spojení bez try/finally na cestě dosažitelné ze sítě
+        # (replace_chain -> get_cumulative_work). Navíc se tu dělalo
+        # int(row[0], 16) bez ošetření: nad poškozeným řádkem odsud letěl
+        # ValueError do cesty, která s ním nepočítá. Zachytil ho až obecný
+        # except v replace_chain(), takže se to projevilo "jen" jako odmítnutí
+        # a netěsné spojení - ale fail-closed to bylo náhodou, ne záměrem.
+        #
+        # Poškozený target se nepřeskakuje: vrátit menší práci, než řetězec
+        # skutečně má, by znamenalo přijmout slabší fork. Při nejistotě se
+        # hlásí MissingChainDataError, stejně jako u ostatních konsenzuálních
+        # dotazů (OPRAVA F-05).
+        conn = None
+        try:
+            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            c = conn.cursor()
+            c.execute("SELECT block_index, target_hex FROM blocks WHERE block_index <= ?", (up_to_index,))
+            for row in c:
+                try:
+                    target = int(row[1], 16)
+                except (TypeError, ValueError) as e:
+                    raise MissingChainDataError(
+                        f"Blok #{row[0]} má v blockchain.db nečitelný target "
+                        f"({type(e).__name__}); kumulovanou práci nelze spočítat."
+                    ) from e
+                work = (1 << 256) // target if target > 0 else 0
+                total_work += work
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return total_work
 
     def add_transaction(self, transaction, allow_expired=False):
@@ -2117,7 +2920,7 @@ class Blockchain:
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Částka transakce musí být větší než 0.")
                 return False
             if transaction.amount < MIN_TX_AMOUNT:
-                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Částka transakce je příliš malá. Minimální částka je {format(MIN_TX_AMOUNT / (10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}.")
+                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Částka transakce je příliš malá. Minimální částka je {format(Decimal(MIN_TX_AMOUNT) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}.")
                 return False
             if not is_valid_address(transaction.from_address) or not is_valid_address(transaction.to_address):
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný formát adresy odesílatele nebo příjemce.")
@@ -2128,10 +2931,12 @@ class Blockchain:
             if transaction.from_address == transaction.to_address:
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nelze posílat peníze na stejnou adresu.")
                 return False
-            # OPRAVA #6b: JEDINÉ místo, kde platí horní mez poplatku. Je to
-            # politika tohoto uzlu (co přepošle a co vytěží), ne pravidlo sítě.
-            if not (TX_FEE_MIN <= transaction.fee <= TX_FEE_MAX):
-                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Poplatek za transakci je mimo povolený rozsah ({TX_FEE_MIN/(10**DECIMALS)}-{TX_FEE_MAX/(10**DECIMALS)} {TICKER}).")
+            # ZMĚNA 1: horní mez poplatku (TX_FEE_MAX), která tu po OPRAVĚ #6b
+            # zůstala jako politika tohoto uzlu, je odstraněna. Platí jen dolní
+            # mez, stejně jako v add_block(), validate_fork() a is_valid_chain().
+            # Shora poplatek omezuje už jen kontrola zůstatku níž (amount + fee).
+            if not (transaction.fee >= TX_FEE_MIN):
+                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Poplatek za transakci je nižší než minimum ({format(Decimal(TX_FEE_MIN) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}).")
                 return False
             if transaction.nonce != self.get_next_nonce(transaction.from_address):
                 print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatná nonce ({transaction.nonce}). Očekávána: {self.get_next_nonce(transaction.from_address)}.")
@@ -2144,7 +2949,7 @@ class Blockchain:
             for tx_in_mempool in self.mempool_by_sender.get(transaction.from_address, []):
                 current_available_balance -= (tx_in_mempool.amount + tx_in_mempool.fee)
             if current_available_balance < transaction.amount + transaction.fee:
-                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nedostatečný zůstatek. K dispozici: {format(current_available_balance / (10**DECIMALS), f'.{DECIMALS}f')} {TICKER}")
+                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nedostatečný zůstatek. K dispozici: {format(Decimal(current_available_balance) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}")
                 return False
 
             # OPRAVA F-02: kapacita a vytěsňování až TADY, jako úplně poslední
@@ -2248,7 +3053,7 @@ class Blockchain:
         if not hasattr(self, 'last_target_log_idx'):
             self.last_target_log_idx = -1
         if new_block_index != self.last_target_log_idx:
-            global p2p_node
+            # OPRAVA G-11: `global p2p_node` tu bylo zbytečně - deklarace je nutná jen při PŘIŘAZENÍ, ne při čtení. Odstraněno.
             if 'p2p_node' in globals() and p2p_node is not None:
                 p2p_node.add_log(
                     f"{Fore.MAGENTA}ÚPRAVA TARGETU (LWMA-3) na bloku #{new_block_index}:{Style.RESET_ALL}\n"
@@ -2257,30 +3062,27 @@ class Blockchain:
             self.last_target_log_idx = new_block_index
         return new_target
 
-    def get_median_time_past(self, new_block_index, chain_dict=None):
+    def get_median_time_past(self, new_block_index, chain_dict=None, conn=None):
         # OPRAVA F-05: chybějící blok v okně dřív medián jen tiše posunul dolů,
         # takže se rozvolnilo časové pravidlo (blok musí být novější než MTP).
         # Stejně jako u targetu platí: chybí-li konsenzuální data, nesmí se
         # rozhodovat, ale odmítat.
         MTP_SPAN = 11
         first_index = max(0, new_block_index - MTP_SPAN)
+        if first_index >= new_block_index:
+            # Jediný legitimní případ: new_block_index == 0, tedy genesis.
+            return GENESIS_TIMESTAMP
+        # OPRAVA A-5: jeden dotaz na celé okno místo 11 samostatných spojení.
+        okno = self._load_header_window(first_index, new_block_index - 1,
+                                        chain_dict=chain_dict, conn=conn)
         timestamps = []
         for i in range(first_index, new_block_index):
-            b = None
-            if chain_dict is not None and i in chain_dict:
-                b = chain_dict[i]
-            elif chain_dict is not None:
-                b = self.get_block_from_db(i)
-            else:
-                b = self.get_block(i)
+            b = okno.get(i)
             if b is None:
                 raise MissingChainDataError(
                     f"Blok #{i} chybí v okně MTP pro blok #{new_block_index}."
                 )
             timestamps.append(b.timestamp)
-        if not timestamps:
-            # Jediný legitimní případ: new_block_index == 0, tedy genesis.
-            return GENESIS_TIMESTAMP
         timestamps.sort()
         count = len(timestamps)
         mid = count // 2
@@ -2292,7 +3094,7 @@ class Blockchain:
     # nikdy nečetla - navádělo to čtenáře k domněnce, že target závisí i na
     # čase nově těženého bloku. LWMA-3 ho počítá výhradně z časů a targetů
     # už existujících bloků [index-N-1, index-1].
-    def calculate_expected_target(self, new_block_index, chain_dict=None):
+    def calculate_expected_target(self, new_block_index, chain_dict=None, conn=None):
         N = DIFFICULTY_ADJUSTMENT_INTERVAL
         
         if new_block_index <= N:
@@ -2301,35 +3103,47 @@ class Blockchain:
         first_index = new_block_index - N - 1
         if first_index < 0:
             return FIXED_TARGET
-            
+
+        # OPRAVA A-5: 145 předchůdců se načte jedním dotazem místo 145 spojení,
+        # a bez sloupce `transactions`, takže se neparsuje ani nepočítá tx_id.
+        okno = self._load_header_window(first_index, new_block_index - 1,
+                                        chain_dict=chain_dict, conn=conn)
         blocks = []
         for i in range(first_index, new_block_index):
-            if chain_dict is not None:
-                if i in chain_dict:
-                    blocks.append(chain_dict[i])
-                else:
-                    b = self.get_block_from_db(i)
-                    if b is None:
-                        # OPRAVA F-05: dřív se tu vracel FIXED_TARGET, tedy
-                        # nejsnazší povolená obtížnost. Chybějící blok v okně
-                        # LWMA-3 je porucha, ne pokyn "pusť cokoli".
-                        raise MissingChainDataError(
-                            f"Blok #{i} chybí v okně LWMA-3 pro blok #{new_block_index}."
-                        )
-                    blocks.append(b)
-            else:
-                b = self.get_block(i)
-                if b is None:
-                    raise MissingChainDataError(
-                        f"Blok #{i} chybí v okně LWMA-3 pro blok #{new_block_index}."
-                    )
-                blocks.append(b)
+            b = okno.get(i)
+            if b is None:
+                # OPRAVA F-05: dřív se tu vracel FIXED_TARGET, tedy nejsnazší
+                # povolená obtížnost. Chybějící blok v okně LWMA-3 je porucha,
+                # ne pokyn "pusť cokoli".
+                raise MissingChainDataError(
+                    f"Blok #{i} chybí v okně LWMA-3 pro blok #{new_block_index}."
+                )
+            blocks.append(b)
                 
         sum_target = 0
         t = 0
+        # OPRAVA N-3 (HARD FORK): solvetime se dřív ořezával asymetricky na
+        # [-3T, +6T] a záporné hodnoty byly povolené. Blok s časem na hraně
+        # pravidla (+600 s) si tak připsal +360 s, zatímco následující poctivý
+        # blok ubral jen 180 s - každý takový blok nafoukl měřený čas o ~60 s.
+        # Simulace (t_bug3_lwma.py): 10 % hashrate = obtížnost 88 %, emise 113 %
+        # plánu; 25 % hashrate = obtížnost 73 %, emise 136 %.
+        #
+        # Nově metoda "předchozí timestamp": časy se zpracují jako monotónní
+        # (nejméně předchozí + 1) a solvetime se po blocích NEOŘEZÁVÁ. Čas
+        # "vypůjčený" z budoucnosti se vrací u následujících bloků, které
+        # dostanou solvetime 1, takže se manipulace vynuluje. Ořez shora (6T)
+        # byl vyzkoušen a zahozen: zahazuje část vypůjčeného času, takže tatáž
+        # manipulace obtížnost naopak ZVEDALA (10 % hashrate -> 126 %).
+        # Změnu targetu dál omezuje ořez na 4x/0,25x níž a strop FIXED_TARGET.
+        # Porovnání variant: t_bug3_variants.py.
+        predchozi_ts = blocks[0].timestamp
         for i in range(1, N + 1):
-            solve_time = blocks[i].timestamp - blocks[i-1].timestamp
-            solve_time = max(-3 * BLOCK_TIME_SECONDS, min(solve_time, 6 * BLOCK_TIME_SECONDS))
+            ts = blocks[i].timestamp
+            if ts <= predchozi_ts:
+                ts = predchozi_ts + 1
+            solve_time = ts - predchozi_ts
+            predchozi_ts = ts
             t += solve_time * i
             sum_target += blocks[i].target
             
@@ -2400,13 +3214,11 @@ class Blockchain:
             b += target_bytes
             
             # Musí odpovídat Block.compute_hash(), jinak by vytěžený hash
-            # neprošel vlastní validací v add_block().
+            # neprošel vlastní validací v add_block(). OPRAVA A-4 se proto musí
+            # promítnout i sem - tenhle kód je ruční kopie hlavičky a rozejití
+            # obou míst by znamenalo, že uzel nedokáže přijmout vlastní blok.
             for s in [previous_hash, merkle_root, state_root]:
-                if s is None:
-                    b += struct.pack('!I', 0)
-                else:
-                    enc = str(s).encode('utf-8')
-                    b += struct.pack('!I', len(enc)) + enc
+                b += encode_optional_field(s)
             
             computed_hash = hashlib.sha3_256(b).hexdigest()
             hashes_calculated += 1
@@ -2424,13 +3236,26 @@ class Blockchain:
             result_queue.put(('update', worker_id, hashes_calculated, nonce, computed_hash))
 
     def proof_of_work(self, block, num_cores):
+        # OPRAVA L-1: obsluha Ctrl+C sahala na proměnné, které v okamžiku
+        # přerušení nemusely existovat. stop_event, processes i result_queue
+        # vznikají až o ~20 řádků níž, takže KeyboardInterrupt kdekoli nad nimi
+        # vedl v handleru na UnboundLocalError - a to NENÍ KeyboardInterrupt,
+        # takže ji nezachytil ani `except KeyboardInterrupt` v mine() a propadla
+        # až do obecného except v menu. Předinicializace + testy v handleru.
+        stop_event = None
+        processes = []
+        result_queue = None
+        original_sigint = None
+        sigint_ignorovan = False
         try:
             start_time = get_time()
             computed_hash = ""
-            total_hashes_calculated = 0
+            # OPRAVA G-11: total_hashes_calculated se nikdy nečetlo (skutečné
+            # počítadlo drží worker procesy) - odstraněno.
             self.mining_in_progress = True
             sys.stdout.write(f"\n{Fore.YELLOW}Začínám těžit blok na zvolený počet CPU jader: {num_cores}{Style.RESET_ALL}\n")
-            last_block = self.get_last_block()
+            # OPRAVA G-11: last_block = self.get_last_block() se nikdy
+            # nepoužilo - odstraněno i s tím dotazem.
             block_data = {
                 'index': block.index,
                 'timestamp': block.timestamp,
@@ -2449,16 +3274,28 @@ class Blockchain:
             processes = []
             original_sigint = signal.getsignal(signal.SIGINT)
             signal.signal(signal.SIGINT, signal.SIG_IGN)
+            sigint_ignorovan = True
             core_hashes = [0] * num_cores
             core_nonces = [0] * num_cores
             core_last_hashes = [""] * num_cores
             
-            for i in range(num_cores):
-                p = multiprocessing.Process(target=Blockchain.mining_worker, args=(block_data, i, num_cores, result_queue, stop_event, 1.0, i))
-                processes.append(p)
-                p.start()
+            # OPRAVA L-1: selhání p.start() (typicky OSError při forku, na
+            # telefonu při vyčerpané paměti nebo limitu procesů) dřív nechalo
+            # už rozběhnuté workery běžet dál a výjimka odešla ven. Teď se
+            # rozdělaná práce uklidí a teprve pak se chyba pustí dál.
+            try:
+                for i in range(num_cores):
+                    p = multiprocessing.Process(target=Blockchain.mining_worker, args=(block_data, i, num_cores, result_queue, stop_event, 1.0, i))
+                    processes.append(p)
+                    p.start()
+            except Exception:
+                stop_event.set()
+                self._shutdown_workers(processes, result_queue)
+                self.mining_in_progress = False
+                raise
                 
             signal.signal(signal.SIGINT, original_sigint)
+            sigint_ignorovan = False
             last_hashrate_time = get_time()
             
             while self.mining_in_progress:
@@ -2511,12 +3348,32 @@ class Blockchain:
                 return None
         except KeyboardInterrupt:
             self.mining_in_progress = False
-            stop_event.set()
+            # OPRAVA L-1: bez těchto testů tu vznikal UnboundLocalError, viz
+            # komentář na začátku metody.
+            if stop_event is not None:
+                stop_event.set()
             for p in processes:
-                p.terminate()
-            self._shutdown_workers(processes, result_queue)
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            if result_queue is not None:
+                self._shutdown_workers(processes, result_queue)
             print(f"\n{Fore.YELLOW}Těžba byla ukončena uživatelem (CTRL+C).{Style.RESET_ALL}")
             return None
+        finally:
+            # OPRAVA L-1: druhá polovina nálezu. SIGINT se ignoruje jen po dobu
+            # startu workerů (aby signál nechytily děti), obnovoval se ale
+            # obyčejným řádkem uprostřed try. Když mezitím selhal p.start(),
+            # obnovení se přeskočilo a Ctrl+C přestalo fungovat DO KONCE BĚHU
+            # UZLU. Obnovení proto patří do finally.
+            if sigint_ignorovan and original_sigint is not None:
+                try:
+                    signal.signal(signal.SIGINT, original_sigint)
+                except Exception:
+                    # signal.signal() jde volat jen z hlavního vlákna; selhání
+                    # tady nesmí přebít výsledek ani probíhající výjimku.
+                    pass
 
     @staticmethod
     def _shutdown_workers(processes, result_queue, timeout=10.0):
@@ -2648,7 +3505,22 @@ class Blockchain:
             # block.index - 1. Při mini-reorgu (níže) se odpojuje současný vrchol,
             # takže self.balance_map / nonce_map / immature_rewards ještě obsahují
             # blok, který se má nahradit; get_state_at() ho přes undo log odroluje.
-            base_state = self.get_state_at(block.index - 1)
+            # OPRAVA N-11: v běžném případě (blok navazuje na vrchol) je
+            # základním stavem self - nekopíruje se. get_state_at() dřív vracel
+            # dict(balance_map), dict(nonce_map) a klon SMT a make_state_shadow()
+            # to níž zkopíroval ZNOVU: 37 ms na blok při 100 000 účtech
+            # (t_perf11_state_copy.py). Kopie stavu zůstává jen pro mini-reorg,
+            # kde se odroluje současný vrchol.
+            rychla_cesta = (not is_mini_reorg and block.index - 1 == self.max_block_index)
+            if rychla_cesta:
+                base_state = {
+                    'balance_map': self.balance_map,
+                    'nonce_map': self.nonce_map,
+                    'immature_rewards': self.immature_rewards,
+                    'total_supply': self.total_supply,
+                }
+            else:
+                base_state = self.get_state_at(block.index - 1)
             if base_state is None:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nelze rekonstruovat stav pro blok #{block.index}.{Style.RESET_ALL}")
                 return False
@@ -2701,9 +3573,19 @@ class Blockchain:
                 
             # OPRAVA D-05: jeden dotaz na celý blok místo jednoho na každou
             # transakci (dřív 302 SQLite spojení na blok s 300 transakcemi).
-            duplicate_ids = self.tx_ids_in_chain(
-                [tx.tx_id for tx in block.transactions], exclude_from_index=block.index
-            )
+            #
+            # OPRAVA B-2: tohle je PRVNÍ otevření databáze v add_block(), a bylo
+            # bez ošetření - chyba DB odsud propadla ven z celé metody a kontrakt
+            # "add_block vrací True/False" přestal platit. Volající (handler
+            # new_block, mine(), resolve_orphans) s výjimkou nepočítají. Stav
+            # sice ještě změněný není, ale odpovědět je potřeba korektně.
+            try:
+                duplicate_ids = self.tx_ids_in_chain(
+                    [tx.tx_id for tx in block.transactions], exclude_from_index=block.index
+                )
+            except Exception as e:
+                p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku #{block.index}: databázi se nepodařilo dotázat na duplicitní TX ID ({type(e).__name__}: {e}).{Style.RESET_ALL}")
+                return False
 
             for tx in block.transactions:
                 if not isinstance(tx.amount, int) or not isinstance(tx.fee, int) or not isinstance(tx.nonce, int):
@@ -2768,8 +3650,9 @@ class Blockchain:
                         p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Částka transakce je příliš malá.{Style.RESET_ALL}")
                         return False
                     # OPRAVA #6b: konsenzus vynucuje jen dolní mez poplatku.
-                    # Horní mez (TX_FEE_MAX) zůstala jen jako politika mempoolu
-                    # v add_transaction() - viz komentář u konstanty.
+                    # ZMĚNA 1: horní mez (TX_FEE_MAX) už neexistuje vůbec, ani
+                    # jako politika mempoolu v add_transaction() - viz komentář
+                    # u TX_FEE_MIN.
                     if tx.fee < TX_FEE_MIN:
                         p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Poplatek transakce je nižší než minimum.{Style.RESET_ALL}")
                         return False
@@ -2862,71 +3745,113 @@ class Blockchain:
             # základního stavu a výsledný root se porovná s hlavičkou. Teprve po
             # shodě se blok zapisuje do DB a promítá do self.
             try:
-                shadow_state = make_state_shadow(base_state)
-                self.update_state_with_block(block, state_target=shadow_state)
-                expected_state_root = compute_state_root_from(shadow_state)
-            except ValueError as e:
+                if rychla_cesta:
+                    expected_state_root = self.state_root_po_bloku(block)
+                else:
+                    shadow_state = make_state_shadow(base_state)
+                    self.update_state_with_block(block, state_target=shadow_state)
+                    expected_state_root = compute_state_root_from(shadow_state)
+            # OPRAVA G-02: struct.error doplněn jako pojistka. Rozsahové kontroly v encode_account() by ji už neměly připustit, ale kontrakt "ven jde vždy ValueError" musí platit bezvýhradně.
+            except (ValueError, struct.error) as e:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Neplatný stav po aplikaci bloku #{block.index} ({e}).{Style.RESET_ALL}")
                 return False
             if block.state_root != expected_state_root:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření bloku: Nesprávný state root bloku #{block.index} (očekáván {expected_state_root}, přijat {block.state_root}).{Style.RESET_ALL}")
                 return False
 
+            # OPRAVA A-1: jeden logický přechod stavu byl rozdělený do DVOU
+            # samostatných SQLite transakcí a paměť se mutovala JEŠTĚ PŘED nimi.
+            # Selhal-li první commit (DELETE při mini-reorgu), paměť spadla na
+            # výšku N-1, zatímco v DB zůstal blok N - get_block() sahá při
+            # neúspěchu do DB, takže calculate_expected_target() i
+            # get_median_time_past() dál četly blok, o kterém paměť tvrdila, že
+            # neexistuje. Selhal-li druhý commit (INSERT), uzel tiše zahodil
+            # vlastní blok: spadl o výšku níž, přišel o emisi, a protože se
+            # recycle_orphan_transactions() na chybové cestě nikdy nezavolá,
+            # uživatelské transakce z odpojeného bloku zmizely beze stopy.
+            # Volající přitom dostal False, tedy "blok odmítnut, nic se nestalo".
+            #
+            # Cílová platforma je Termux na Androidu, kde "disk I/O error" a
+            # "database or disk is full" nejsou teorie. Nově tedy: JEDNO spojení,
+            # JEDNA transakce (DELETE starého + INSERT nového), a mutace paměti
+            # až PO úspěšném commitu. Do try spadá i json.dumps() celého bloku,
+            # takže ani výjimka při serializaci paměť nerozbije. Je to tatáž
+            # zásada, kterou si kód formuluje u OPRAVY D-02 - jen tady nejde
+            # o stavový příznak, nýbrž o celý stav řetězce.
             if is_mini_reorg:
                 p2p_node.add_log(f"{Fore.YELLOW}Detekován lepší konkurenční blok na stejné výšce. Provádím bleskový mini-reorg (Undo).{Style.RESET_ALL}")
-                self.chain.pop()
-                self.rollback_state(block_to_remove.index - 1)
-                try:
-                    conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-                    conn.execute("PRAGMA journal_mode=WAL;")
-                    c = conn.cursor()
-                    c.execute("DELETE FROM blocks WHERE block_index = ?", (block_to_remove.index,))
-                    c.execute("DELETE FROM transactions WHERE block_index = ?", (block_to_remove.index,))
-                    conn.commit()
-                    conn.close()
-                except Exception as e:
-                    if 'conn' in locals():
-                        try:
-                            conn.rollback()
-                            conn.close()
-                        except:
-                            pass
-                    p2p_node.add_log(f"{Fore.RED}Kritická chyba DB: Selhal rollback při mini-reorgu ({e}).{Style.RESET_ALL}")
-                    return False
-                    
+
             block.hash = proof
-            
+
+            conn = None
             try:
+                transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
+                target_hex = hex(block.target)[2:]
                 conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                 conn.execute("PRAGMA journal_mode=WAL;")
                 c = conn.cursor()
-                transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
-                target_hex = hex(block.target)[2:]
+
+                if is_mini_reorg:
+                    c.execute("DELETE FROM blocks WHERE block_index = ?", (block_to_remove.index,))
+                    c.execute("DELETE FROM transactions WHERE block_index = ?", (block_to_remove.index,))
+
                 c.execute('''
                     INSERT OR REPLACE INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id, block.state_root))
-                
+
                 for tx in block.transactions:
                     c.execute('INSERT OR REPLACE INTO transactions (tx_id, block_index) VALUES (?, ?)', (tx.tx_id, block.index))
-                    
+
                 conn.commit()
-                conn.close()
             except Exception as e:
-                if 'conn' in locals():
+                if conn is not None:
                     try:
                         conn.rollback()
-                        conn.close()
-                    except:
+                    except Exception:
                         pass
-                p2p_node.add_log(f"{Fore.RED}Kritická chyba DB: Selhal zápis bloku #{block.index} ({e}).{Style.RESET_ALL}")
+                p2p_node.add_log(f"{Fore.RED}Kritická chyba DB: Selhal zápis bloku #{block.index} ({e}). Stav uzlu zůstal nezměněn, blok nebyl přijat.{Style.RESET_ALL}")
                 return False
-                
-            self.chain.append(block)
-            self.max_block_index = block.index
-            if len(self.chain) > LAST_BLOCKS_TO_KEEP:
-                self.chain = self.chain[-LAST_BLOCKS_TO_KEEP:]
-            self.update_state_with_block(block)
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            # Databáze je v cílovém stavu - teprve teď se mutuje paměť.
+            #
+            # OPRAVA M-2: tenhle blok neměl ŽÁDNÝ try. rollback_state() volá
+            # rebuild_state(), a odtud může jít ven MissingChainDataError
+            # (poškozený řádek v blocks) nebo sqlite3.OperationalError. Výjimka
+            # odsud proletěla ven z add_block(), čímž se porušil kontrakt
+            # "vrací True/False", a paměť zůstala v půli přechodu: chain.pop()
+            # už proběhl, stav odrolovaný jen zčásti, nový blok nepřipojený -
+            # přestože V DATABÁZI UŽ JE. Zotavením je dorovnat paměť k DB.
+            try:
+                if is_mini_reorg:
+                    self.chain.pop()
+                    self.rollback_state(block_to_remove.index - 1)
+
+                self.chain.append(block)
+                self.max_block_index = block.index
+                if len(self.chain) > LAST_BLOCKS_TO_KEEP:
+                    self.chain = self.chain[-LAST_BLOCKS_TO_KEEP:]
+                self.update_state_with_block(block)
+            except Exception as e:
+                p2p_node.add_log(
+                    f"{Fore.RED}Kritická chyba: blok #{block.index} je zapsaný v DB, "
+                    f"ale mutace paměti selhala ({type(e).__name__}: {e}). "
+                    f"Dorovnávám paměť podle databáze...{Style.RESET_ALL}")
+                if not self._resync_memory_from_db():
+                    p2p_node.add_log(
+                        f"{Fore.RED}Dorovnání paměti podle databáze SELHALO. Stav uzlu "
+                        f"není důvěryhodný - restartujte uzel, aby se řetězec načetl "
+                        f"znovu od začátku.{Style.RESET_ALL}")
+                    return False
+                p2p_node.add_log(
+                    f"{Fore.GREEN}Paměť dorovnána podle databáze (vrchol #{self.max_block_index}). "
+                    f"Blok #{block.index} je součástí řetězce.{Style.RESET_ALL}")
             
             confirmed_tx_ids = {tx.tx_id for tx in block.transactions if tx.from_address != "COINBASE"}
             self.unconfirmed_transactions = [
@@ -2934,12 +3859,36 @@ class Blockchain:
                 if tx.tx_id not in confirmed_tx_ids
             ]
 
+            # ZMĚNA 4: výše se odstraňují jen transakce se STEJNÝM tx_id jako
+            # v bloku. Transakce téže adresy se stejnou nonce, ale jiným tx_id
+            # (konflikt) se odstraní tady, hned po přijetí bloku - dřív zůstala
+            # v mempoolu až do expirace. Viz _prune_mempool_sequences().
+            # Změnit se mohla jen nonce a zůstatek odesílatelů z bloku (příjemci
+            # a zralá coinbase odměna zůstatek jen zvyšují), takže u běžného bloku
+            # stačí zkontrolovat je.
+            odesilatele_bloku = {tx.from_address for tx in block.transactions if tx.from_address != "COINBASE"}
+
             # Transakce odpojeného bloku, které nový vrchol nepřebírá, musí zpět do
             # mempoolu - jinak by mini-reorgem nenávratně zmizely. Volá se až tady,
             # protože recycle_orphan_transactions() se ptá is_tx_id_in_chain() a
             # add_transaction() validuje proti stavu; obojí už je aktuální.
             if is_mini_reorg and block_to_remove is not None:
+                # ZMĚNA 4: před recyklací jen zastaralé transakce - jinak by
+                # add_transaction() odečítala jejich částky od zůstatku a mohla
+                # platnou recyklovanou transakci odmítnout. Díry a zůstatek až po
+                # recyklaci, protože ta může díru v posloupnosti zaplnit.
+                odstranene_po_bloku = self._prune_mempool_sequences(odesilatele_bloku, stale_only=True)
                 self.recycle_orphan_transactions([block_to_remove])
+                # Mini-reorg mění zůstatky a nonce adres z OBOU bloků (i příjemcům
+                # z odpojeného bloku peníze ubydou) a je vzácný, takže se
+                # kontroluje celý mempool.
+                odstranene_po_bloku += self._prune_mempool_sequences()
+            else:
+                odstranene_po_bloku = self._prune_mempool_sequences(odesilatele_bloku)
+
+            if odstranene_po_bloku and 'p2p_node' in globals() and p2p_node is not None:
+                for tx, duvod in odstranene_po_bloku:
+                    p2p_node.add_log(f"{Fore.YELLOW}Transakce {tx.tx_id} odstraněna z mempoolu po bloku #{block.index} ({duvod}).{Style.RESET_ALL}")
             
             self.resolve_orphans(block.hash)
             return True
@@ -2999,8 +3948,19 @@ class Blockchain:
         # Strop je nově v BAJTECH, ne v položkách. Počet položek je špatná
         # jednotka ze stejného důvodu jako u EXPENSIVE_BYTES_*: 100 prázdných
         # bloků stojí zlomek toho, co 100 plných, a útočník si vybere ty plné.
+        # OPRAVA N-8: vytěsňovalo se FIFO bez ohledu na práci, takže 17 orphanů
+        # s nejsnazším povoleným targetem (~2^20 hashů) vytlačilo i legitimní
+        # orphan s plnou síťovou obtížností (test t_bug8_orphans.py). Nově se
+        # obětuje orphan s NEJMENŠÍ prací (při shodě nejstarší) a jen tehdy,
+        # když nový nese práce víc - levný spam tak nevytlačí dražší bloky.
+        prace_noveho = (1 << 256) // block.target
         while self.orphan_pool and self.orphan_pool_bytes + size > MAX_ORPHAN_POOL_BYTES:
-            self._drop_orphan(next(iter(self.orphan_pool)))
+            obet = min(self.orphan_pool,
+                       key=lambda h: ((1 << 256) // self.orphan_pool[h].target,
+                                      self.orphan_added_at.get(h, 0)))
+            if (1 << 256) // self.orphan_pool[obet].target >= prace_noveho:
+                return
+            self._drop_orphan(obet)
         if self.orphan_pool_bytes + size > MAX_ORPHAN_POOL_BYTES:
             return
 
@@ -3250,6 +4210,21 @@ class Blockchain:
                                  + shadow_balance[tx.from_address])
                     if available < tx.amount + tx.fee:
                         unspendable_txs.append(tx)
+                        # OPRAVA B-3: mine() a cleanup_mempool() měly různou
+                        # politiku. cleanup_mempool() odstraní neplatnou
+                        # transakci I VŠECHNY NAVAZUJÍCÍ (správně - bez ní
+                        # vznikne díra v posloupnosti nonce a zbytek je stejně
+                        # nevytěžitelný), zatímco mine() odstranila jen tu
+                        # jednu. Navazující transakce pak v mempoolu ležely
+                        # nevytěžitelné, dokud uživatel nedoplnil chybějící
+                        # nonce nebo neuplynulo MEMPOOL_TX_EXPIRATION (24 h),
+                        # a každé kolo těžby je znovu bralo do úvahy.
+                        # Sjednoceno na chování cleanup_mempool().
+                        navazujici = tx_by_sender.get(sender) or []
+                        if navazujici:
+                            unspendable_txs.extend(navazujici)
+                            tx_by_sender[sender] = []
+                            print(f"{Fore.YELLOW}S transakcí {tx.tx_id} padá i {len(navazujici)} navazujících transakcí téže adresy (díra v nonce).{Style.RESET_ALL}")
                         print(f"{Fore.YELLOW}Transakce {tx.tx_id} přeskočena při sestavování bloku: nedostatečný zůstatek. Bude odstraněna z mempoolu.{Style.RESET_ALL}")
                         continue
 
@@ -3321,10 +4296,10 @@ class Blockchain:
                 # před PoW - přechod stavu nezávisí na nonce, takže root je v tuhle
                 # chvíli už jednoznačně určený a může vstoupit do hashovaného headeru.
                 try:
-                    mining_shadow = make_state_shadow(self)
-                    self.update_state_with_block(new_block, state_target=mining_shadow)
-                    new_block.state_root = compute_state_root_from(mining_shadow)
-                except ValueError as e:
+                    # OPRAVA N-11: bez kopie celého stavu, viz state_root_po_bloku().
+                    new_block.state_root = self.state_root_po_bloku(new_block)
+                # OPRAVA G-02: struct.error doplněn jako pojistka. Rozsahové kontroly v encode_account() by ji už neměly připustit, ale kontrakt "ven jde vždy ValueError" musí platit bezvýhradně.
+                except (ValueError, struct.error) as e:
                     print(f"{Fore.RED}Kritická chyba: Nelze spočítat state root pro nový blok ({e}).{Style.RESET_ALL}")
                     return False
                 new_block.hash = new_block.compute_hash()
@@ -3342,7 +4317,7 @@ class Blockchain:
             num_cores = multiprocessing.cpu_count()
             print(f"Detekováno {num_cores} CPU jader.")
             try:
-                user_cores = int(input(f"Vyberte počet dostupných CPU jader: "))
+                user_cores = int(input("Vyberte počet dostupných CPU jader: "))
                 if 1 <= user_cores <= num_cores:
                     num_cores = user_cores
                 else:
@@ -3366,9 +4341,15 @@ class Blockchain:
                     print(f"{Fore.GREEN}Blok {new_block.index} byl vytěžen a přidán do řetězce!{Style.RESET_ALL} (Target: {hex(target)[2:]})")
                     print(f"  Datum: {time.strftime('%d.%m.%Y %H:%M:%S UTC+00:00', time.gmtime(new_block.timestamp))}")
                     print(f"  Velikost bloku: {Fore.CYAN}{new_block.get_size() / 1024:.2f} KB{Style.RESET_ALL}")
-                    print(f"  Odměna za blok: {Fore.CYAN}{format(current_reward / (10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
-                    print(f"  Poplatky z transakcí: {Fore.CYAN}{format(total_fees / (10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
-                    print(f"  Celková odměna pro těžaře: {Fore.CYAN}{format(final_reward / (10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                    # OPRAVA G-12: dělení floatem nahrazeno Decimalem. int/int dává
+                    # v Pythonu float a ten má 53bitovou mantisu, tedy ~15,9 platné
+                    # číslice - zůstatek v nanitech jich má až 17. Na 2 000 000
+                    # náhodných zůstatků se výpis rozešel s přesnou hodnotou v 11 %
+                    # případů, vždy o jeden nanit. Účetní kniha je celočíselná a byla
+                    # v pořádku, ale uživatel viděl jinou částku, než doopravdy měl.
+                    print(f"  Odměna za blok: {Fore.CYAN}{format(Decimal(current_reward) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                    print(f"  Poplatky z transakcí: {Fore.CYAN}{format(Decimal(total_fees) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                    print(f"  Celková odměna pro těžaře: {Fore.CYAN}{format(Decimal(final_reward) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                     print(f"  Těžařská adresa: {Fore.CYAN}{miner_address}{Style.RESET_ALL}")
                     
                     save_mempool(self.unconfirmed_transactions)
@@ -3381,6 +4362,26 @@ class Blockchain:
             return False
 
     def validate_fork(self, fork_index, new_chain_tail):
+        # OPRAVA A-5: obal, který otevře JEDNO spojení na celé ověření forku
+        # a předá ho oknům MTP i LWMA-3. Stejný vzorec jako _store_fork_batch()
+        # / _store_fork_batch_inner(). Selže-li otevření, pokračuje se s
+        # conn=None a každé volání si otevře vlastní - funkčnost tím netrpí,
+        # jen se ztratí úspora.
+        conn = None
+        try:
+            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+        except sqlite3.Error:
+            conn = None
+        try:
+            return self._validate_fork_inner(fork_index, new_chain_tail, conn)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _validate_fork_inner(self, fork_index, new_chain_tail, okno_conn=None):
         # OPRAVA D-16: návratová hodnota rozlišuje TŘI stavy, ne dva.
         #
         #   True  - fork je platný, jde s ním state_dict a undo logy
@@ -3456,8 +4457,8 @@ class Blockchain:
 
             # OPRAVA F-05: chybějící blok v okně = odmítnutí, ne fail-open.
             try:
-                median_time_past = self.get_median_time_past(current_block.index, chain_dict=chain_window)
-                expected_target = self.calculate_expected_target(current_block.index, chain_dict=chain_window)
+                median_time_past = self.get_median_time_past(current_block.index, chain_dict=chain_window, conn=okno_conn)
+                expected_target = self.calculate_expected_target(current_block.index, chain_dict=chain_window, conn=okno_conn)
             except MissingChainDataError:
                 return False, None, {}
 
@@ -3608,9 +4609,16 @@ class Blockchain:
                         return False, None, {}
                     temp_balance_changes[tx.from_address] -= (tx.amount + tx.fee)
                     temp_balance_changes[tx.to_address] += tx.amount
-                    
-                    if tx.from_address not in undo_data['nonce_restores']:
-                        undo_data['nonce_restores'][tx.from_address] = nonce_map.get(tx.from_address, -1)
+                    # OPRAVA G-03: tady byla podmínka
+                    #     if tx.from_address not in undo_data['nonce_restores']:
+                    #         undo_data['nonce_restores'][tx.from_address] = nonce_map.get(...)
+                    # Nemohla být NIKDY pravdivá: každý ne-coinbase odesílatel se
+                    # dostane do block_nonce_map ve smyčce nad transakcemi výše
+                    # a odtud do nonce_restores ve smyčce přes block_nonce_map,
+                    # která běží PŘED tímhle kódem. A kdyby se přece provedla,
+                    # uložila by už AKTUALIZOVANOU hodnotu nonce_map[sender] -
+                    # tedy chybný undo log. Odstraněno, aby nesvádělo ke
+                    # domněnce, že se tu něco ukládá.
                 else:
                     immature_rewards[current_block.index] = {'address': tx.to_address, 'amount': tx.amount}
                     undo_data['immature_removes'].append(current_block.index)
@@ -3643,7 +4651,8 @@ class Blockchain:
                 else:
                     expected_state_root = compute_state_root(
                         balance_map, nonce_map, immature_rewards, total_supply)
-            except ValueError:
+            # OPRAVA G-02: struct.error doplněn jako pojistka. Rozsahové kontroly v encode_account() by ji už neměly připustit, ale kontrakt "ven jde vždy ValueError" musí platit bezvýhradně.
+            except (ValueError, struct.error):
                 return False, None, {}
             if current_block.state_root != expected_state_root:
                 return False, None, {}
@@ -3676,6 +4685,23 @@ class Blockchain:
         return True, state_dict, new_undo_logs
 
     def is_valid_chain(self, chain_iterable=None):
+        # OPRAVA A-5: totéž co u validate_fork() - jedno spojení na celé
+        # ověření řetězce místo dvou na každý blok.
+        conn = None
+        try:
+            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+        except sqlite3.Error:
+            conn = None
+        try:
+            return self._is_valid_chain_inner(chain_iterable, conn)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _is_valid_chain_inner(self, chain_iterable=None, okno_conn=None):
         global p2p_node
         if 'p2p_node' not in globals() or p2p_node is None:
             class DummyNode:
@@ -3773,7 +4799,14 @@ class Blockchain:
                 return False, None
 
             current_block_size = current_block.get_size()
-            
+
+            # OPRAVA A-6 (assumevalid): blok pod nejvyšším checkpointem má obsah
+            # zavázaný hashovým řetězcem, který k tomu checkpointu vede. Ověřovat
+            # jeho podpisy znovu je práce navíc bez informační hodnoty - a je to
+            # 97 % času startovní validace. Vše ostatní (hash, merkle root,
+            # state root, target, časy, přehrání stavu) se dělá dál beze změny.
+            overit_podpisy = (not ASSUMEVALID) or current_block.index > NEJVYSSI_CHECKPOINT
+
             chain_window[current_block.index] = current_block
             if len(chain_window) > LAST_BLOCKS_TO_KEEP:
                 oldest = min(chain_window.keys())
@@ -3815,10 +4848,12 @@ class Blockchain:
                 if genesis_tx.data != "BTC: 000000000000000000009c26a9609e1956765cb1a89fb4cdd2411b75f208dd76":
                     return False, None
                     
-                self.update_state_with_block(current_block, state_target=state)
+                # OPRAVA B-1: totéž pravidlo i pro genesis blok.
                 try:
+                    self.update_state_with_block(current_block, state_target=state)
                     expected_state_root = compute_state_root_from(state)
-                except ValueError as e:
+                # OPRAVA G-02: struct.error doplněn jako pojistka. Rozsahové kontroly v encode_account() by ji už neměly připustit, ale kontrakt "ven jde vždy ValueError" musí platit bezvýhradně.
+                except (ValueError, struct.error) as e:
                     p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Neplatný stav po genesis bloku ({e}).{Style.RESET_ALL}")
                     return False, None
                 if current_block.state_root != expected_state_root:
@@ -3847,8 +4882,8 @@ class Blockchain:
 
             # OPRAVA F-05: chybějící blok v okně = odmítnutí, ne fail-open.
             try:
-                median_time_past = self.get_median_time_past(current_block.index, chain_dict=chain_window)
-                expected_target = self.calculate_expected_target(current_block.index, chain_dict=chain_window)
+                median_time_past = self.get_median_time_past(current_block.index, chain_dict=chain_window, conn=okno_conn)
+                expected_target = self.calculate_expected_target(current_block.index, chain_dict=chain_window, conn=okno_conn)
             except MissingChainDataError as e:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: {e}{Style.RESET_ALL}")
                 return False, None
@@ -3961,7 +4996,12 @@ class Blockchain:
                         
                 if not tx.verify_sender_identity() and tx.from_address != "COINBASE":
                     return False, None
-                if not tx.verify_signature() and tx.from_address != "COINBASE":
+                # OPRAVA A-6: pod nejvyšším checkpointem se podpisy neověřují -
+                # obsah těch bloků už zavazuje hashový řetězec vedoucí ke
+                # checkpointu, který je součástí binárky. Identita odesílatele
+                # (verify_sender_identity, tedy shoda adresy s veřejným klíčem)
+                # se kontroluje dál: je to jen hash, ne křivka, a stojí skoro nic.
+                if overit_podpisy and not tx.verify_signature() and tx.from_address != "COINBASE":
                     return False, None
 
             for sender, nonces_in_block in block_nonce_map.items():
@@ -4000,11 +5040,19 @@ class Blockchain:
                     temp_balance_changes[tx.from_address] -= (tx.amount + tx.fee)
                     temp_balance_changes[tx.to_address] += tx.amount
 
-            self.update_state_with_block(current_block, state_target=state)
-
+            # OPRAVA B-1: tohle volání bylo jako jediné ze tří MIMO try. V
+            # add_block() i v mine() je totéž volání uvnitř try/except ValueError,
+            # tady ne - a encode_account() ValueError umí vyhodit (záporný
+            # zůstatek, zůstatek nad MAX_SUPPLY). Dnes je to nedosažitelné,
+            # protože kontrola zůstatků o pár řádků výš to pokrývá, jenže
+            # is_valid_chain() se volá z load_data(), a to kolem ní try nemá:
+            # uzel by spadl s tracebackem místo záchranného menu z OPRAVY F-14.
+            # Kontrakt téhle metody je "vrať (False, None)", ne "vyhoď".
             try:
+                self.update_state_with_block(current_block, state_target=state)
                 expected_state_root = compute_state_root_from(state)
-            except ValueError as e:
+            # OPRAVA G-02: struct.error doplněn jako pojistka. Rozsahové kontroly v encode_account() by ji už neměly připustit, ale kontrakt "ven jde vždy ValueError" musí platit bezvýhradně.
+            except (ValueError, struct.error) as e:
                 p2p_node.add_log(f"{Fore.RED}Chyba ověření řetězce: Neplatný stav po bloku #{current_block.index} ({e}).{Style.RESET_ALL}")
                 return False, None
             if current_block.state_root != expected_state_root:
@@ -4059,12 +5107,22 @@ class Blockchain:
         return self.max_block_index - block_index + 1
 
     def get_confirmations(self, block_hash):
-        conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        c = conn.cursor()
-        c.execute("SELECT block_index FROM blocks WHERE block_hash = ?", (block_hash,))
-        row = c.fetchone()
-        conn.close()
+        # OPRAVA L-3: spojení bez try/finally. Ze sítě dosažitelné není (volá se
+        # z menu), ale netěsné spojení je netěsné spojení - a WAL soubor drží
+        # otevřený deskriptor i po chybě, což na Termuxu není zadarmo.
+        conn = None
+        try:
+            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            c = conn.cursor()
+            c.execute("SELECT block_index FROM blocks WHERE block_hash = ?", (block_hash,))
+            row = c.fetchone()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         if row:
             block_index = row[0]
             return self.max_block_index - block_index + 1
@@ -4077,7 +5135,7 @@ class Blockchain:
         # {'a': 1} -> ValueError, ['ahoj'] -> ValueError, [None] -> ValueError,
         # vše ven z funkce. Navíc prázdný seznam u fork_index == tip+1 vedl na
         # IndexError při new_chain_tail[-1] níž.
-        global p2p_node
+        # OPRAVA G-11: `global p2p_node` tu bylo zbytečně - deklarace je nutná jen při PŘIŘAZENÍ, ne při čtení. Odstraněno.
 
         def _reject(duvod):
             if 'p2p_node' in globals() and p2p_node is not None and hasattr(p2p_node, 'add_log'):
@@ -4137,7 +5195,16 @@ class Blockchain:
                 def proposed_chain_iterator():
                     for b in new_chain_tail: yield b
                 is_valid, new_state = self.is_valid_chain(chain_iterable=proposed_chain_iterator())
-                new_undo_logs = {}
+                # OPRAVA M-1: undo_logy se tu zahazovaly, přestože je
+                # is_valid_chain() PRÁVĚ SPOČÍTALA a vrací je ve state_dict
+                # (viz OPRAVA, která sloučila dva průchody řetězcem do jednoho).
+                # Prázdný slovník znamená, že get_state_at(vrchol-1) vrátí None,
+                # validate_fork() pak pro KAŽDÝ další fork vrátí is_valid = None
+                # ("nevím") a spustí se plná revalidace od genesis včetně všech
+                # podpisů - tedy přesně to, co OPRAVA D-16 odstraňovala, a to
+                # v okamžiku hned po plné synchronizaci, kdy je uzel nejzranitelnější.
+                # Navíc do příchodu dalšího bloku není možný mini-reorg na vrcholu.
+                new_undo_logs = new_state.get('undo_logs', {}) if new_state else {}
             else:
                 is_valid, new_state, new_undo_logs = self.validate_fork(fork_index, new_chain_tail)
                 # OPRAVA D-16: fallback JEN na "nevím" (is_valid is None).
@@ -4163,51 +5230,94 @@ class Blockchain:
                         conn.close()
                         for b in new_chain_tail: yield b
                     is_valid, new_state = self.is_valid_chain(chain_iterable=proposed_chain_iterator())
-                    new_undo_logs = {}
+                    # OPRAVA M-1 (druhé místo, fallback při is_valid is None):
+                    # týž případ jako výš. Undo logy pod fork_index zůstávají
+                    # platné (bloky pod forkem jsou oběma větvím společné),
+                    # takže se níž na ř. ~4650 jen doplní zbytek.
+                    new_undo_logs = new_state.get('undo_logs', {}) if new_state else {}
             
             if not is_valid:
                 # OPRAVA D-16: dřív se zamítalo tiše, takže v logu nešlo odlišit
                 # "fork je neplatný" od "sem se výpočet vůbec nedostal".
                 return _reject(f"navrhovaný fork od #{fork_index} neprošel ověřením.")
 
-            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            c = conn.cursor()
-            
+            # OPRAVA A-2 (1/3): zápis nového řetězce do DB neměl žádné ošetření.
+            # replace_chain() má jen try/finally, takže OperationalError (disk
+            # full, database is locked) i ValueError z Transaction.from_dict()
+            # nad poškozeným lokálním záznamem prošly celou funkcí ven - přes
+            # process_sync_buffer() až do _store_fork_batch(), kde se z nich
+            # stal 24hodinový ban poctivé protistrany za chybu NAŠEHO disku.
+            # Nově: transakce se vrátí zpět, vrací se False, a protože se paměť
+            # mění až za tímto blokem, je stav uzlu netknutý.
+            conn = None
             orphaned_transactions = []
-            if fork_index <= self.max_block_index:
-                c.execute("SELECT block_index, transactions FROM blocks WHERE block_index >= ? ORDER BY block_index", (fork_index,))
-                new_tx_ids = set(tx.tx_id for block in new_chain_tail for tx in block.transactions)
-                
-                for row in c.fetchall():
-                    local_block_index = row[0]
-                    local_transactions = json.loads(row[1])
-                    for tx_data in local_transactions:
-                        tx = Transaction.from_dict(tx_data)
-                        if tx.from_address == "COINBASE":
-                            p2p_node.add_log(f"{Fore.YELLOW}COINBASE transakce {tx.tx_id} z osiřelého bloku #{local_block_index} zanikla (přirozené chování).{Style.RESET_ALL}")
-                        elif tx.tx_id not in new_tx_ids:
-                            orphaned_transactions.append(tx)
-                
-                if reorg_depth > 0:
-                    p2p_node.add_log(
-                        f"{Fore.MAGENTA}REORG: hloubka {reorg_depth} bloků "
-                        f"(fork od bloku #{fork_index}, "
-                        f"opouštím staré bloky do #{self.max_block_index}).{Style.RESET_ALL}"
-                    )
-                
-            c.execute("DELETE FROM blocks WHERE block_index >= ?", (fork_index,))
-            c.execute("DELETE FROM transactions WHERE block_index >= ?", (fork_index,))
-            for block in new_chain_tail:
-                transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
-                target_hex = hex(block.target)[2:]
-                c.execute("INSERT INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id, block.state_root))
-                for tx in block.transactions:
-                    c.execute("INSERT INTO transactions (tx_id, block_index) VALUES (?, ?)", (tx.tx_id, block.index))
-            conn.commit()
-            conn.close()
-            
+            try:
+                conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                c = conn.cursor()
+
+                if fork_index <= self.max_block_index:
+                    c.execute("SELECT block_index, transactions FROM blocks WHERE block_index >= ? ORDER BY block_index", (fork_index,))
+                    new_tx_ids = set(tx.tx_id for block in new_chain_tail for tx in block.transactions)
+
+                    for row in c.fetchall():
+                        local_block_index = row[0]
+                        local_transactions = json.loads(row[1])
+                        for tx_data in local_transactions:
+                            tx = Transaction.from_dict(tx_data)
+                            if tx.from_address == "COINBASE":
+                                p2p_node.add_log(f"{Fore.YELLOW}COINBASE transakce {tx.tx_id} z osiřelého bloku #{local_block_index} zanikla (přirozené chování).{Style.RESET_ALL}")
+                            elif tx.tx_id not in new_tx_ids:
+                                orphaned_transactions.append(tx)
+
+                    if reorg_depth > 0:
+                        p2p_node.add_log(
+                            f"{Fore.MAGENTA}REORG: hloubka {reorg_depth} bloků "
+                            f"(fork od bloku #{fork_index}, "
+                            f"opouštím staré bloky do #{self.max_block_index}).{Style.RESET_ALL}"
+                        )
+
+                c.execute("DELETE FROM blocks WHERE block_index >= ?", (fork_index,))
+                c.execute("DELETE FROM transactions WHERE block_index >= ?", (fork_index,))
+                for block in new_chain_tail:
+                    transactions_json = json.dumps([tx.to_dict() for tx in block.transactions])
+                    target_hex = hex(block.target)[2:]
+                    c.execute("INSERT INTO blocks (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              (block.index, block.timestamp, transactions_json, block.previous_hash, target_hex, block.nonce, block.hash, block.merkle_root, block.version, block.chain_id, block.state_root))
+                    for tx in block.transactions:
+                        c.execute("INSERT INTO transactions (tx_id, block_index) VALUES (?, ?)", (tx.tx_id, block.index))
+                conn.commit()
+            except Exception as e:
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                return _reject(f"zápis nového řetězce do databáze selhal ({type(e).__name__}: {e}); stav uzlu zůstal nezměněn.")
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            # OPRAVA A-2 (2/3): self.chain se dřív načítala z DB SAMOSTATNÝM
+            # spojením AŽ PO přiřazení balance_map, nonce_map, total_supply,
+            # cumulative_work i max_block_index. Selhalo-li to čtení, zůstal
+            # self.chain na staré větvi, zatímco max_block_index ukazoval na
+            # novou. Důsledky: get_last_block() vracel blok #10, ale stav i DB
+            # byly na #11; mine() by vytěžil blok #12 navazující na #10 (síť ho
+            # odmítne a celé kolo PoW je pryč) a add_block() by čekal na blok
+            # #11, který už v DB i ve stavu je - jeho přijetí by stav aplikovalo
+            # podruhé.
+            #
+            # Nový self.chain se proto skládá z dat, která už jsou v paměti:
+            # starý prefix pod fork_indexem + new_chain_tail. Žádné I/O, takže
+            # se přiřadí spolu se zbytkem stavu a rozejít se nemají jak.
+            nova_chain = [b for b in self.chain if b.index < fork_index] + list(new_chain_tail)
+            if len(nova_chain) > LAST_BLOCKS_TO_KEEP:
+                nova_chain = nova_chain[-LAST_BLOCKS_TO_KEEP:]
+
             self.balance_map = new_state['balance_map']
             self.nonce_map = new_state['nonce_map']
             self.total_supply = new_state['total_supply']
@@ -4219,8 +5329,9 @@ class Blockchain:
             prevzaty_smt = new_state.get('accounts_smt')
             self.accounts_smt = (prevzaty_smt if prevzaty_smt is not None
                                  else build_accounts_smt(self.balance_map, self.nonce_map))
+            self.chain = nova_chain
             self.max_block_index = new_length - 1
-            
+
             if hasattr(self, 'undo_logs'):
                 self.undo_logs = {k: v for k, v in self.undo_logs.items() if k < fork_index}
                 if new_undo_logs:
@@ -4238,52 +5349,84 @@ class Blockchain:
                 checkpoint_keys = sorted(self.state_checkpoints.keys())
                 while len(checkpoint_keys) > 5:
                     del self.state_checkpoints[checkpoint_keys.pop(0)]
-            
-            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            c = conn.cursor()
-            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ? ORDER BY block_index", (self.max_block_index - LAST_BLOCKS_TO_KEEP + 1,))
-            rows = c.fetchall()
-            self.chain = [Block.from_dict({
-                'index': row[0], 'timestamp': row[1], 'transactions': json.loads(row[2]),
-                'previous_hash': row[3], 'target': row[4], 'nonce': row[5], 'hash': row[6],
-                'merkle_root': row[7], 'version': row[8], 'chain_id': row[9], 'state_root': row[10]
-            }) for row in rows]
-            conn.close()
 
-            existing_mempool = self.unconfirmed_transactions
-            self.unconfirmed_transactions = []
-            
-            all_pending = {tx.tx_id: tx for tx in existing_mempool}
-            # OPRAVA #11: transakce z odpojených bloků si označíme, aby dostaly
-            # allow_expired=True. Transakce, které v mempoolu jen ležely, se
-            # posuzují normálně - jejich lhůta běžet nepřestala.
-            orphaned_tx_ids = {tx.tx_id for tx in orphaned_transactions}
-            for tx in orphaned_transactions:
-                all_pending[tx.tx_id] = tx
-                
-            combined_transactions = list(all_pending.values())
-            combined_transactions.sort(key=lambda x: (x.from_address, x.nonce))
-            
-            for tx in combined_transactions:
-                if self.add_transaction(tx, allow_expired=(tx.tx_id in orphaned_tx_ids)):
-                    p2p_node.add_log(f"{Fore.GREEN}Osiřelá/čekající transakce {tx.tx_id} ponechána nebo přidána do mempoolu.{Style.RESET_ALL}")
-                else:
-                    reason = "Neznámý důvod"
-                    if self.is_tx_id_in_chain(tx.tx_id):
-                        reason = "Již existuje v novém řetězci"
-                    elif any(t.tx_id == tx.tx_id for t in self.unconfirmed_transactions):
-                        reason = "Již existuje v mempoolu"
-                    elif tx.nonce != self.get_next_nonce(tx.from_address):
-                        reason = f"Navazující chyba nonce (Máte {tx.nonce}, ale síť čeká na {self.get_next_nonce(tx.from_address)}.)"
-                    elif self.get_confirmed_balance(tx.from_address) - sum(t.amount + t.fee for t in self.unconfirmed_transactions if t.from_address == tx.from_address) < tx.amount + tx.fee:
-                        reason = "Nedostatečný zůstatek"
+            # Reorg na kratší (ale těžší) větev může okno v paměti zkrátit pod
+            # LAST_BLOCKS_TO_KEEP. Doplnění z DB je čistě optimalizace, takže
+            # smí selhat: kratší okno je legitimní stav a get_block() si
+            # chybějící bloky dohledá v databázi. Rozhodně ale nesmí shodit
+            # reorg, který už je zapsaný a promítnutý do stavu.
+            zadouci_delka = min(LAST_BLOCKS_TO_KEEP, new_length)
+            if len(self.chain) < zadouci_delka:
+                conn = None
+                try:
+                    conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    c = conn.cursor()
+                    c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ? ORDER BY block_index", (max(0, self.max_block_index - LAST_BLOCKS_TO_KEEP + 1),))
+                    rows = c.fetchall()
+                    doplnene = [Block.from_dict({
+                        'index': row[0], 'timestamp': row[1], 'transactions': json.loads(row[2]),
+                        'previous_hash': row[3], 'target': row[4], 'nonce': row[5], 'hash': row[6],
+                        'merkle_root': row[7], 'version': row[8], 'chain_id': row[9], 'state_root': row[10]
+                    } ) for row in rows]
+                    if len(doplnene) > len(self.chain) and doplnene and doplnene[-1].index == self.max_block_index:
+                        self.chain = doplnene
+                except Exception as e:
+                    p2p_node.add_log(f"{Fore.YELLOW}Okno posledních bloků se nepodařilo doplnit z DB ({type(e).__name__}: {e}); pokračuji s kratším oknem.{Style.RESET_ALL}")
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+            # OPRAVA A-2 (3/3): obnova mempoolu běží až ZA úspěšným reorgem.
+            # Řetězec i stav už jsou nahrazené, takže selhání téhle části nesmí
+            # znamenat "reorg neproběhl" - vrátit tu False by volajícího poslalo
+            # zpátky pro data, která už máme. Chyba se proto zaloguje a reorg
+            # se dokončí; nejhorší následek je transakce, která zůstane venku
+            # a doteče příštím kolem synchronizace mempoolu.
+            try:
+                existing_mempool = self.unconfirmed_transactions
+                self.unconfirmed_transactions = []
+
+                all_pending = {tx.tx_id: tx for tx in existing_mempool}
+                # OPRAVA #11: transakce z odpojených bloků si označíme, aby dostaly
+                # allow_expired=True. Transakce, které v mempoolu jen ležely, se
+                # posuzují normálně - jejich lhůta běžet nepřestala.
+                orphaned_tx_ids = {tx.tx_id for tx in orphaned_transactions}
+                for tx in orphaned_transactions:
+                    all_pending[tx.tx_id] = tx
+
+                combined_transactions = list(all_pending.values())
+                combined_transactions.sort(key=lambda x: (x.from_address, x.nonce))
+
+                for tx in combined_transactions:
+                    if self.add_transaction(tx, allow_expired=(tx.tx_id in orphaned_tx_ids)):
+                        p2p_node.add_log(f"{Fore.GREEN}Osiřelá/čekající transakce {tx.tx_id} ponechána nebo přidána do mempoolu.{Style.RESET_ALL}")
                     else:
-                        reason = "Jiná chyba ověření (např. čas, podpis, plný mempool)"
-                    p2p_node.add_log(f"{Fore.RED}Transakce {tx.tx_id} zamítnuta z mempoolu po reorgu. Důvod: {reason}.{Style.RESET_ALL}")
-            
-            save_mempool(self.unconfirmed_transactions)
+                        reason = "Neznámý důvod"
+                        if self.is_tx_id_in_chain(tx.tx_id):
+                            reason = "Již existuje v novém řetězci"
+                        elif any(t.tx_id == tx.tx_id for t in self.unconfirmed_transactions):
+                            reason = "Již existuje v mempoolu"
+                        elif tx.nonce != self.get_next_nonce(tx.from_address):
+                            reason = f"Navazující chyba nonce (Máte {tx.nonce}, ale síť čeká na {self.get_next_nonce(tx.from_address)}.)"
+                        elif self.get_confirmed_balance(tx.from_address) - sum(t.amount + t.fee for t in self.unconfirmed_transactions if t.from_address == tx.from_address) < tx.amount + tx.fee:
+                            reason = "Nedostatečný zůstatek"
+                        else:
+                            reason = "Jiná chyba ověření (např. čas, podpis, plný mempool)"
+                        p2p_node.add_log(f"{Fore.RED}Transakce {tx.tx_id} zamítnuta z mempoolu po reorgu. Důvod: {reason}.{Style.RESET_ALL}")
+
+                save_mempool(self.unconfirmed_transactions)
+            except Exception as e:
+                p2p_node.add_log(f"{Fore.YELLOW}Reorg proběhl, ale obnova mempoolu selhala ({type(e).__name__}: {e}). Řetězec je v pořádku.{Style.RESET_ALL}")
             return True
+        except Exception as e:
+            # OPRAVA A-2: pojistka pro cokoli, co se výše nechytlo. Bez ní
+            # výjimka propadla přes process_sync_buffer() do _store_fork_batch(),
+            # kde se z lokální chyby stal ban protistrany.
+            return _reject(f"neočekávaná chyba při nahrazení řetězce ({type(e).__name__}: {e}).")
         finally:
             self.lock.release()
 
@@ -4357,7 +5500,10 @@ def load_address_book(password):
             aesgcm = AESGCM(key)
             decrypted = aesgcm.decrypt(nonce, ciphertext_and_tag, None)
             return json.loads(decrypted.decode())
-        except Exception as e:
+        except Exception:
+            # OPRAVA G-11: 'as e' se nepoužívalo. Text výjimky se tu ZÁMĚRNĚ
+            # nevypisuje - u chyby dešifrování by prozrazoval, jestli selhalo
+            # heslo, nebo integrita souboru.
             print(f"{Fore.RED}Chyba při dešifrování adresáře (špatné heslo nebo poškozený soubor).{Style.RESET_ALL}")
             return {}
     return {}
@@ -4411,6 +5557,9 @@ def load_blacklist():
     return {}
 
 def save_blacklist(blacklist):
+    # OPRAVA G-06: vrací True/False. Volající (flush_blacklist) podle toho drží
+    # nebo shazuje příznak 'dirty' - při neúspěšném zápisu se tedy o změnu
+    # nepřijde a zkusí se znovu při dalším flushi.
     temp_file = BLACKLIST_FILE + '.tmp'
     try:
         with open(temp_file, 'w') as f:
@@ -4418,10 +5567,12 @@ def save_blacklist(blacklist):
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp_file, BLACKLIST_FILE)
+        return True
     except Exception as e:
         print(f"{Fore.RED}Chyba při ukládání blacklistu:{Style.RESET_ALL} {e}")
         if os.path.exists(temp_file):
             os.remove(temp_file)
+        return False
 
 def ensure_column(conn, table, column, coltype):
     # Obecná migrace: doplní chybějící sloupec do už existující tabulky.
@@ -4605,7 +5756,19 @@ def save_wallets_enc(wallets, password):
 # jakékoli chybě zápisu, aby se cache nikdy nemohla tiše rozejít se souborem.
 _mempool_persisted_ids = None
 
+# OPRAVA N-4: save_mempool() volají P2P vlákna (handlery 'transaction',
+# 'response_mempool', new_block -> save_data) i hlavní vlákno, a to bez
+# droid_chain.lock. Dvě souběžná volání počítala rozdíl proti téže staré cache
+# _mempool_persisted_ids a to, které doběhlo později, ji přepsalo svým snímkem.
+# Test t_bug4_mempool_race.py: cache tvrdí "Y je uložená", v mempool.db není
+# a žádné další uložení ji už nezapíše - restart transakci ztratí.
+_mempool_save_lock = threading.Lock()
+
 def save_mempool(unconfirmed_transactions):
+    with _mempool_save_lock:
+        _save_mempool_nezamceno(unconfirmed_transactions)
+
+def _save_mempool_nezamceno(unconfirmed_transactions):
     global _mempool_persisted_ids
     try:
         conn = sqlite3.connect(MEMPOOL_DB, timeout=1.0)
@@ -4642,13 +5805,24 @@ def save_mempool(unconfirmed_transactions):
         # v paměti, takže běžný případ (jedna nová transakce) je jeden INSERT.
         # Při první změně po startu se množina načte z DB - držet ji jinde by
         # znamenalo druhý zdroj pravdy, který se může rozejít.
+        # OPRAVA N-7: cache je nově {tx_id: mempool_deadline}. Dřív se u řádku,
+        # který už v DB byl, lhůta nikdy nepřepsala - prodloužení z recyklace
+        # (add_transaction(allow_expired=True)) se tak do souboru nedostalo a
+        # po restartu load_mempool() transakci posoudil podle staré lhůty.
         if _mempool_persisted_ids is None:
-            c.execute('SELECT tx_id FROM transactions')
-            _mempool_persisted_ids = {row[0] for row in c.fetchall()}
+            c.execute('SELECT tx_id, mempool_deadline FROM transactions')
+            _mempool_persisted_ids = {row[0]: row[1] for row in c.fetchall()}
+
+        def _lhuta(tx):
+            return getattr(tx, 'mempool_deadline', tx.timestamp + MEMPOOL_TX_EXPIRATION)
 
         current = {tx.tx_id: tx for tx in unconfirmed_transactions}
         to_insert = [tx for tx_id, tx in current.items() if tx_id not in _mempool_persisted_ids]
         to_delete = [tx_id for tx_id in _mempool_persisted_ids if tx_id not in current]
+        to_update = [(_lhuta(tx), tx_id) for tx_id, tx in current.items()
+                     if tx_id in _mempool_persisted_ids and _mempool_persisted_ids[tx_id] != _lhuta(tx)]
+        if to_update:
+            c.executemany('UPDATE transactions SET mempool_deadline = ? WHERE tx_id = ?', to_update)
 
         for tx in to_insert:
             c.execute('''
@@ -4662,7 +5836,7 @@ def save_mempool(unconfirmed_transactions):
         conn.commit()
         conn.close()
         # Až po úspěšném commitu - kdyby zápis selhal, musí se příště zkusit znovu.
-        _mempool_persisted_ids = set(current.keys())
+        _mempool_persisted_ids = {tx_id: _lhuta(tx) for tx_id, tx in current.items()}
     except Exception as e:
         # Po chybě nevíme, co v DB skutečně je; vynutíme příště načtení z DB.
         _mempool_persisted_ids = None
@@ -4713,7 +5887,9 @@ def load_data():
             except ValueError:
                 print(f"{Fore.RED}Chyba: Soubor peněženek obsahuje neplatná data (poškozený klíč).{Style.RESET_ALL}")
                 sys.exit(1)
-        except Exception as e:
+        except Exception:
+            # OPRAVA G-11: 'as e' se nepoužívalo; text výjimky se tu opět
+            # záměrně nevypisuje.
             print(f"{Fore.RED}Chyba při dešifrování peněženek: Špatné heslo nebo poškozený soubor.{Style.RESET_ALL}")
             sys.exit(1)
     else:
@@ -4811,6 +5987,14 @@ def load_data():
         except Exception as e:
             print(f"{Fore.RED}Chyba při načítání blockchainu:{Style.RESET_ALL} {e}")
             print(f"{Fore.YELLOW}Vytvářím nový blockchain s genesis blokem.{Style.RESET_ALL}")
+            # OPRAVA G-11: droid_chain.chain už v tuhle chvíli může být částečně
+            # naplněná - výjimka mohla nastat až ZA přiřazením výše. Genesis by
+            # se pak připojil na KONEC existujícího seznamu a save_data(full=True)
+            # by zapsal i staré bloky. Následná is_valid_chain() to sice zachytí,
+            # ale spoléhat se na obranu v druhé linii je zbytečné: stav se před
+            # tvorbou genesis vynuluje. (max_block_index si create_genesis_block()
+            # nastavuje sám.)
+            droid_chain.chain = []
             droid_chain.create_genesis_block()
             save_data(droid_chain, wallets, password, peers, full=True, save_wallets=True)
     else:
@@ -4909,9 +6093,23 @@ def load_data():
     return droid_chain, wallets, peers, password
 
 def load_mempool(droid_chain):
-    if os.path.exists(MEMPOOL_DB):
+    # ZMĚNA 3: načtení CELÉHO uloženého mempoolu (nejen transakcí tohoto uzlu)
+    # a jeho validace proti aktuálnímu blockchainu. Volá se z load_data() až po
+    # načtení a validaci řetězce, takže balance_map a nonce_map jsou aktuální.
+    #
+    # Oproti původní verzi:
+    #   - transakce se čtou v pořadí zápisu (ORDER BY rowid) a ověřují se po
+    #     odesílatelích v pořadí nonce - dřív šly do add_transaction() v pořadí,
+    #     jaké náhodou vrátil SELECT, a platná navazující transakce propadla,
+    #     kdykoli se načetla dřív než její předchůdce,
+    #   - vytěžené, zastaralé a jinak neplatné transakce (včetně navazujících
+    #     po díře v nonce) se odstraní, viz Blockchain.revalidate_stored_mempool,
+    #   - výsledek validace se hned propíše zpět do mempool.db.
+    if not os.path.exists(MEMPOOL_DB):
+        return droid_chain.unconfirmed_transactions
+    try:
+        conn = sqlite3.connect(MEMPOOL_DB, timeout=1.0)
         try:
-            conn = sqlite3.connect(MEMPOOL_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
             c = conn.cursor()
             c.execute('''
@@ -4931,42 +6129,91 @@ def load_mempool(droid_chain):
                 )
             ''')
             ensure_column(conn, 'transactions', 'mempool_deadline', 'INTEGER')
-            c.execute("SELECT tx_id, from_address, to_address, amount, fee, nonce, timestamp, public_key, signature, data, chain_id, mempool_deadline FROM transactions")
+            c.execute("SELECT tx_id, from_address, to_address, amount, fee, nonce, timestamp, public_key, signature, data, chain_id, mempool_deadline FROM transactions ORDER BY rowid")
             rows = c.fetchall()
+        finally:
             conn.close()
-            for row in rows:
-                tx_data = {
-                    'tx_id': row[0],
-                    'from_address': row[1],
-                    'to_address': row[2],
-                    'amount': row[3],
-                    'fee': row[4],
-                    'nonce': row[5],
-                    'timestamp': row[6],
-                    'public_key': row[7],
-                    'signature': row[8],
-                    'data': row[9],
-                    'chain_id': row[10]
-                }
-                try:
-                    tx = Transaction.from_dict(tx_data)
-                except ValueError as e:
-                    print(f"{Fore.RED}Přeskakuji neplatnou transakci z mempoolu DB (tx_id={row[0]}): {e}{Style.RESET_ALL}")
-                    continue
-                # OPRAVA #11: uloženou lhůtu obnovíme. Pokud ještě běží a je
-                # pozdější, než by odpovídalo stáří transakce, jde o transakci
-                # vrácenou reorgem a musí se pustit zpět i jako "expirovaná".
-                stored_deadline = row[11]
-                allow_expired = False
-                if isinstance(stored_deadline, int):
-                    tx.mempool_deadline = stored_deadline
-                    if stored_deadline > tx.timestamp + MEMPOOL_TX_EXPIRATION and stored_deadline > get_time():
-                        allow_expired = True
-                if not droid_chain.add_transaction(tx, allow_expired=allow_expired):
-                    print(f"{Fore.RED}Transakce z mempoolu DB zamítnuta (duplicitní nebo neplatná): {tx.tx_id}{Style.RESET_ALL}")
-        except Exception as e:
-            print(f"{Fore.RED}Chyba při načítání mempoolu:{Style.RESET_ALL} {e}")
+    except Exception as e:
+        print(f"{Fore.RED}Chyba při načítání mempoolu:{Style.RESET_ALL} {e}")
+        return droid_chain.unconfirmed_transactions
+
+    if not rows:
+        return droid_chain.unconfirmed_transactions
+
+    print(f"{Fore.YELLOW}Ověřuji uložený mempool ({len(rows)} TX) proti aktuálnímu stavu blockchainu...{Style.RESET_ALL}")
+    kandidati = []
+    necitelne = 0
+    for row in rows:
+        tx_data = {
+            'tx_id': row[0],
+            'from_address': row[1],
+            'to_address': row[2],
+            'amount': row[3],
+            'fee': row[4],
+            'nonce': row[5],
+            'timestamp': row[6],
+            'public_key': row[7],
+            'signature': row[8],
+            'data': row[9],
+            'chain_id': row[10]
+        }
+        try:
+            tx = Transaction.from_dict(tx_data)
+        except ValueError as e:
+            # from_dict() ověřuje i shodu uloženého tx_id s obsahem transakce,
+            # takže sem padá i ručně pozměněný záznam.
+            necitelne += 1
+            print(f"{Fore.YELLOW}  Odstraněno z mempoolu: {row[0]} - poškozený nebo nečitelný záznam ({e}){Style.RESET_ALL}")
+            continue
+        # OPRAVA #11: uloženou lhůtu obnovíme. Pokud ještě běží a je
+        # pozdější, než by odpovídalo stáří transakce, jde o transakci
+        # vrácenou reorgem a musí se pustit zpět i jako "expirovaná".
+        stored_deadline = row[11]
+        allow_expired = False
+        if isinstance(stored_deadline, int):
+            tx.mempool_deadline = stored_deadline
+            if stored_deadline > tx.timestamp + MEMPOOL_TX_EXPIRATION and stored_deadline > get_time():
+                allow_expired = True
+        kandidati.append((tx, allow_expired))
+
+    try:
+        ponechane, odstranene = droid_chain.revalidate_stored_mempool(kandidati)
+    except Exception as e:
+        # V mempoolu zůstává jen to, co už validací prošlo.
+        print(f"{Fore.RED}Chyba při ověřování uloženého mempoolu:{Style.RESET_ALL} {e}")
+        return droid_chain.unconfirmed_transactions
+    odstranene += necitelne
+
+    # Odstraněné transakce se hned smažou i z mempool.db. save_mempool() zapisuje
+    # rozdíl proti souboru, takže ponechané transakce se nepřepisují a smažou
+    # se jen řádky, které v paměti nejsou.
+    save_mempool(droid_chain.unconfirmed_transactions)
+    print(f"{Fore.GREEN}Mempool obnoven a ověřen: ponecháno {ponechane} TX, odstraněno {odstranene} TX.{Style.RESET_ALL}")
     return droid_chain.unconfirmed_transactions
+
+def uloz_mempool_pri_vypnuti(droid_chain):
+    # ZMĚNA 2: náhrada za původní mazání mempool.db při vypnutí uzlu (volba 20
+    # i CTRL+C). Mazání mělo chránit před načtením zastaralých transakcí po
+    # delší nečinnosti, jenže uzel si pak po restartu musel transakce znovu
+    # vyžádat od peerů - a ty je neposílají v pořadí nonce, takže navazující
+    # transakce téže adresy propadaly. A kdyby to dělal každý uzel, neuchovával
+    # by si mempool nikdo a po restartu by nebylo odkud ho získat.
+    #
+    # Ochranu před zastaralými transakcemi nově zajišťuje validace při startu
+    # (Blockchain.revalidate_stored_mempool), takže se mempool uchovává celý.
+    #
+    # save_data() mempool ukládá také, ale až po zápisu blockchainu - kdyby
+    # ten selhal, save_mempool() by se vůbec nezavolal. Proto se tu ukládá
+    # ještě jednou samostatně. Je-li mempool.db už aktuální, zapíše se prázdný
+    # rozdíl, takže to nic nestojí.
+    with droid_chain.lock:
+        save_mempool(droid_chain.unconfirmed_transactions)
+        pocet = len(droid_chain.unconfirmed_transactions)
+        ulozeno = _mempool_persisted_ids is not None
+    if ulozeno:
+        print(f"{Fore.GREEN}Mempool ({pocet} TX) zůstává uložený v {MEMPOOL_DB} a při dalším spuštění se načte a ověří.{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.RED}Mempool se nepodařilo uložit do {MEMPOOL_DB} (viz chyba výše).{Style.RESET_ALL}")
 
 class PeerConnection:
     """
@@ -5111,7 +6358,18 @@ class P2PNode:
         self.bind_ready = threading.Event()
         self.sync_thread = threading.Thread(target=self.sync_chain_periodically)
         self.sync_thread.daemon = True
-        self.p2p_log = queue.Queue()
+        # OPRAVA G-05: místo queue.Queue() bez maxsize je log kruhový buffer.
+        # deque(maxlen=N) při zaplnění sám zahodí NEJSTARŠÍ záznam, takže
+        # spotřeba paměti je shora omezená bez ohledu na to, jak dlouho uzel
+        # běží a co na něj kdo posílá. Počítadlo zahozených záznamů se ukáže
+        # při čtení, aby uživatel poznal, že o něco přišel.
+        self.p2p_log = deque(maxlen=MAX_P2P_LOG_ENTRIES)
+        self.p2p_log_lock = threading.Lock()
+        self.p2p_log_dropped = 0
+        # Potlačení opakujících se hlášek: zaplavovací útok posílá tutéž
+        # zprávu tisíckrát, takže z ní nově vznikne jeden řádek a počítadlo.
+        self._p2p_log_last = None
+        self._p2p_log_repeat = 0
         # OPRAVA #1: token buckets místo seznamu časových razítek.
         # rate_buckets   = levné zprávy / navazovaná spojení
         # expensive_buckets = drahé dotazy (request_blocks, request_full_chain, ...)
@@ -5130,6 +6388,13 @@ class P2PNode:
         self.rate_overflow = {}
         self.blacklist_lock = threading.Lock()
         self.blacklist = load_blacklist()
+        # OPRAVA G-06: stav pro dávkovaný zápis a periodický úklid.
+        # dirty = v paměti je změna, která ještě není na disku.
+        self.blacklist_dirty = False
+        self.blacklist_last_flush = 0.0
+        # Blacklist pracuje důsledně s time.time(), ne s get_time() - expirace
+        # banu nesmí záviset na síťovém offsetu, který uzly mezi sebou ladí.
+        self.blacklist_last_prune = time.time()
         self.tx_rate_limit = defaultdict(list)
         self.awaiting_full_chain = False
         self.syncing_fork = False
@@ -5144,6 +6409,8 @@ class P2PNode:
         # na banování poctivých uzlů - viz komentář v _store_fork_batch().
         self.fork_peer_ip = None
         self.fork_start_index = None
+        # OPRAVA A-3: účetní počítadlo bajtů zapsaných do sync_buffer.db.
+        self.sync_buffer_bytes = 0
         self.fork_sync_start = 0
         self.SYNC_BUFFER_DB = 'sync_buffer.db'
 
@@ -5154,6 +6421,9 @@ class P2PNode:
         # posledních 10 bloků po jednom, pak krok 2, 4, 8, ... To pokryje
         # stejnou hloubku ~32 hashi místo 1200.
         locator = []
+        # OPRAVA L-3: conn.close() leželo až na konci try, takže při výjimce
+        # uprostřed (poškozený řádek, zamčená DB) spojení zůstalo otevřené.
+        conn = None
         try:
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -5178,9 +6448,14 @@ class P2PNode:
                 c.execute(f"SELECT block_index, block_hash FROM blocks WHERE block_index IN ({placeholders})", tuple(indices))
                 found = {r[0]: r[1] for r in c.fetchall()}
                 locator = [found[i] for i in indices if i in found]
-            conn.close()
         except Exception:
             pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         return locator
 
     def init_sync_buffer(self, reset=True):
@@ -5188,28 +6463,49 @@ class P2PNode:
         # fork (reset=True). Při navazování na rozpracovaný buffer se tabulka
         # zachová, jinak by každý pokus začínal od nuly a hluboký reorg by se
         # nad hraničním RTT nedotáhl nikdy.
-        conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        c = conn.cursor()
-        if reset:
-            c.execute("DROP TABLE IF EXISTS sync_blocks")
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS sync_blocks (
-                block_index INTEGER PRIMARY KEY,
-                timestamp INTEGER,
-                transactions TEXT,
-                previous_hash TEXT,
-                target_hex TEXT,
-                nonce INTEGER,
-                block_hash TEXT,
-                merkle_root TEXT,
-                version INTEGER,
-                chain_id INTEGER,
-                state_root TEXT
-            )
-        ''')
-        conn.commit()
-        conn.close()
+        # OPRAVA L-3: spojení bez try/finally. Volá se ze síťové cesty při
+        # každém zahájení i navázání fork syncu; selhání DROP/CREATE (plný disk,
+        # zamčená DB) tu nechalo deskriptor viset.
+        conn = None
+        try:
+            conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            c = conn.cursor()
+            if reset:
+                c.execute("DROP TABLE IF EXISTS sync_blocks")
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS sync_blocks (
+                    block_index INTEGER PRIMARY KEY,
+                    timestamp INTEGER,
+                    transactions TEXT,
+                    previous_hash TEXT,
+                    target_hex TEXT,
+                    nonce INTEGER,
+                    block_hash TEXT,
+                    merkle_root TEXT,
+                    version INTEGER,
+                    chain_id INTEGER,
+                    state_root TEXT
+                )
+            ''')
+            conn.commit()
+            # OPRAVA A-3: počítadlo bajtů musí sedět i při navazování na
+            # rozpracovaný buffer (reset=False), jinak by strop po timeoutu začal
+            # počítat od nuly a útočník by ho obešel pouhým přerušením přenosu.
+            if reset:
+                self.sync_buffer_bytes = 0
+            else:
+                try:
+                    c.execute("SELECT COALESCE(SUM(LENGTH(transactions)), 0) FROM sync_blocks")
+                    self.sync_buffer_bytes = int(c.fetchone()[0] or 0)
+                except Exception:
+                    self.sync_buffer_bytes = 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def sync_buffer_tip(self):
         # OPRAVA #6c: (index, hash) posledního bloku v bufferu, nebo None.
@@ -5217,11 +6513,21 @@ class P2PNode:
         try:
             if not os.path.exists(self.SYNC_BUFFER_DB):
                 return None
-            conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
-            c = conn.cursor()
-            c.execute("SELECT block_index, block_hash FROM sync_blocks ORDER BY block_index DESC LIMIT 1")
-            row = c.fetchone()
-            conn.close()
+            # OPRAVA L-3: conn.close() bylo uvnitř try, takže selhání dotazu
+            # (poškozený buffer) spojení nezavřelo - a tahle metoda se volá
+            # z watchdogu každých 10 s.
+            conn = None
+            try:
+                conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
+                c = conn.cursor()
+                c.execute("SELECT block_index, block_hash FROM sync_blocks ORDER BY block_index DESC LIMIT 1")
+                row = c.fetchone()
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             if row:
                 return (row[0], row[1])
         except Exception:
@@ -5229,6 +6535,8 @@ class P2PNode:
         return None
 
     def discard_sync_buffer(self):
+        # OPRAVA A-3: s bufferem padá i jeho účetnictví.
+        self.sync_buffer_bytes = 0
         for suffix in ('', '-wal', '-shm'):
             try:
                 path = self.SYNC_BUFFER_DB + suffix
@@ -5240,6 +6548,11 @@ class P2PNode:
     def process_sync_buffer(self):
         self.add_log(f"{Fore.YELLOW}Stahování forku do bufferu dokončeno, spouštím replace_chain()...{Style.RESET_ALL}")
         
+        # OPRAVA L-3: `conn.close()` leželo jako poslední řádek uvnitř try, takže
+        # při výjimce z json.loads() nad poškozeným řádkem bufferu se spojení
+        # nezavřelo. Cesta je dosažitelná ze sítě (dávky forku plní buffer),
+        # takže útočník mohl deskriptory hromadit. Zavření patří do finally.
+        conn = None
         try:
             conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -5260,12 +6573,17 @@ class P2PNode:
                     'version': row[8],
                     'chain_id': row[9], 'state_root': row[10]
                 })
-            conn.close()
         except Exception as e:
             self.add_log(f"{Fore.RED}Chyba při čtení ze sync bufferu: {e}{Style.RESET_ALL}")
             self.syncing_fork = False
             self.fork_sync_start = 0
             return
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         fork_idx = self.fork_start_index
         fork_peer_ip = self.fork_peer_ip
@@ -5317,8 +6635,11 @@ class P2PNode:
             self.discard_sync_buffer()
             return
 
-        global wallets, password
+        # OPRAVA G-11: `global wallets, password` tu bylo zbytečně - deklarace je nutná jen při PŘIŘAZENÍ, ne při čtení. Odstraněno.
         if self.blockchain.replace_chain(fork_idx, blocks_data):
+            # OPRAVA N-1: řídicí smyčka sync_blocks_from_peer() podle toho pozná,
+            # že fork neskončil zrušením, ale úspěchem, a může pokračovat.
+            self.fork_last_ok = True
             save_data(self.blockchain, wallets, password, self.peers)
             self.add_log(f"{Fore.GREEN}Úspěšný reorg z bufferu! (zpracováno {len(blocks_data)} bloků){Style.RESET_ALL}")
         else:
@@ -5334,8 +6655,50 @@ class P2PNode:
         except ValueError:
             return ip_str
 
+    def _p2p_log_append_locked(self, message):
+        # Volat POUZE s drženým self.p2p_log_lock.
+        if len(self.p2p_log) == MAX_P2P_LOG_ENTRIES:
+            self.p2p_log_dropped += 1
+        self.p2p_log.append(message)
+
+    def _p2p_log_flush_repeat_locked(self):
+        # Volat POUZE s drženým self.p2p_log_lock. Zhmotní potlačené opakování
+        # do jediného souhrnného řádku.
+        if self._p2p_log_repeat > 0:
+            self._p2p_log_append_locked(
+                f"{Fore.YELLOW}  ... předchozí hláška se opakovala {self._p2p_log_repeat}x.{Style.RESET_ALL}"
+            )
+            self._p2p_log_repeat = 0
+
     def add_log(self, message):
-        self.p2p_log.put(message)
+        # OPRAVA G-05: zápis do kruhového bufferu místo do neomezené fronty.
+        # Zámek je potřeba proto, že add_log volají všechna P2P vlákna, kdežto
+        # dřívější Queue si synchronizaci řešila sama.
+        with self.p2p_log_lock:
+            if message == self._p2p_log_last:
+                self._p2p_log_repeat += 1
+                return
+            self._p2p_log_flush_repeat_locked()
+            self._p2p_log_last = message
+            self._p2p_log_append_locked(message)
+
+    def drain_log(self):
+        # OPRAVA G-05: jediná cesta, kudy se log čte. Vrátí seznam řádků a
+        # buffer vyprázdní - stejná sémantika jako dřívější smyčka nad
+        # Queue.get(), jen navíc hlásí, kolik záznamů padlo pod strop.
+        with self.p2p_log_lock:
+            self._p2p_log_flush_repeat_locked()
+            entries = list(self.p2p_log)
+            self.p2p_log.clear()
+            dropped = self.p2p_log_dropped
+            self.p2p_log_dropped = 0
+            self._p2p_log_last = None
+        if dropped:
+            entries.append(
+                f"{Fore.YELLOW}[{dropped} nejstarších záznamů bylo zahozeno, "
+                f"strop logu je {MAX_P2P_LOG_ENTRIES} řádků.]{Style.RESET_ALL}"
+            )
+        return entries
 
     def ban_peer(self, ip, reason, duration=BAN_DURATION_SECONDS):
         # OPRAVA #1: jediné místo, kudy se uděluje ban, a je vždy DOČASNÝ.
@@ -5348,12 +6711,99 @@ class P2PNode:
             if ip in self.blacklist and existing is None:
                 return  # trvalý ban dočasným nepřepisujeme
             self.blacklist[ip] = expiry
-            snapshot = dict(self.blacklist)
-        save_blacklist(snapshot)
+            # OPRAVA G-06 (b): dřív se tu volalo save_blacklist(dict(...)),
+            # tedy kompletní přepis souboru po KAŽDÉM banu - N banů znamenalo
+            # O(N^2) zapsaných bajtů (měřeno: 1500 banů = 59 kB souboru a 2,0 s
+            # čistého I/O) a zbytečné opotřebení flash paměti telefonu. Nově se
+            # změna jen označí a na disk ji odnese flush_blacklist().
+            self.blacklist_dirty = True
+            # OPRAVA G-06 (a): tvrdý strop na počet položek. Bez něj mohl
+            # útočník z jediného /64 prefixu (2^64 adres) nechat slovník růst
+            # bez omezení - každá adresa se dá zabanovat jedním protokolovým
+            # přestupkem, tedy prakticky zdarma.
+            self._enforce_blacklist_cap_locked(slack=BLACKLIST_CAP_SLACK)
+        if expiry is None:
+            # Trvalý ban uděluje výhradně uživatel z menu a čeká, že přežije
+            # vypnutí. Ten jediný se zapisuje okamžitě - je jich řádově málo,
+            # takže kvadratické chování nehrozí.
+            self.flush_blacklist(force=True)
         if expiry is None:
             self.add_log(f"{Fore.RED}Uzel {ip} trvale zablokován. Důvod: {reason}.{Style.RESET_ALL}")
         else:
             self.add_log(f"{Fore.RED}Uzel {ip} dočasně zablokován na {int(duration)} s. Důvod: {reason}.{Style.RESET_ALL}")
+
+    def _enforce_blacklist_cap_locked(self, slack=0):
+        # OPRAVA G-06 (a): volat POUZE s drženým self.blacklist_lock.
+        # slack > 0 je horká cesta (ban_peer): ořez se spustí až po překročení
+        # rezervy a sáhne rovnou pod strop, takže amortizovaně stojí O(1).
+        # slack = 0 je úklidová cesta (prune_blacklist), která dorovná přesně.
+        if len(self.blacklist) <= MAX_BLACKLIST_ENTRIES + slack:
+            return 0
+        now = time.time()
+        # Nejdřív se zkusí uvolnit místo bez ztráty informace - expirované ven.
+        obetovane = [ip for ip, exp in self.blacklist.items()
+                     if exp is not None and now >= exp]
+        for ip in obetovane:
+            del self.blacklist[ip]
+        prebytek = len(self.blacklist) - MAX_BLACKLIST_ENTRIES
+        if prebytek > 0:
+            # Pořád plno. Obětují se DOČASNÉ bany s nejbližší expirací, tedy
+            # ty, které by stejně brzy vypršely samy. Trvalý ban uděluje jen
+            # uživatel ručně z menu - ten se nezahazuje nikdy, i kdyby jich
+            # bylo nad strop; smazat cizí rozhodnutí je horší než mít o pár
+            # položek víc.
+            docasne = sorted((exp, ip) for ip, exp in self.blacklist.items()
+                             if exp is not None)
+            for _, ip in docasne[:prebytek]:
+                del self.blacklist[ip]
+                obetovane.append(ip)
+        if obetovane:
+            self.blacklist_dirty = True
+        return len(obetovane)
+
+    def flush_blacklist(self, force=False):
+        # OPRAVA G-06 (b): dávkovaný zápis na disk. Snapshot se pořizuje pod
+        # zámkem, samotné I/O běží bez něj. Když zápis selže, příznak 'dirty'
+        # se vrátí zpátky, takže se o změnu nepřijde.
+        if not self.blacklist_dirty:
+            return False
+        now = time.time()
+        with self.blacklist_lock:
+            if not self.blacklist_dirty:
+                return False
+            if not force and now - self.blacklist_last_flush < BLACKLIST_FLUSH_INTERVAL:
+                return False
+            snapshot = dict(self.blacklist)
+            self.blacklist_dirty = False
+            self.blacklist_last_flush = now
+        if save_blacklist(snapshot):
+            return True
+        with self.blacklist_lock:
+            self.blacklist_dirty = True
+        return False
+
+    def prune_blacklist(self, force=False):
+        # OPRAVA G-06 (a): periodický úklid. Dřív se slovník kvůli úklidu
+        # neprocházel VŮBEC - expirovaný záznam zmizel jedině tehdy, když se
+        # náhodou znovu ozvala TÁŽ IP (is_blacklisted). IP, která se už nikdy
+        # neozve, zůstala v paměti i v souboru napořád. Volá se ze
+        # sync_chain_periodically, tedy odtud, kde už běží cleanup_mempool().
+        now = time.time()
+        if not force and now - self.blacklist_last_prune < BLACKLIST_PRUNE_INTERVAL:
+            return 0
+        self.blacklist_last_prune = now
+        with self.blacklist_lock:
+            vyprsele = [ip for ip, exp in self.blacklist.items()
+                        if exp is not None and now >= exp]
+            for ip in vyprsele:
+                del self.blacklist[ip]
+            if vyprsele:
+                self.blacklist_dirty = True
+            self._enforce_blacklist_cap_locked()
+        if vyprsele:
+            self.add_log(f"{Fore.GREEN}Úklid blacklistu: {len(vyprsele)} vypršelých banů odstraněno.{Style.RESET_ALL}")
+        self.flush_blacklist()
+        return len(vyprsele)
 
     def _take_token(self, bucket, ip, capacity, refill, now):
         # Token bucket: vrací True, pokud byl token k dispozici a byl odebrán.
@@ -5467,14 +6917,15 @@ class P2PNode:
                 return True
             if time.time() >= expiry:
                 # OPRAVA #1: ban vypršel, IP se sama uvolní.
+                # OPRAVA G-06 (b): dřív se tady rovnou přepisoval celý soubor.
+                # Nově se změna jen označí; na disk ji odnese flush_blacklist()
+                # z úklidového vlákna. Tahle cesta je navíc jen pojistka -
+                # systematicky expirované bany maže prune_blacklist().
                 del self.blacklist[ip]
-                snapshot = dict(self.blacklist)
-                changed = True
+                self.blacklist_dirty = True
             else:
                 return True
-        if changed:
-            save_blacklist(snapshot)
-            self.add_log(f"{Fore.GREEN}Dočasný ban IP {ip} vypršel, uzel je opět povolen.{Style.RESET_ALL}")
+        self.add_log(f"{Fore.GREEN}Dočasný ban IP {ip} vypršel, uzel je opět povolen.{Style.RESET_ALL}")
         return False
 
     @staticmethod
@@ -5563,12 +7014,18 @@ class P2PNode:
         # bez úspěšné interakce.
         now = get_time()
         candidates = [p for p in self.peers if p not in self.protected_peers]
-        # Rezerva pro ručně zadané peery: chráněné uzly se nepočítají do
-        # rozpočtu, který smí obsadit síť.
-        if len(self.peers) - len(candidates) < PROTECTED_PEER_SLOTS:
-            free_for_network = MAX_PEERS - PROTECTED_PEER_SLOTS
-            if len(candidates) <= free_for_network - 1:
-                return True, None
+        # OPRAVA G-04: tady byla větev
+        #     if len(self.peers) - len(candidates) < PROTECTED_PEER_SLOTS:
+        #         free_for_network = MAX_PEERS - PROTECTED_PEER_SLOTS   # 16
+        #         if len(candidates) <= free_for_network - 1:           # <= 15
+        #             return True, None
+        # Do tohohle bodu se kód dostane jen při len(self.peers) >= MAX_PEERS,
+        # tedy >= 20. Podmínky ale zároveň vyžadují chráněných < 4 a
+        # kandidátů <= 15, což dává len(peers) <= 18. Spor - větev byla
+        # NEDOSAŽITELNÁ. A kdyby dosažitelná byla, vracela by (True, None),
+        # tedy přijetí BEZ vytlačení, a tabulka by přerostla MAX_PEERS.
+        # Rezervu pro ruční peery řeší samotná množina protected_peers: chráněné
+        # uzly se nikdy neobjeví mezi kandidáty, takže je vytlačit nelze.
 
         if not candidates:
             return False, None
@@ -5627,11 +7084,22 @@ class P2PNode:
             return
         self.add_log(f"{Fore.CYAN}Poslouchám na portu {self.port} (IPv4 i IPv6)...{Style.RESET_ALL}")
         self.bind_ready.set()
+        # OPRAVA N-2: evidence souběžných příchozích spojení (celkem a po IP).
+        self.inbound_lock = threading.Lock()
+        self.inbound_total = 0
+        self.inbound_per_ip = defaultdict(int)
         while self.running:
             try:
                 readable, _, _ = select.select(sockets, [], [], 1.0)
                 for s in readable:
-                    conn, addr = s.accept()
+                    try:
+                        conn, addr = s.accept()
+                    except OSError:
+                        # OPRAVA N-2: EMFILE/ENFILE nechávají spojení ve frontě,
+                        # select() ho hlásí dál jako čitelné a smyčka se točila
+                        # na 100 % CPU. Krátká pauza místo busy loopu.
+                        time.sleep(0.2)
+                        continue
                     if isinstance(addr, tuple) and len(addr) > 2:
                         addr = (addr[0], addr[1])
                     if self.is_blacklisted(addr):
@@ -5644,7 +7112,19 @@ class P2PNode:
                     if self.is_connection_rate_limited(addr):
                         conn.close()
                         continue
-                    client_thread = threading.Thread(target=self.handle_client_connection, args=(conn, addr))
+                    ip_klic = self.normalize_ip(addr[0])
+                    with self.inbound_lock:
+                        if (self.inbound_total >= MAX_INBOUND_CONNECTIONS
+                                or self.inbound_per_ip[ip_klic] >= MAX_INBOUND_PER_IP):
+                            prijmout = False
+                        else:
+                            prijmout = True
+                            self.inbound_total += 1
+                            self.inbound_per_ip[ip_klic] += 1
+                    if not prijmout:
+                        conn.close()
+                        continue
+                    client_thread = threading.Thread(target=self._serve_inbound, args=(conn, addr, ip_klic))
                     client_thread.daemon = True
                     client_thread.start()
             except OSError:
@@ -5658,14 +7138,38 @@ class P2PNode:
                 pass
 
     @staticmethod
-    def _recv_exactly(conn, n):
-        buf = b''
+    def _recv_exactly(conn, n, deadline=None):
+        # OPRAVA N-2: dřív `buf = b''` a `buf += part` - bytes je neměnný, takže
+        # každé přidání kopírovalo celý dosavadní buffer. 10 MiB zprávy po 1 KiB
+        # stálo 17,6 s CPU pod GILem (test t_bug2b_recv.py), odesílatele nic.
+        # bytearray se prodlužuje amortizovaně v O(1).
+        #
+        # deadline (time.monotonic()) je CELKOVÁ lhůta na n bajtů. Timeout
+        # socketu sám o sobě hlídá jen jedno recv(), takže pomalé odkapávání
+        # po bajtu ho nikdy nevyčerpá (slowloris).
+        buf = bytearray()
         while len(buf) < n:
-            part = conn.recv(n - len(buf))
+            if deadline is not None:
+                zbyva = deadline - time.monotonic()
+                if zbyva <= 0:
+                    raise socket.timeout("lhůta na doručení zprávy vypršela")
+                conn.settimeout(zbyva)
+            part = conn.recv(min(n - len(buf), 1 << 20))
             if not part:
                 return None
             buf += part
-        return buf
+        return bytes(buf)
+
+    def _serve_inbound(self, conn, addr, ip_klic):
+        # OPRAVA N-2: obal, který spojení vždy odečte z evidence - i při výjimce.
+        try:
+            self.handle_client_connection(conn, addr)
+        finally:
+            with self.inbound_lock:
+                self.inbound_total -= 1
+                self.inbound_per_ip[ip_klic] -= 1
+                if self.inbound_per_ip[ip_klic] <= 0:
+                    del self.inbound_per_ip[ip_klic]
 
     @staticmethod
     def _json_depth_ok(data_buffer, max_depth=20):
@@ -5724,7 +7228,8 @@ class P2PNode:
             unauthenticated_in_row = 0
             try:
                 while self.running:
-                    raw_msglen = self._recv_exactly(conn, 4)
+                    # OPRAVA N-2: celková lhůta na hlavičku i na tělo zprávy.
+                    raw_msglen = self._recv_exactly(conn, 4, time.monotonic() + CONNECTION_IDLE_TIMEOUT)
                     if not raw_msglen:
                         # Peer korektně zavřel spojení - běžný konec, ne chyba.
                         return
@@ -5739,10 +7244,15 @@ class P2PNode:
                         self.add_log(f"{Fore.YELLOW}Zpráva od {addr} zahozena: vyčerpán limit zpráv.{Style.RESET_ALL}")
                         return
 
-                    data_buffer = self._recv_exactly(conn, msglen)
+                    data_buffer = self._recv_exactly(
+                        conn, msglen,
+                        time.monotonic() + MESSAGE_RECV_GRACE_SECONDS + msglen / MIN_RECV_RATE_BYTES_PER_S)
                     if data_buffer is None:
                         self.add_log(f"{Fore.RED}Spojení s {addr} přerušeno při přijímání dat.{Style.RESET_ALL}")
                         return
+                    # OPRAVA N-2: _recv_exactly() nechal na socketu zbytek lhůty;
+                    # odpověď (reply -> sendall) má mít zase plný timeout.
+                    conn.settimeout(CONNECTION_IDLE_TIMEOUT)
 
                     if not self._json_depth_ok(data_buffer):
                         self.add_log(f"{Fore.RED}Přijatá zpráva má příliš hluboké vnoření. Odmítnuto.{Style.RESET_ALL}")
@@ -5760,6 +7270,11 @@ class P2PNode:
                     # socket otevřený donekonečna a posílat zprávy, které se
                     # všechny zahodí branou z opravy #10 - a stojí nás to vlákno.
                     # Po několika odmítnutích za sebou spojení zavřeme.
+                    # OPRAVA B-4: `is False` zůstává záměrně - None tu znamená
+                    # "zpráva zpracována, nic k hlášení" (legitimní konec
+                    # synchronizace, prázdná dávka, úklid peerů), ne odmítnutí.
+                    # Opraveny byly naopak handlery, které None vracely tam, kde
+                    # myslely False; ty teď vracejí False výslovně.
                     if accepted is False:
                         unauthenticated_in_row += 1
                         if unauthenticated_in_row >= MAX_UNAUTHENTICATED_MESSAGES:
@@ -5842,8 +7357,16 @@ class P2PNode:
             rounds += 1
             in_fork = bool(getattr(self, 'syncing_fork', False))
             if fork_mode_seen and not in_fork:
-                self.add_log(f"{Fore.YELLOW}Řízený sync s {peer} ukončen: fork byl mezitím zrušen.{Style.RESET_ALL}")
-                return False
+                # OPRAVA N-1: fork mohl skončit i ÚSPĚCHEM (buffer se zpracoval
+                # po dosažení stropu). Pak se pokračuje od nového vrcholu jako
+                # běžné prodloužení řetězce.
+                if getattr(self, 'fork_last_ok', False):
+                    self.fork_last_ok = False
+                    fork_mode_seen = False
+                    in_fork = False
+                else:
+                    self.add_log(f"{Fore.YELLOW}Řízený sync s {peer} ukončen: fork byl mezitím zrušen.{Style.RESET_ALL}")
+                    return False
             fork_mode_seen = fork_mode_seen or in_fork
             tip = self.sync_buffer_tip() if in_fork else None
             if tip:
@@ -5855,8 +7378,17 @@ class P2PNode:
             if resp is None or resp.get('type') != 'response_blocks':
                 self.add_log(f"{Fore.YELLOW}Řízený sync s {peer} přerušen (bez odpovědi v kole {rounds}).{Style.RESET_ALL}")
                 return False
+            # OPRAVA N-9: prázdná dávka s has_more=True je protimluv - smyčka by
+            # se na ní točila až do stropu max_rounds, aniž by se cokoli stáhlo.
+            if not resp.get('data') and resp.get('has_more'):
+                self.add_log(f"{Fore.YELLOW}Řízený sync s {peer} přerušen: prázdná dávka s has_more=True.{Style.RESET_ALL}")
+                return False
 
+            zruseni_pred = getattr(self, 'fork_abort_count', 0)
             self.handle_message(resp, peer, driven=True)
+            if getattr(self, 'fork_abort_count', 0) != zruseni_pred:
+                self.add_log(f"{Fore.YELLOW}Řízený sync s {peer} ukončen: dávka z kola {rounds} fork zrušila.{Style.RESET_ALL}")
+                return False
 
             if not resp.get('has_more'):
                 self.add_log(f"{Fore.GREEN}Řízený sync s {peer} dokončen po {rounds} kolech.{Style.RESET_ALL}")
@@ -5931,6 +7463,23 @@ class P2PNode:
 
     def sync_with_peer(self, peer):
         """ETAPA 1: jedno kolo periodické synchronizace s jedním uzlem."""
+        # OPRAVA N-9: sync_chain_periodically() spouštělo každých 10 s nové
+        # vlákno pro každého peera bez ohledu na to, jestli předchozí ještě běží.
+        # Peer, který tvrdí větší práci a odpovídá pomalu, tak hromadil vlákna
+        # lineárně (test t_bug9_sync_threads.py: 6 nových za minutu, každé až
+        # 2000 kol). Nově nejvýš jedna synchronizace na peera.
+        with self.peers_lock:
+            probihajici = self.__dict__.setdefault('sync_in_progress', set())
+            if peer in probihajici:
+                return
+            probihajici.add(peer)
+        try:
+            self._sync_with_peer_inner(peer)
+        finally:
+            with self.peers_lock:
+                self.sync_in_progress.discard(peer)
+
+    def _sync_with_peer_inner(self, peer):
         resp = self.send_request(peer, {'type': 'request_chain_info'}, timeout=8.0)
         if resp is None:
             # Buď je uzel nedostupný, nebo běží bez téhle změny a odpověděl
@@ -5985,14 +7534,62 @@ class P2PNode:
             return False
         if isinstance(bd['index'], bool) or not isinstance(bd['index'], int):
             return False
+        # OPRAVA L-2: branka kontrolovala tvar MĚLČEJI, než se s daty dál
+        # pracuje - přesně vzorec, který popisuje OPRAVA D-15. Pole timestamp,
+        # nonce, merkle_root a target neprocházela žádnou kontrolou, přestože
+        # jdou v _store_fork_batch_inner() rovnou jako parametry do SQLite.
+        # Například timestamp jako objekt dá sqlite3.InterfaceError; tu zachytí
+        # _store_fork_batch() jako sqlite3.Error a vyhodnotí ji jako CHYBU
+        # NAŠEHO DISKU - _abort_fork_sync(ban=False). Uzel tedy zahodí buffer
+        # a protistranu nepotrestá, přestože vadná data poslala ona.
+        #
+        # Kontroluje se pořád jen TVAR, ne platnost: skutečné meze targetu řeší
+        # _store_fork_batch_inner() proti FIXED_TARGET a pravidlo pro danou
+        # výšku až validate_fork() / is_valid_chain().
+        for k in ('timestamp', 'nonce'):
+            if isinstance(bd[k], bool) or not isinstance(bd[k], int) or bd[k] < 0:
+                return False
+        if not isinstance(bd['merkle_root'], str):
+            return False
+        # target chodí po drátě jako hex řetězec; int se toleruje kvůli starším
+        # uzlům, protože _store_fork_batch_inner() obojí přijímá také.
+        if isinstance(bd['target'], bool):
+            return False
+        if isinstance(bd['target'], str):
+            # OPRAVA N-5: stejné pravidlo jako Block.from_dict() - malý hex.
+            if (not bd['target'] or len(bd['target']) > 64 or bd['target'][0] == '0'
+                    or any(c not in '0123456789abcdef' for c in bd['target'])):
+                return False
+        elif not isinstance(bd['target'], int):
+            return False
+        # Nepovinná pole, která jdou do SQLite také (INSERT níž je bere přes
+        # .get() s výchozí hodnotou, takže chybět smějí - ale mít vadný typ ne).
+        if 'version' in bd and (isinstance(bd['version'], bool) or not isinstance(bd['version'], int)):
+            return False
+        if 'chain_id' in bd and (isinstance(bd['chain_id'], bool) or not isinstance(bd['chain_id'], int)):
+            return False
+        if bd.get('state_root') is not None and not isinstance(bd.get('state_root'), str):
+            return False
         return bd['index'] >= 0
 
-    def _abort_fork_sync(self, addr, reason):
+    def _abort_fork_sync(self, addr, reason, ban=True):
         # Společný úklid při zamítnuté dávce. Buffer se maže, protože dávka byla
         # prokazatelně vadná - navazovat na ni nemá smysl (na rozdíl od timeoutu,
         # kde je buffer v pořádku a jen se přestalo odpovídat, viz OPRAVA #6c).
-        self.add_log(f"{Fore.RED}DoS ochrana: {reason} Uzel ignoruji.{Style.RESET_ALL}")
-        if addr:
+        #
+        # OPRAVA A-2 (3/3): ban=False je pro případ, kdy je na vině NÁŠ disk,
+        # ne protistrana. Stahování forku se stejně musí zrušit (buffer je
+        # v nejistém stavu), ale 24hodinový ban poctivého uzlu za naši chybu
+        # I/O je přesně ten failure mode, který OPRAVA #1 i ETAPA 3 odstraňují.
+        # OPRAVA N-1: počítadlo zrušení - řídicí smyčka sync_blocks_from_peer()
+        # podle něj pozná, že dávka z TOHOTO kola fork zrušila (i bez banu), a
+        # nebude se ptát znovu na totéž až do stropu max_rounds.
+        self.fork_abort_count = getattr(self, 'fork_abort_count', 0) + 1
+        if ban:
+            self.add_log(f"{Fore.RED}DoS ochrana: {reason} Uzel ignoruji.{Style.RESET_ALL}")
+        else:
+            self.add_log(f"{Fore.YELLOW}Stahování forku zrušeno: {reason}{Style.RESET_ALL}")
+        if addr and ban:
             self.ban_peer(addr[0], reason, BAN_DURATION_PROTOCOL)
         self.syncing_fork = False
         self.fork_start_index = None
@@ -6012,6 +7609,15 @@ class P2PNode:
         try:
             return self._store_fork_batch_inner(blocks_data, first_block_index, last_block_data,
                                                 addr, ip_port, has_more, driven)
+        except (sqlite3.Error, OSError, MemoryError) as e:
+            # OPRAVA A-2 (3/3): tohle jsou chyby NAŠEHO stroje - plný disk,
+            # zamčená databáze, došlá paměť. Data protistrany s nimi nemají nic
+            # společného, takže se fork zruší, ale bez postihu.
+            self._abort_fork_sync(
+                addr,
+                f"lokální chyba při zpracování dávky forku ({type(e).__name__}: {e}). Protistrana není na vině, žádný postih.",
+                ban=False)
+            return
         except Exception as e:
             self._abort_fork_sync(addr, f"neočekávaná chyba při zpracování dávky forku ({type(e).__name__}: {e}).")
             return
@@ -6039,7 +7645,8 @@ class P2PNode:
             self.add_log(f"{Fore.YELLOW}Dávka od {ip_port} ignorována: fork se stahuje z {self.fork_peer_ip}. Žádný postih.{Style.RESET_ALL}")
             return
 
-        tip = self.sync_buffer_tip()
+        # OPRAVA G-11: tip = self.sync_buffer_tip() se nikde dál nečetlo -
+        # odstraněno včetně zbytečného SQL dotazu do bufferu na každou dávku.
 
         for i, bd in enumerate(blocks_data):
             # OPRAVA #8: původní kód porovnával hash bloku s targetem, KTERÝ SI
@@ -6072,24 +7679,129 @@ class P2PNode:
                     self._abort_fork_sync(addr, "Bloky v dávce nenavazují.")
                     return
 
-        conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        c = conn.cursor()
+        # OPRAVA A-3 (hloubkový strop): hloubka se měří od fork_start_index,
+        # tedy přesně tím pravidlem, kterým ji potom posoudí replace_chain().
+        # Cokoli nad MAX_REORG_DEPTH je zápis na flash, o kterém dopředu víme,
+        # že skončí hláškou "Navrhovaný fork z bufferu není platný". Dřív se
+        # takových bloků dalo zapsat kolik útočník chtěl.
+        # OPRAVA N-1: dřív se tu jako "hloubka" počítala DÉLKA OCASU nové větve
+        # (poslední index dávky - fork_start_index + 1) a nad MAX_REORG_DEPTH
+        # se sync zrušil S BANEM na 24 h. MAX_REORG_DEPTH ale omezuje, kolik
+        # NAŠICH bloků se smí zahodit - ne kolik bloků má delší větev. Uzel se
+        # slepým vrcholem (stačil jediný osiřelý blok), který byl pozadu o víc
+        # než ~1000 bloků, se proto už nikdy nedosynchronizoval a postupně
+        # zabanoval všechny poctivé peery (ověřeno testem t_bug1_fork_sync.py).
+        #
+        # Nově dvě nezávislé veličiny:
+        #   hloubka reorgu = max_block_index - fork_start_index + 1 (naše bloky)
+        #                    -> nad limitem zrušit, ale BEZ banu - jiná větev
+        #                       není důkaz zlého úmyslu,
+        #   délka ocasu    = počet bloků v bufferu -> strop jen kvůli paměti
+        #                    a flash; po jeho dosažení se zpracuje, co už v
+        #                    bufferu je (typicky už těžší než naše větev), a zbytek
+        #                    se dotáhne běžným syncem jako prosté pokračování.
+        zpracovat_hned = False
+        if self.fork_start_index is not None:
+            try:
+                start = int(self.fork_start_index)
+                prvni = int(blocks_data[0]['index'])
+            except (TypeError, ValueError, KeyError):
+                self._abort_fork_sync(addr, "Dávka nemá čitelné indexy.")
+                return
+            hloubka_reorgu = self.blockchain.max_block_index - start + 1
+            if hloubka_reorgu > MAX_REORG_DEPTH:
+                self._abort_fork_sync(
+                    addr,
+                    f"Fork od #{start} by vyžadoval reorg hloubky {hloubka_reorgu} > MAX_REORG_DEPTH ({MAX_REORG_DEPTH}). Žádný postih.",
+                    ban=False)
+                return
+            volno = (MAX_REORG_DEPTH + 1) - (prvni - start)
+            if volno < len(blocks_data):
+                blocks_data = blocks_data[:max(0, volno)]
+                zpracovat_hned = True
+                if not blocks_data:
+                    self.process_sync_buffer()
+                    return
+                last_block_data = blocks_data[-1]
+
+        # OPRAVA A-3 (bajtový strop): drží i tam, kde hloubku spočítat neumíme
+        # (fork_start_index není znám), a chrání flash i při plných blocích.
+        # Serializace se dělá jednou a použije se pro účtování i pro zápis.
+        pripravene = []
+        davka_bajtu = 0
         for bd in blocks_data:
             tx_json = json.dumps(bd['transactions'])
-            c.execute('''
-                INSERT OR REPLACE INTO sync_blocks 
-                (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (bd['index'], bd['timestamp'], tx_json, bd['previous_hash'], bd['target'], bd['nonce'], bd['hash'], bd['merkle_root'], bd.get('version', BLOCK_VERSION), bd.get('chain_id', CHAIN_ID), bd.get('state_root')))
-        conn.commit()
-        conn.close()
+            davka_bajtu += len(tx_json)
+            pripravene.append((bd, tx_json))
+
+        buffer_bajtu = getattr(self, 'sync_buffer_bytes', 0)
+        if buffer_bajtu + davka_bajtu > MAX_SYNC_BUFFER_BYTES:
+            # OPRAVA N-1: plný bajtový strop NENÍ vina protistrany - 63 plných
+            # poctivých bloků ho naplní taky. Místo banu se vezme jen tolik
+            # bloků, kolik se vejde, a zpracuje se, co v bufferu je.
+            vejde_se = []
+            for bd, tx_json in pripravene:
+                if buffer_bajtu + sum(len(t) for _, t in vejde_se) + len(tx_json) > MAX_SYNC_BUFFER_BYTES:
+                    break
+                vejde_se.append((bd, tx_json))
+            if not vejde_se:
+                if self.sync_buffer_tip() is not None:
+                    self.process_sync_buffer()
+                else:
+                    self._abort_fork_sync(addr, "Blok forku se nevejde do MAX_SYNC_BUFFER_BYTES. Žádný postih.", ban=False)
+                return
+            pripravene = vejde_se
+            davka_bajtu = sum(len(t) for _, t in vejde_se)
+            blocks_data = [bd for bd, _ in vejde_se]
+            last_block_data = blocks_data[-1]
+            zpracovat_hned = True
+
+        # OPRAVA L-3: zápis dávky do bufferu je nejfrekventovanější síťová cesta
+        # do SQLite v celém uzlu a spojení tu viselo bez try/finally. Výjimku
+        # samotnou řeší obal _store_fork_batch() (OPRAVA A-2/D-02), ale
+        # deskriptor po ní zůstával otevřený - a při opakovaných pokusech
+        # o fork sync se hromadil.
+        conn = None
+        try:
+            conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            c = conn.cursor()
+            for bd, tx_json in pripravene:
+                c.execute('''
+                    INSERT OR REPLACE INTO sync_blocks 
+                    (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (bd['index'], bd['timestamp'], tx_json, bd['previous_hash'], bd['target'], bd['nonce'], bd['hash'], bd['merkle_root'], bd.get('version', BLOCK_VERSION), bd.get('chain_id', CHAIN_ID), bd.get('state_root')))
+            conn.commit()
+        except Exception:
+            # Buď se zapíše celá dávka, nebo nic - poloviční dávka by v bufferu
+            # udělala díru, kterou process_sync_buffer() vyhodnotí jako výpadek.
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            raise
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        self.sync_buffer_bytes = buffer_bajtu + davka_bajtu
 
         # OPRAVA #6c: watchdog na NEČINNOST - lhůta se obnovuje při každém
         # úspěšném zápisu do bufferu, ne jen jednou na začátku stahování.
         self.fork_sync_start = time.time()
 
         self.add_log(f"{Fore.CYAN}Uloženo {len(blocks_data)} bloků do bufferu (od #{first_block_index} do #{last_block_data['index']}).{Style.RESET_ALL}")
+
+        # OPRAVA N-1: buffer dosáhl stropu (délky ocasu nebo bajtů). Zpracuje
+        # se hned - zbytek větve se po úspěšném reorgu dotáhne jako prosté
+        # pokračování řetězce.
+        if zpracovat_hned:
+            self.process_sync_buffer()
+            return
 
         # OPRAVA #21: pokračování se řídí příznakem od protistrany, ne délkou
         # dávky - ta může být kratší i kvůli bajtovému stropu.
@@ -6183,6 +7895,27 @@ class P2PNode:
         if not isinstance(message['data'], expected):
             self.add_log(f"{Fore.RED}Zpráva {msg_type} od {ip_port} má pole 'data' špatného typu. Odmítnuto.{Style.RESET_ALL}")
             return False
+        if msg_type == 'response_mempool':
+            # OPRAVA G-07: dosud se ověřovalo jen to, že 'data' je SEZNAM, ne
+            # typ jeho prvků. Transaction.from_dict volá na prvku .get(), takže
+            # data=[42] dalo AttributeError a data=[None] taktéž - a ta v except
+            # tuple téhle funkce nebyla. Výjimka propadla až do obecného
+            # except v handle_message(): zpráva sice skončila jako False, ale
+            # zbytek dávky se nezpracoval a v logu to vypadalo jako neočekávaná
+            # chyba, ne jako čisté odmítnutí.
+            # Je to přesně ta kontrola, kterou OPRAVA D-15 zavedla v
+            # Block.from_dict; tady chyběla. Ověřuje se jen TVAR, ne platnost.
+            #
+            # Záměrně JEN pro response_mempool: response_blocks a
+            # response_full_chain si tvar prvků řeší ve vlastní větvi a za vadný
+            # tvar navíc UDĚLUJÍ BAN. Odmítnutí už tady by ten ban obešlo.
+            for polozka in message['data']:
+                if not isinstance(polozka, dict):
+                    self.add_log(
+                        f"{Fore.RED}Zpráva {msg_type} od {ip_port} má v 'data' položku, "
+                        f"která není objekt (je {type(polozka).__name__}). Odmítnuto.{Style.RESET_ALL}"
+                    )
+                    return False
         if msg_type == 'new_peer':
             # tuple(message['data']) níž vyžaduje přesně dvojici (host, port).
             d = message['data']
@@ -6281,7 +8014,14 @@ class P2PNode:
             self.tx_rate_limit[addr[0]] = [t for t in self.tx_rate_limit[addr[0]] if now - t < TX_RATE_WINDOW]
             if len(self.tx_rate_limit[addr[0]]) >= TX_RATE_LIMIT:
                 self.ban_peer(addr[0], "překročen limit transakcí")
-                return
+                # OPRAVA B-4: tahle cesta (a dalších devět odmítavých cest
+                # v tomhle handleru) vracela bare `return`, tedy None.
+                # handle_client_connection() testuje `if accepted is False`,
+                # takže None čítač MAX_UNAUTHENTICATED_MESSAGES NEVYNULOVAL -
+                # on ho rovnou resetoval větví `else`. Uzel, který posílá jen
+                # rate-limitované nebo jinak odmítnuté zprávy, tak spojení nikdy
+                # neztratil a držel nám vlákno zdarma. Odmítnutí = False.
+                return False
             self.tx_rate_limit[addr[0]].append(now)
             
             tx_data = message['data']
@@ -6363,54 +8103,75 @@ class P2PNode:
             elif len(locator_hashes) > MAX_LOCATOR_HASHES:
                 self.add_log(f"{Fore.YELLOW}Locator od {ip_port} má {len(locator_hashes)} hashů, zkracuji na {MAX_LOCATOR_HASHES}.{Style.RESET_ALL}")
                 locator_hashes = locator_hashes[:MAX_LOCATOR_HASHES]
+            # OPRAVA G-08: typ PRVKŮ locatoru se dosud nekontroloval vůbec -
+            # šly rovnou jako parametr do SQLite. SQL injection to není (dotaz
+            # je parametrizovaný), ale locator_hashes=[{'a': 1}] vyhodilo
+            # sqlite3.ProgrammingError: Error binding parameter 1: type 'dict'
+            # is not supported, a ta přeskočila conn.close() na konci větve.
+            # Spojení se pak uzavřelo až při garbage collection - spoléhání na
+            # implementační detail CPythonu v cestě dosažitelné ze sítě.
+            # Prvek, který nemá tvar hashe, v DB stejně nic najít nemůže,
+            # takže se tiše zahodí.
+            locator_hashes = [h for h in locator_hashes
+                              if isinstance(h, str) and len(h) == 64]
             start_index = message['data'].get('start_index', 0)
-            if not isinstance(start_index, int) or start_index < 0:
+            # isinstance(True, int) je True, takže bool vylučujeme zvlášť -
+            # stejný důvod jako u _check_uint v Transaction.from_dict.
+            if isinstance(start_index, bool) or not isinstance(start_index, int) or start_index < 0:
                 start_index = 0
             conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            c = conn.cursor()
+            # OPRAVA G-08: tělo obalené try/finally. Dřív byl conn.close()
+            # obyčejný řádek na konci větve, takže ho každá výjimka přeskočila.
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                c = conn.cursor()
             
-            if locator_hashes:
-                for h in locator_hashes:
-                    c.execute("SELECT block_index FROM blocks WHERE block_hash = ?", (h,))
-                    row = c.fetchone()
-                    if row:
-                        start_index = row[0] + 1
-                        break
+                if locator_hashes:
+                    for h in locator_hashes:
+                        c.execute("SELECT block_index FROM blocks WHERE block_hash = ?", (h,))
+                        row = c.fetchone()
+                        if row:
+                            start_index = row[0] + 1
+                            break
                         
-            # OPRAVA #21: +1 řádek navíc, abychom poznali, že další bloky existují,
-            # aniž bychom je posílali.
-            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ? ORDER BY block_index LIMIT ?", (start_index, SYNC_BATCH_SIZE + 1))
-            rows = c.fetchall()
-            blocks_data = []
-            batch_bytes = 0
-            has_more = False
-            for i, row in enumerate(rows):
-                if i >= SYNC_BATCH_SIZE:
-                    has_more = True
-                    break
-                # Odhad velikosti na drátě: transakce jsou zdaleka největší část,
-                # zbytek hlavičky je pár set bajtů. Přesnost tu není potřeba,
-                # jde o strop s rezervou.
-                row_bytes = len(row[2]) + 512
-                if blocks_data and batch_bytes + row_bytes > MAX_BATCH_BYTES:
-                    # Aspoň jeden blok pošleme vždy, jinak by se sync zasekl.
-                    has_more = True
-                    break
-                batch_bytes += row_bytes
-                blocks_data.append({
-                    'index': row[0],
-                    'timestamp': row[1],
-                    'transactions': json.loads(row[2]),
-                    'previous_hash': row[3],
-                    'target': row[4],
-                    'nonce': row[5],
-                    'hash': row[6],
-                    'merkle_root': row[7],
-                    'version': row[8],
-                    'chain_id': row[9], 'state_root': row[10]
-                })
-            conn.close()
+                # OPRAVA #21: +1 řádek navíc, abychom poznali, že další bloky existují,
+                # aniž bychom je posílali.
+                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index >= ? ORDER BY block_index LIMIT ?", (start_index, SYNC_BATCH_SIZE + 1))
+                rows = c.fetchall()
+                blocks_data = []
+                batch_bytes = 0
+                has_more = False
+                for i, row in enumerate(rows):
+                    if i >= SYNC_BATCH_SIZE:
+                        has_more = True
+                        break
+                    # Odhad velikosti na drátě: transakce jsou zdaleka největší část,
+                    # zbytek hlavičky je pár set bajtů. Přesnost tu není potřeba,
+                    # jde o strop s rezervou.
+                    row_bytes = len(row[2]) + 512
+                    if blocks_data and batch_bytes + row_bytes > MAX_BATCH_BYTES:
+                        # Aspoň jeden blok pošleme vždy, jinak by se sync zasekl.
+                        has_more = True
+                        break
+                    batch_bytes += row_bytes
+                    blocks_data.append({
+                        'index': row[0],
+                        'timestamp': row[1],
+                        'transactions': json.loads(row[2]),
+                        'previous_hash': row[3],
+                        'target': row[4],
+                        'nonce': row[5],
+                        'hash': row[6],
+                        'merkle_root': row[7],
+                        'version': row[8],
+                        'chain_id': row[9], 'state_root': row[10]
+                    })
+            finally:
+                # OPRAVA G-08: spojení se zavře i při výjimce.
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
             
             # OPRAVA #21: 'has_more' je nutné, protože s bajtovým stropem už
             # kratší dávka neznamená "konec řetězce". Bez toho by si příjemce
@@ -6432,13 +8193,13 @@ class P2PNode:
                 self.add_log(f"{Fore.RED}Dávka od {ip_port} není seznam bloků, zahazuji.{Style.RESET_ALL}")
                 if addr:
                     self.ban_peer(addr[0], "response_blocks se špatným tvarem dat", BAN_DURATION_PROTOCOL)
-                return
+                return False
             for bd in blocks_data:
                 if not self._valid_block_dict(bd):
                     self.add_log(f"{Fore.RED}Dávka od {ip_port} obsahuje blok se špatným tvarem, zahazuji.{Style.RESET_ALL}")
                     if addr:
                         self.ban_peer(addr[0], "blok se špatným tvarem v response_blocks", BAN_DURATION_PROTOCOL)
-                    return
+                    return False
 
             # OPRAVA #21: příznak od protistrany je autoritativní. Uzel bez téhle
             # opravy ho neposílá, takže padáme zpět na původní test délky dávky.
@@ -6448,6 +8209,36 @@ class P2PNode:
             
             if not blocks_data:
                 if getattr(self, 'syncing_fork', False):
+                    # OPRAVA H-1: tahle větev běžela DŘÍV, než se kdokoli podíval
+                    # na fork_peer_ip, takže obcházela pravidlo ETAPY 3 ("fork se
+                    # stahuje od jednoho uzlu, dávky od ostatních se ignorují"),
+                    # které se vynucuje až v _store_fork_batch_inner().
+                    #
+                    # Cena útoku byly dvě zprávy: handshake (bez PoW, z libovolné
+                    # IP) a 39bajtová {"type":"response_blocks","data":[]}.
+                    # Následek: process_sync_buffer() doběhl nad NEÚPLNÝM bufferem,
+                    # replace_chain() ho odmítl (ještě nemá převahu) a
+                    # discard_sync_buffer() ho smazal - u hlubokého reorgu se tím
+                    # zahodí stovky stažených bloků. Horší je druhý krok: navazující
+                    # dávka od POCTIVÉHO zdroje, která už byla na drátě, dorazí do
+                    # uzlu bez bufferu i bez fork_start_index, takže resuming je
+                    # False, kontrola rodiče v blockchain.db selže (rodič ležel jen
+                    # v bufferu) a spustí se větev "long-range útok" s banem na 24 h.
+                    # Uzel si tak jeden po druhém zabanuje vlastní synchronizační
+                    # zdroje - tedy eclipse, přesně failure mode, proti kterému míří
+                    # OPRAVA #1, ETAPA 3 i D-17.
+                    #
+                    # Prázdná dávka je legitimní signál "nic dalšího nemám", ale
+                    # jen od toho, kdo fork dodává. Od kohokoli jiného se ignoruje.
+                    peer_ip = addr[0] if addr else None
+                    if self.fork_peer_ip is not None and peer_ip != self.fork_peer_ip:
+                        self.add_log(f"{Fore.YELLOW}Prázdná dávka od {ip_port} ignorována: "
+                                     f"fork se stahuje z {self.fork_peer_ip}.{Style.RESET_ALL}")
+                        # False, ne None: odmítnutá zpráva se MÁ započítat do
+                        # MAX_UNAUTHENTICATED_MESSAGES. Původní holé `return`
+                        # vracelo None, takže handle_client_connection() čítač
+                        # vynuloval a útok šel opakovat donekonečna po jednom spojení.
+                        return False
                     self.process_sync_buffer()
                 return
                 
@@ -6580,12 +8371,25 @@ class P2PNode:
 
                     self.add_log(f"{Fore.YELLOW}Detekován fork (od bloku #{first_block_index}). Zahajuji ukládání do dočasného bufferu...{Style.RESET_ALL}")
                     
-                    conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-                    conn.execute("PRAGMA journal_mode=WAL;")
-                    c = conn.cursor()
-                    c.execute("SELECT block_hash FROM blocks WHERE block_index = ?", (first_block_index - 1,))
-                    row = c.fetchone()
-                    conn.close()
+                    # OPRAVA L-3: spojení bez try/finally na cestě přímo
+                    # dosažitelné ze sítě. Selhání dotazu (OperationalError,
+                    # DatabaseError) tu nechalo deskriptor viset a výjimka
+                    # odešla do obecného except v handle_message(), kde se
+                    # z ní stalo jen "zpráva zahozena" - tedy tichý únik,
+                    # opakovatelný jednou zprávou na spojení.
+                    conn = None
+                    try:
+                        conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+                        conn.execute("PRAGMA journal_mode=WAL;")
+                        c = conn.cursor()
+                        c.execute("SELECT block_hash FROM blocks WHERE block_index = ?", (first_block_index - 1,))
+                        row = c.fetchone()
+                    finally:
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
                     
                     if (not row or row[0] != first_block_data['previous_hash']) and first_block_index != 0:
                         if self.blockchain.max_block_index == 0:
@@ -6602,16 +8406,54 @@ class P2PNode:
                                 self.add_log(f"{Fore.YELLOW}Fallback na full sync zrušen: naslouchací port uzlu {ip_port} není znám.{Style.RESET_ALL}")
                             return
                         else:
-                            self.add_log(f"{Fore.RED}Varování: Detekován pokus o hluboký reorg / long-range útok. Fallback na fullsync zamítnut.{Style.RESET_ALL}")
-                            if addr:
-                                self.ban_peer(addr[0], "pokus o hluboký reorg / long-range útok", BAN_DURATION_PROTOCOL)
-                            self.syncing_fork = False
-                            self.fork_start_index = None
-                            self.fork_sync_start = 0
-                            return
+                            # OPRAVA G-09: tady se dřív tři příznaky uklízely
+                            # ručně (syncing_fork, fork_start_index,
+                            # fork_sync_start) a ČTVRTÝ - fork_peer_ip - zůstal
+                            # viset. Nevolala se ani discard_sync_buffer(), takže
+                            # rozpracovaný buffer zůstal na disku i s napočítaným
+                            # sync_buffer_bytes. Úklid proto vede přes
+                            # _abort_fork_sync(), jediné místo, kde je kompletní.
+                            #
+                            # OPRAVA P-1: ...ale BEZ BANU a bez ničení cizí práce.
+                            #
+                            # Podmínka výše zní jen "rodiče prvního bloku dávky
+                            # nemám v blockchain.db". To není důkaz viny - nastane
+                            # to i zcela legitimně:
+                            #   - rodič leží v sync bufferu, ne v DB (to je základ
+                            #     útoku H-1),
+                            #   - protistrana odpověděla na locator, který jsme
+                            #     mezitím přerostli,
+                            #   - protistrana je na skutečně jiné větvi, hlubší,
+                            #     než kam sahá naše DB.
+                            # Postih přitom býval nejtvrdší, jaký kód zná: 24 hodin
+                            # za jedinou dávku. Ban patří k PROKAZATELNÉMU rozporu
+                            # (nesouvislá dávka, nesedící previous_hash uvnitř
+                            # dávky) - stejnou úvahu dělá process_sync_buffer(),
+                            # kde se díra v indexech záměrně nebanuje ("poctivý
+                            # uzel za výpadek sítě nemůže").
+                            #
+                            # Druhá půlka opravy: leží-li v bufferu rozpracovaný
+                            # fork, NESAHÁME na něj. Po FORK_SYNC_IDLE_TIMEOUT je
+                            # syncing_fork False a buffer čeká na _resume_fork_sync();
+                            # nechat libovolný uzel tenhle buffer smazat jednou
+                            # nenavazující dávkou je táž ztráta práce jako u H-1,
+                            # jen jinými dveřmi. Dávku tedy zahodíme a dál se
+                            # nestane nic.
+                            self.add_log(f"{Fore.YELLOW}Dávka od {ip_port} začíná blokem #{first_block_index}, jehož rodiče nemáme v DB. Fallback na fullsync zamítnut, dávku zahazuji.{Style.RESET_ALL}")
+                            if self.sync_buffer_tip() is not None:
+                                self.add_log(f"{Fore.CYAN}Rozpracovaný fork buffer ponechávám (nepatří téhle dávce).{Style.RESET_ALL}")
+                            else:
+                                self._abort_fork_sync(
+                                    addr,
+                                    "dávka nenavazuje na naši DB (neznámý rodič). Nic prokázáno není, žádný postih.",
+                                    ban=False)
+                            # False, ne None: dávku jsme odmítli, ať se započítá
+                            # do MAX_UNAUTHENTICATED_MESSAGES.
+                            return False
 
                     # Nový fork - buffer po případném starém pokusu zahodíme.
                     self.discard_sync_buffer()
+                    self.fork_last_ok = False
                     self.syncing_fork = True
                     self.fork_start_index = first_block_index
                     self.fork_sync_start = time.time()
@@ -6621,31 +8463,41 @@ class P2PNode:
                 return self._store_fork_batch(blocks_data, first_block_index, last_block_data, addr, ip_port, batch_has_more, driven)
 
         elif msg_type == 'request_full_chain':
-            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            c = conn.cursor()
-            # OPRAVA #21: stejný bajtový strop jako u request_blocks - i tady by
-            # 100 plných bloků přeteklo MAX_MESSAGE_SIZE a vedlo na ban poctivého uzlu.
-            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks ORDER BY block_index LIMIT ?", (SYNC_BATCH_SIZE,))
+            # OPRAVA L-3: týž vzorec jako u request_blocks, který řešila OPRAVA
+            # G-08 - jen se sem tehdy nedostala. json.loads() nad poškozeným
+            # řádkem vyhodí uvnitř smyčky a conn.close() na konci se přeskočí.
+            conn = None
             chain_data = []
             full_chain_bytes = 0
-            for row in c:
-                if chain_data and full_chain_bytes + len(row[2]) + 512 > MAX_BATCH_BYTES:
-                    break
-                full_chain_bytes += len(row[2]) + 512
-                chain_data.append({
-                    'index': row[0],
-                    'timestamp': row[1],
-                    'transactions': json.loads(row[2]),
-                    'previous_hash': row[3],
-                    'target': row[4],
-                    'nonce': row[5],
-                    'hash': row[6],
-                    'merkle_root': row[7],
-                    'version': row[8],
-                    'chain_id': row[9], 'state_root': row[10]
-                })
-            conn.close()
+            try:
+                conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                c = conn.cursor()
+                # OPRAVA #21: stejný bajtový strop jako u request_blocks - i tady by
+                # 100 plných bloků přeteklo MAX_MESSAGE_SIZE a vedlo na ban poctivého uzlu.
+                c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks ORDER BY block_index LIMIT ?", (SYNC_BATCH_SIZE,))
+                for row in c:
+                    if chain_data and full_chain_bytes + len(row[2]) + 512 > MAX_BATCH_BYTES:
+                        break
+                    full_chain_bytes += len(row[2]) + 512
+                    chain_data.append({
+                        'index': row[0],
+                        'timestamp': row[1],
+                        'transactions': json.loads(row[2]),
+                        'previous_hash': row[3],
+                        'target': row[4],
+                        'nonce': row[5],
+                        'hash': row[6],
+                        'merkle_root': row[7],
+                        'version': row[8],
+                        'chain_id': row[9], 'state_root': row[10]
+                    })
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
             response = {'type': 'response_full_chain', 'data': chain_data}
             # OPRAVA #9: broadcast fallback zrušen i tady - tahle odpověď je ze
             # všech nejdražší.
@@ -6655,7 +8507,7 @@ class P2PNode:
         elif msg_type == 'response_full_chain':
             if not getattr(self, 'awaiting_full_chain', False):
                 self.add_log(f"{Fore.YELLOW}Přijat nevyžádaný response_full_chain od uzlu {ip_port}, ignoruji.{Style.RESET_ALL}")
-                return
+                return False
             self.awaiting_full_chain = False
             new_chain_data = message.get('data', [])
             
@@ -6686,12 +8538,12 @@ class P2PNode:
             except (TypeError, ValueError):
                 if addr:
                     self.ban_peer(addr[0], "neserializovatelný blok v new_block", BAN_DURATION_PROTOCOL)
-                return
+                return False
             if raw_size > MAX_BLOCK_SIZE_BYTES:
                 self.add_log(f"{Fore.RED}Blok od {ip_port} překračuje MAX_BLOCK_SIZE ({raw_size} B), zahozeno.{Style.RESET_ALL}")
                 if addr:
                     self.ban_peer(addr[0], "blok překračující MAX_BLOCK_SIZE", BAN_DURATION_PROTOCOL)
-                return
+                return False
 
             # OPRAVA D-07: from_dict nově garantuje ValueError i pro target mimo
             # rozsah (dřív unikla OverflowError až do handle_client_connection).
@@ -6701,7 +8553,7 @@ class P2PNode:
                 self.add_log(f"{Fore.RED}Nečitelný blok od {ip_port}: {e}{Style.RESET_ALL}")
                 if addr:
                     self.ban_peer(addr[0], "nečitelný blok v new_block", BAN_DURATION_PROTOCOL)
-                return
+                return False
 
             # Target nesmí být volnější než síťové minimum (FIXED_TARGET je
             # počáteční, tedy nejsnazší povolená obtížnost). Teprve tím se
@@ -6711,13 +8563,13 @@ class P2PNode:
                 self.add_log(f"{Fore.RED}Blok od {ip_port} deklaruje target snazší než síťové minimum, zahozeno.{Style.RESET_ALL}")
                 if addr:
                     self.ban_peer(addr[0], "blok s targetem snazším než síťové minimum", BAN_DURATION_PROTOCOL)
-                return
+                return False
 
             # Rychlá validace PoW před složitějším zpracováním
             quick_hash = new_block.compute_hash()
             if quick_hash != new_block.hash or not Blockchain.meets_difficulty(quick_hash, new_block.target):
                 self.add_log(f"{Fore.RED}Přijatý blok neprošel rychlou kontrolou PoW, zahozeno.{Style.RESET_ALL}")
-                return
+                return False
                 
             if self.blockchain.add_block(new_block, new_block.hash):
                 # Zastavíme těžení až po úspěšném ověření a zapsání bloku do DB uvnitř add_block
@@ -6729,12 +8581,23 @@ class P2PNode:
                 self.add_log(f"{Fore.YELLOW}Mempool byl bezpečně aktualizován.{Style.RESET_ALL}")
                 save_data(self.blockchain, wallets, password, self.peers)
             else:
-                conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-                conn.execute("PRAGMA journal_mode=WAL;")
-                c = conn.cursor()
-                c.execute("SELECT 1 FROM blocks WHERE block_hash = ?", (new_block.previous_hash,))
-                exists = c.fetchone() is not None
-                conn.close()
+                # OPRAVA L-3: spojení bez try/finally na síťové cestě. json se
+                # tu sice neparsuje, ale sqlite3.OperationalError ("database is
+                # locked" při souběžném zápisu bloku) je běžný stav - a odsud
+                # vedla rovnou k netěsnému spojení.
+                conn = None
+                try:
+                    conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    c = conn.cursor()
+                    c.execute("SELECT 1 FROM blocks WHERE block_hash = ?", (new_block.previous_hash,))
+                    exists = c.fetchone() is not None
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
                 
                 if exists:
                     request = {'type': 'request_chain_info'}
@@ -6829,7 +8692,22 @@ class P2PNode:
                                       and new_peer_addr != (self.host, self.port)
                                       and self._can_admit_locked(new_peer_addr)[0])
                 if should_connect:
-                    self.connect_to_peer(new_peer_addr)
+                    # OPRAVA N-10: každá zpráva new_peer dřív OKAMŽITĚ spustila
+                    # odchozí spojení na IP:port podle odesílatele. Neúspěšné
+                    # spojení se do tabulky nezapíše, takže šlo opakovat bez
+                    # konce - uzel sloužil jako skener portů / reflektor
+                    # handshaků (test t_bug10_new_peer.py: 60 zpráv = 60 pokusů).
+                    # Objevování peerů nespěchá: globální rozpočet 5 pokusů
+                    # najednou a pak 1 za 30 s.
+                    with self.rate_lock:
+                        povoleno = self._take_token(
+                            self.__dict__.setdefault('new_peer_bucket', {}), '*',
+                            NEW_PEER_CONNECT_CAPACITY, NEW_PEER_CONNECT_REFILL_PER_SECOND, time.time())
+                    if povoleno:
+                        self.connect_to_peer(new_peer_addr)
+                    else:
+                        self.add_log(f"{Fore.YELLOW}Zpráva 'new_peer' od {ip_port}: vyčerpán rozpočet na nová spojení, {new_peer_addr[0]} se nezkouší.{Style.RESET_ALL}")
+                        return False
             else:
                 self.add_log(f"{Fore.YELLOW}Zpráva 'new_peer' ignorována: Adresa {new_peer_addr[0]} není povolená veřejná IP.{Style.RESET_ALL}")
                 
@@ -6955,12 +8833,30 @@ class P2PNode:
                     return False
 
                 if manual:
+                    # OPRAVA G-10: při manual=True se _can_admit_locked() nevolal
+                    # vůbec, takže self.peers i protected_peers mohly růst BEZ
+                    # JAKÉHOKOLI stropu. Záměr je legitimní (ruční zadání je
+                    # záchranná cesta z eclipse útoku a nesmí ho zablokovat plná
+                    # tabulka), ale horní mez chyběla úplně. Nově se rezerva
+                    # kvantifikuje: ručně smí tabulka přerůst nejvýš o
+                    # PROTECTED_PEER_SLOTS nad MAX_PEERS.
                     with self.peers_lock:
-                        self.protected_peers.add(peer_addr)
-                        if peer_addr not in self.peers:
-                            self.peers.append(peer_addr)
-                        self.peer_last_seen[peer_addr] = get_time()
-                    admitted = True
+                        if peer_addr in self.peers or len(self.peers) < MAX_MANUAL_PEERS_TOTAL:
+                            self.protected_peers.add(peer_addr)
+                            if peer_addr not in self.peers:
+                                self.peers.append(peer_addr)
+                            self.peer_last_seen[peer_addr] = get_time()
+                            admitted = True
+                        else:
+                            admitted = False
+                    if not admitted:
+                        self.add_log(
+                            f"{Fore.YELLOW}Uzel {peer_addr[0]}:{peer_addr[1]} nelze přidat ručně: "
+                            f"tabulka má {MAX_MANUAL_PEERS_TOTAL} peerů, což je strop i pro ruční "
+                            f"zadání. Odeberte nejdřív jiný uzel (menu 17).{Style.RESET_ALL}"
+                        )
+                        client_socket.close()
+                        return False
                 else:
                     admitted = self.try_admit_peer(peer_addr)
 
@@ -7121,6 +9017,12 @@ class P2PNode:
                         self.discard_sync_buffer()
                         
             self.blockchain.cleanup_mempool()
+            # OPRAVA G-06: úklid blacklistu jede ve stejném rytmu jako úklid
+            # mempoolu. Obojí jsou struktury, které rostou z přijatých dat.
+            # Vlastní perioda (BLACKLIST_PRUNE_INTERVAL) uvnitř metody hlídá,
+            # aby se slovník neprocházel zbytečně každých 10 s.
+            self.prune_blacklist()
+            self.flush_blacklist()
             with self.peers_lock:
                 has_peers = bool(self.peers)
                 
@@ -7179,8 +9081,10 @@ def is_valid_address(address):
 
 def show_p2p_log():
     print(f"\n{Fore.YELLOW}--- Log P2P sítě (stiskněte Enter pro návrat) ---{Style.RESET_ALL}")
-    while not p2p_node.p2p_log.empty():
-        print(p2p_node.p2p_log.get())
+    # OPRAVA G-05: log je nově kruhový buffer, ne Queue. drain_log() ho
+    # atomicky vybere a vyprázdní.
+    for line in p2p_node.drain_log():
+        print(line)
     input()
 
 def get_mempool_size_bytes(unconfirmed_transactions):
@@ -7230,7 +9134,17 @@ def verify_genesis_block(chain):
         print(f"{Fore.RED}Chyba: Genesis blok byl změněn (timestamp nebo hash nesouhlasí)! Program se ukončuje.{Style.RESET_ALL}")
         sys.exit(1)
 
-def enforce_mobile_environment():
+def enforce_mobile_environment(allow_any=False):
+    # OPRAVA B-5: jako bezpečnostní opatření tahle kontrola nefunguje - obejde
+    # se nastavením TERMUX_VERSION v prostředí, takže brání omylu, ne útočníkovi.
+    # Zároveň znemožňovala jakékoli CI a regresní testy na běžném stroji.
+    # Přepínač --allow-any-platform ji vypne výslovně a hlasitě; volá se
+    # z if __name__ == "__main__", ne z main(), aby šel modul importovat
+    # a testovat bez sys.exit(1).
+    if allow_any:
+        print(f"{Fore.YELLOW}Upozornění: kontrola prostředí přeskočena (--allow-any-platform).{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Uzel běží mimo podporovanou platformu (Termux, ARM/AArch64). Určeno pro testy, ne pro provoz.{Style.RESET_ALL}")
+        return
     machine = platform.machine().lower()
     is_arm = 'arm' in machine or 'aarch' in machine
     is_termux = 'TERMUX_VERSION' in os.environ or '/com.termux/' in os.environ.get('PREFIX', '')
@@ -7269,7 +9183,8 @@ def enforce_mobile_environment():
         pass
 
 def main():
-    enforce_mobile_environment()
+    # OPRAVA B-5: volání enforce_mobile_environment() se přesunulo do
+    # if __name__ == "__main__" níže.
     global wallets
     global p2p_node
     global password
@@ -7364,7 +9279,7 @@ def main():
                                 print(f"  Částka: {Fore.RED}-{format(tx_amount_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                                 print(f"  Poplatek: {Fore.RED}-{format(tx_fee_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                                 print(f"  TX ID: {tx.tx_id}")
-                                print(f"  --------------------")
+                                print("  --------------------")
                                 
                         if pending_incoming:
                             print(f" Pending (+): {Fore.GREEN}+{format(pending_incoming_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
@@ -7374,21 +9289,21 @@ def main():
                                 print(f"  Částka: {Fore.GREEN}+{format(tx_amount_dec, f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                                 print(f"  Poplatek: {Fore.YELLOW}{format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                                 print(f"  TX ID: {tx.tx_id}")
-                                print(f"  --------------------")
+                                print("  --------------------")
                         print("-" * 40)
                         
             elif choice == "2":
                 if not p2p_node.get_online_peers():
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Vytvoření transakce není možné. Musíte být připojen k alespoň jednomu dalšímu uzlu.")
                     continue
-                from_address = input(f"Zadejte ADRESU peněženky odesílatele: ").strip()
+                from_address = input("Zadejte ADRESU peněženky odesílatele: ").strip()
                 if len(from_address) >= 3:
                     from_address = from_address[:3].upper() + from_address[3:].lower()
                 if from_address not in wallets:
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Peněženka s adresou '{from_address}' neexistuje. Nejdříve ji vytvořte nebo importujte.")
                     continue
                     
-                to_address = input(f"Zadejte ADRESU příjemce: ").strip()
+                to_address = input("Zadejte ADRESU příjemce: ").strip()
                 if len(to_address) >= 3:
                     to_address = to_address[:3].upper() + to_address[3:].lower()
                 if not is_valid_address(to_address):
@@ -7398,7 +9313,7 @@ def main():
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nelze posílat peníze na stejnou adresu.")
                     continue
                     
-                amount_str = input(f"Zadejte částku: ").strip()
+                amount_str = input("Zadejte částku: ").strip()
                 amount_str = amount_str.replace(',', '.')
                 parts = amount_str.split('.')
                 if len(parts) > 2 or not parts[0].isdigit() or (len(parts) == 2 and (not parts[1].isdigit() or len(parts[1]) > DECIMALS)):
@@ -7409,7 +9324,7 @@ def main():
                     amount_decimal = Decimal(amount_str)
                     amount_in_decimal = int(amount_decimal * (10 ** DECIMALS))
                     if amount_in_decimal < MIN_TX_AMOUNT:
-                        print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Částka transakce je příliš malá. Minimální částka je {format(MIN_TX_AMOUNT / (10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}.")
+                        print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Částka transakce je příliš malá. Minimální částka je {format(Decimal(MIN_TX_AMOUNT) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}.")
                         continue
                 except Exception:
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Částka musí být platné číslo.")
@@ -7424,7 +9339,9 @@ def main():
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nedostatečný zůstatek pro tuto částku (včetně min. poplatku). K dispozici: {format(Decimal(current_available_balance) / Decimal(10**DECIMALS), f'.{DECIMALS}f')} {TICKER}")
                     continue
                     
-                fee_str = input(f"Zadejte poplatek ({format(Decimal(TX_FEE_MIN)/(10**DECIMALS), f'.{DECIMALS}f')}-{format(Decimal(TX_FEE_MAX)/(10**DECIMALS), f'.{DECIMALS}f')} {TICKER}, prázdné pro {format(Decimal(TX_FEE_MIN)/(10**DECIMALS), f'.{DECIMALS}f')}): ").strip()
+                # ZMĚNA 1: prompt už neukazuje rozsah min-max, protože horní mez
+                # poplatku neexistuje. Zobrazuje se jen minimum.
+                fee_str = input(f"Zadejte poplatek (min. {format(Decimal(TX_FEE_MIN)/(10**DECIMALS), f'.{DECIMALS}f')} {TICKER}, prázdné pro {format(Decimal(TX_FEE_MIN)/(10**DECIMALS), f'.{DECIMALS}f')}): ").strip()
                 if fee_str == "":
                     fee = TX_FEE_MIN
                 else:
@@ -7436,12 +9353,25 @@ def main():
                     try:
                         fee_decimal = Decimal(fee_str)
                         fee = int(fee_decimal * (10 ** DECIMALS))
-                        if TX_FEE_MIN > fee or fee > TX_FEE_MAX:
-                            print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Poplatek za transakci je mimo povolený rozsah.")
+                        # ZMĚNA 1: kontroluje se jen dolní mez (fee >= TX_FEE_MIN).
+                        if fee < TX_FEE_MIN:
+                            print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Poplatek za transakci je nižší než minimum ({format(Decimal(TX_FEE_MIN) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}).")
                             continue
                     except Exception:
                         print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný formát poplatku.")
                         continue
+
+                # ZMĚNA 1: poplatek už nemá horní mez, shora ho omezuje jen
+                # dostupný zůstatek. Kontrola výše pokrývala jen částku +
+                # MINIMÁLNÍ poplatek; tahle pokrývá částku + ZADANÝ poplatek,
+                # takže se uživatel nedostane k potvrzení transakce, kterou by
+                # add_transaction() stejně odmítla. Zároveň to drží poplatek pod
+                # rozsahem uint64, do kterého ho balí get_signing_data() - bez
+                # téhle kontroly by nesmyslně vysoký poplatek shodil sestavení
+                # transakce na struct.error.
+                if current_available_balance < amount_in_decimal + fee:
+                    print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nedostatečný zůstatek pro tuto částku včetně zadaného poplatku. K dispozici: {format(Decimal(current_available_balance) / Decimal(10**DECIMALS), f'.{DECIMALS}f')} {TICKER}")
+                    continue
                         
                 with droid_chain.lock:
                     from_wallet = wallets[from_address]
@@ -7469,7 +9399,59 @@ def main():
                     if tx.from_address != "COINBASE" and any(t.nonce == tx.nonce and t.from_address == tx.from_address for t in droid_chain.unconfirmed_transactions):
                         print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Duplicitní nonce {tx.nonce} pro adresu {tx.from_address} po vytvoření. Transakce odmítnuta.")
                         continue
-                        
+
+                # ZMĚNA 1 (D, E): transakce je sestavená a podepsaná, ale do
+                # mempoolu ani do P2P sítě se zatím NEDOSTALA. Odešle se až po
+                # výslovném potvrzení "a".
+                #
+                # Dotaz na potvrzení běží záměrně MIMO droid_chain.lock. Čekání
+                # na uživatele může trvat libovolně dlouho a po celou dobu by
+                # P2P vlákna nemohla přijímat transakce ani bloky - add_block()
+                # se o zámek pokusí jen ADD_BLOCK_LOCK_RETRIES krát po
+                # ADD_BLOCK_LOCK_TIMEOUT sekundách a pak platný blok zahodí.
+                # Bezpečnost tím netrpí: add_transaction() po potvrzení ověří
+                # transakci znovu proti tehdy aktuálnímu stavu (nonce, zůstatek,
+                # duplicity) a když se mezitím něco změnilo, transakci odmítne.
+                print(f"\n{Fore.YELLOW}--- Shrnutí transakce ---{Style.RESET_ALL}")
+                print(f" Odesílatel: {Fore.CYAN}{tx.from_address}{Style.RESET_ALL}")
+                print(f" Příjemce: {Fore.CYAN}{tx.to_address}{Style.RESET_ALL}")
+                print(f" Částka: {Fore.MAGENTA}{format(Decimal(tx.amount) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                print(f" Poplatek: {Fore.MAGENTA}{format(Decimal(tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                print(f" Celkem (částka + poplatek): {Fore.MAGENTA}{format(Decimal(tx.amount + tx.fee) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
+                print(f" Nonce: {Fore.MAGENTA}{tx.nonce}{Style.RESET_ALL}")
+                print(f" TX ID: {Fore.MAGENTA}{tx.tx_id}{Style.RESET_ALL}")
+
+                # ZMĚNA 1 (E): varování při poplatku 1 DRX nebo vyšším. Práh je
+                # čistě upozornění v rozhraní, NE limit - poplatek nad ním jde
+                # po potvrzení odeslat úplně stejně jako jakýkoli jiný.
+                prah_varovani_poplatku = 1 * (10 ** DECIMALS)
+                if tx.fee >= prah_varovani_poplatku:
+                    print(f"\n{Fore.RED}VAROVÁNÍ! TRANSAKČNÍ POPLATEK BYL NASTAVEN NA HODNOTU 1 {TICKER} NEBO VYŠŠÍ.{Style.RESET_ALL}")
+
+                # ZMĚNA 1 (D): odešle se výhradně po odpovědi "a". Odpověď "n"
+                # transakci zruší; na cokoli jiného se dotaz zopakuje, takže
+                # překlep ani omylem stisknutý Enter transakci neodešle
+                # a zároveň ji nezahodí. EOF na vstupu znamená zrušení.
+                potvrzeno = False
+                while True:
+                    try:
+                        odpoved = input(f"\n{Fore.YELLOW}Jste si jistí že chcete tuto transakci odeslat? (a/n): {Style.RESET_ALL}").strip().lower()
+                    except EOFError:
+                        odpoved = 'n'
+                    if odpoved == 'a':
+                        potvrzeno = True
+                        break
+                    if odpoved == 'n':
+                        break
+                    print(f"{Fore.RED}Neplatná odpověď.{Style.RESET_ALL} Zadejte 'a' pro odeslání transakce, nebo 'n' pro její zrušení.")
+
+                if not potvrzeno:
+                    # Transakce existuje jen v lokální proměnné: nic se nepřidalo
+                    # do mempoolu, neuložilo do mempool.db ani neodeslalo peerům.
+                    print(f"{Fore.YELLOW}Transakce byla zrušena. Nebyla přidána do mempoolu ani odeslána do sítě.{Style.RESET_ALL}")
+                    continue
+
+                with droid_chain.lock:
                     if droid_chain.add_transaction(tx):
                         print(f"{Fore.GREEN}Transakce byla úspěšně přidána do fronty.{Style.RESET_ALL}")
                         print(f" TX ID: {Fore.MAGENTA}{tx.tx_id}{Style.RESET_ALL}")
@@ -7477,6 +9459,11 @@ def main():
                         print(f"{Fore.GREEN}Transakce byla podepsána privátním klíčem.{Style.RESET_ALL}")
                         save_mempool(droid_chain.unconfirmed_transactions)
                         p2p_node.send_data_to_peers({'type': 'transaction', 'data': tx.to_dict()})
+                    else:
+                        # Důvod vypsala add_transaction(). Typicky se během
+                        # potvrzování změnil stav (např. dorazila jiná transakce
+                        # téže adresy se stejnou nonce).
+                        print(f"{Fore.RED}Transakce nebyla přidána do mempoolu ani odeslána do sítě. Vytvořte ji prosím znovu.{Style.RESET_ALL}")
                         
             elif choice == "3":
                 print(f"\n{Fore.YELLOW}--- Mempool (nepotvrzené transakce) ---{Style.RESET_ALL}")
@@ -7576,7 +9563,7 @@ def main():
                 save_data(droid_chain, wallets, password, p2p_node.peers, save_wallets=True)
                 
             elif choice == "7":
-                key_hex = input(f"Zadejte privátní klíč (hex): ")
+                key_hex = input("Zadejte privátní klíč (hex): ")
                 if not is_valid_private_key(key_hex):
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný formát privátního klíče.")
                     continue
@@ -7590,7 +9577,7 @@ def main():
                 save_data(droid_chain, wallets, password, p2p_node.peers, save_wallets=True)
                 
             elif choice == "8":
-                address = input(f"Zadejte ADRESU peněženky, jejíž klíč chcete exportovat: ")
+                address = input("Zadejte ADRESU peněženky, jejíž klíč chcete exportovat: ")
                 if address in wallets:
                     bezp_otazka = input(f"{Fore.YELLOW}Opravdu si přejete exportovat privátní klíč? (a/n): {Style.RESET_ALL}").strip().lower()
                     if bezp_otazka == 'a':
@@ -7602,7 +9589,7 @@ def main():
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Peněženka s adresou '{address}' neexistuje.")
                     
             elif choice == "9":
-                address_to_delete = input(f"Zadejte ADRESU peněženky, kterou chcete smazat: ")
+                address_to_delete = input("Zadejte ADRESU peněženky, kterou chcete smazat: ")
                 if address_to_delete in wallets:
                     confirm = input(f"\n{Fore.YELLOW}Jste si jistí že chcete tuto peněženku smazat? Tato akce je nevratná (a/n): {Style.RESET_ALL}").strip().lower()
                     if confirm == 'a':
@@ -7786,7 +9773,7 @@ def main():
                     print(f"{Fore.RED}Transakce s TX ID '{tx_id}' nebyla nalezena.{Style.RESET_ALL}")
                     
             elif choice == "13":
-                address = input(f"Zadejte ADRESU pro zobrazení historie transakcí: ")
+                address = input("Zadejte ADRESU pro zobrazení historie transakcí: ")
                 print(f"\n{Fore.YELLOW}--- Historie transakcí pro adresu '{address}' ---{Style.RESET_ALL}")
                 sent_amount = 0
                 received_amount = 0
@@ -7889,7 +9876,7 @@ def main():
                 print(f" Maximální nabídka: {Fore.CYAN}{format(Decimal(max_supply) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}{Style.RESET_ALL}")
                 
                 print()
-                miner_addr = input(f"Zadejte ADRESU těžaře pro zobrazení coinbase odměn: ").strip()
+                miner_addr = input("Zadejte ADRESU těžaře pro zobrazení coinbase odměn: ").strip()
                 if miner_addr:
                     if not is_valid_address(miner_addr):
                         print(f"{Fore.RED}Chyba: Neplatný formát adresy.{Style.RESET_ALL}")
@@ -8060,8 +10047,10 @@ def main():
                             if confirm == 'a':
                                 with p2p_node.blacklist_lock:
                                     p2p_node.blacklist.pop(ip_to_remove, None)
-                                    snapshot = dict(p2p_node.blacklist)
-                                save_blacklist(snapshot)
+                                    p2p_node.blacklist_dirty = True
+                                # OPRAVA G-06: rozhodnutí uživatele se ukládá
+                                # okamžitě, ne až s dávkou.
+                                p2p_node.flush_blacklist(force=True)
                                 print(f"{Fore.GREEN}IP adresa {ip_to_remove} byla odblokována.{Style.RESET_ALL}")
                             else:
                                 print(f"{Fore.YELLOW}Akce zrušena. IP adresa zůstává zablokovaná.{Style.RESET_ALL}")
@@ -8080,11 +10069,17 @@ def main():
                 # ETAPA 1: perzistentní spojení je potřeba explicitně zavřít,
                 # jinak čtecí vlákna visí až do timeoutu.
                 p2p_node.close_all_connections()
+                # OPRAVA G-06: zápis blacklistu je nově dávkovaný, takže se
+                # při vypnutí musí dotlačit na disk ručně - jinak by se ztratily
+                # bany udělené od posledního flushe.
+                p2p_node.flush_blacklist(force=True)
                 print(f"\n{Fore.YELLOW}Ukládám a vypínám...{Style.RESET_ALL}")
                 save_data(droid_chain, wallets, password, p2p_node.peers, full=True, save_wallets=True)
-                if os.path.exists(MEMPOOL_DB):
-                    os.remove(MEMPOOL_DB)
-                    print(f"{Fore.GREEN}Mempool databáze byla smazána.{Style.RESET_ALL}")
+                # ZMĚNA 2: mempool.db se při vypnutí už NEMAŽE. Celý mempool
+                # (všechny transakce, ne jen transakce tohoto uzlu) zůstává
+                # uložený a při dalším startu se načte a ověří proti aktuálnímu
+                # blockchainu (viz Blockchain.revalidate_stored_mempool).
+                uloz_mempool_pri_vypnuti(droid_chain)
                 break
                 
         except KeyboardInterrupt:
@@ -8094,16 +10089,21 @@ def main():
                 # ETAPA 1: perzistentní spojení je potřeba explicitně zavřít,
                 # jinak čtecí vlákna visí až do timeoutu.
                 p2p_node.close_all_connections()
+                # OPRAVA G-06: dotlačení dávkovaného blacklistu na disk.
+                p2p_node.flush_blacklist(force=True)
             save_data(droid_chain, wallets, password, p2p_node.peers if 'p2p_node' in globals() and p2p_node else [], full=True, save_wallets=True)
-            if os.path.exists(MEMPOOL_DB):
-                try:
-                    os.remove(MEMPOOL_DB)
-                    print(f"{Fore.GREEN}Mempool databáze byla smazána.{Style.RESET_ALL}")
-                except OSError:
-                    pass
+            # ZMĚNA 2: ani při CTRL+C se mempool.db už NEMAŽE - stejně jako
+            # u volby 20 zůstává celý mempool uložený pro další start.
+            uloz_mempool_pri_vypnuti(droid_chain)
             break
         except Exception as e:
             print(f"{Fore.RED}Došlo k chybě: {e}{Style.RESET_ALL}")
 
 if __name__ == "__main__":
+    # OPRAVA B-5: kontrola prostředí patří do vstupního bodu, ne do main().
+    # Přepínač se z argv odstraní, aby main() dál mohl brát port z argv[1].
+    povolit_jakoukoli_platformu = '--allow-any-platform' in sys.argv
+    if povolit_jakoukoli_platformu:
+        sys.argv = [a for a in sys.argv if a != '--allow-any-platform']
+    enforce_mobile_environment(allow_any=povolit_jakoukoli_platformu)
     main()
