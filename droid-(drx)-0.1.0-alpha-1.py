@@ -171,6 +171,45 @@ MEMPOOL_PREMIUM_RESERVE_BYTES = MAX_MEMPOOL_SIZE_BYTES // 10
 # že hloubku neumíme spočítat (fork_start_index není znám) nebo jsou bloky plné.
 MAX_SYNC_BUFFER_BYTES = (MAX_REORG_DEPTH + 1) * 64 * 1024
 
+# OPRAVA T-1 (Nález 1, 2/2): účetnictví bufferu měřilo JEN sloupec
+# `transactions`. Pole hlavičky (previous_hash, merkle_root, state_root) přitom
+# procházejí tvarovou brankou pouze přes isinstance(..., str), takže blok
+# s prázdným seznamem transakcí a balastem ve state_root se do bufferu zapsal
+# s účtovanou velikostí 12 B. Naměřený poměr skutečnost/účetnictví byl
+# 251 221x - bajtový strop se tedy neuplatnil vůbec a zbyl jen hloubkový
+# (1001 řádků), tedy řádově 10 GB zápisu na flash proti zamýšleným 63 MB.
+#
+# Jediný zdroj pravdy o velikosti řádku je proto tahle dvojice: SQL verze pro
+# změřený obsah tabulky a Python verze pro odhad dávky PŘED zápisem. Obě musí
+# dávat totéž, jinak by se strop dal obejít v mezeře mezi nimi - proto jsou
+# vedle sebe a obě vycházejí z téhož seznamu sloupců.
+#
+# Měří se BAJTY, ne znaky: LENGTH() nad TEXTem vrací počet znaků, takže by
+# jediný čtyřbajtový znak ve state_root účtoval za 1 a dal útočníkovi 4x páku
+# na skutečný zápis. CAST(... AS BLOB) vrátí délku v bajtech kódování UTF-8.
+# COALESCE je nutné u každého sloupce zvlášť: LENGTH(NULL) je NULL a NULL
+# v součtu udělá z CELÉHO řádku nulu, tedy přesně opačnou chybu, než jakou
+# tenhle strop opravuje.
+SYNC_BUFFER_COLUMNS = ('block_index', 'timestamp', 'transactions', 'previous_hash',
+                       'target_hex', 'nonce', 'block_hash', 'merkle_root',
+                       'version', 'chain_id', 'state_root')
+SYNC_BUFFER_BYTES_SQL = (
+    "SELECT COALESCE(SUM("
+    + " + ".join(f"LENGTH(CAST(COALESCE({sloupec}, '') AS BLOB))" for sloupec in SYNC_BUFFER_COLUMNS)
+    + "), 0) FROM sync_blocks"
+)
+
+def sync_row_bytes(hodnoty):
+    # Python protějšek SYNC_BUFFER_BYTES_SQL nad týmž řádkem PŘED zápisem.
+    # SQLite čísla při CASTu nejdřív vyrenderuje do textu, takže str(v) je
+    # tady ekvivalent - a NULL (None) nepřispívá ničím.
+    celkem = 0
+    for v in hodnoty:
+        if v is None:
+            continue
+        celkem += len(v.encode('utf-8')) if isinstance(v, str) else len(str(v).encode('utf-8'))
+    return celkem
+
 # OPRAVA D-04: add_block() měl jediný pokus o zámek s timeout=5 a při vypršení
 # platný blok zahodil. Blok má přednost před transakcemi, takže se o zámek
 # pokouší opakovaně; celkový rozpočet je 3 × 5 s.
@@ -797,10 +836,21 @@ class Transaction:
             # POZOR, JE TO ZMĚNA KONSENZU (HARD FORK): patří do kódu PŘED
             # spuštěním sítě, ne po něm. Stejnou poznámku nesou OPRAVA A-4,
             # OPRAVA #6b / ZMĚNA 1, OPRAVA #14 a OPRAVA N-3.
+            #
+            # OPRAVA U-2 (audit 2. 10. 2026, nález 2): mez byla 2**64-1, ale
+            # amount, fee, nonce i timestamp jdou v save_mempool() rovnou jako
+            # parametry do mempool.db, kde je INTEGER 64bitový SE ZNAMÉNKEM.
+            # Hodnota nad 2**63-1 by tam vyhodila OverflowError - stejná úvaha
+            # jako u OPRAVY A-05 a o pár řádků výš u Block.from_dict (U-2).
+            #
+            # Konsenzus se nemění. MAX_SUPPLY je 10**16 nanitů, takže částka ani
+            # poplatek se k 2**63 nepřiblíží ani o deset řádů a transakce nad
+            # touhle mezí dnes stejně padne na kontrole zůstatku; get_signing_data()
+            # pole dál balí přes '!Q' (uint64), tohle je jen užší podmnožina.
             je_coinbase = data.get('from_address') == "COINBASE"
-            _check_uint(amount, 64, "Částka", minimum=0 if je_coinbase else 1)
-            _check_uint(fee, 64, "Poplatek")
-            _check_uint(nonce, 64, "Nonce")
+            _check_uint(amount, 63, "Částka", minimum=0 if je_coinbase else 1)
+            _check_uint(fee, 63, "Poplatek")
+            _check_uint(nonce, 63, "Nonce")
 
             chain_id = data.get('chain_id', CHAIN_ID)
             _check_uint(chain_id, 32, "chain_id")
@@ -815,7 +865,9 @@ class Transaction:
                 # jako čas 1, "1785614460" jako číslo a 1785614460.7 se tiše
                 # oříznulo. Kontroluje se proto SYROVÁ hodnota, stejně jako
                 # u amount, fee, nonce a chain_id o pár řádků výš.
-                _check_uint(raw_timestamp, 64, "Timestamp")
+                # OPRAVA U-2: mez 63 bitů ze stejného důvodu jako u amount/fee/
+                # nonce výš - timestamp jde do mempool.db jako parametr SQLite.
+                _check_uint(raw_timestamp, 63, "Timestamp")
                 timestamp = raw_timestamp
 
             # OPRAVA F-02: tvar hex polí se vynucuje JEŠTĚ PŘED konstrukcí.
@@ -1779,11 +1831,30 @@ class Block:
             # index/timestamp/nonce jdou do compute_hash() přes struct.pack('!Q'),
             # version a chain_id přes '!I'. Mimo rozsah = struct.error, která také
             # není podtřída ValueError.
-            _check_uint(data['timestamp'], 64, "Timestamp bloku")
+            #
+            # OPRAVA U-2 (audit 2. 10. 2026, nález 2): mez byla 2**64-1, zatímco
+            # _valid_block_dict() (branka cesty response_blocks) i sloupce
+            # v SQLite drží 2**63-1. Úvaha z OPRAVY A-05 se do téhle branky
+            # nepromítla: index, timestamp i nonce jdou do SQLite jako
+            # parametry, a hodnota nad 2**63-1 tam vyhodí OverflowError.
+            #
+            # Důsledek byl nesymetrický postih stejný jako u OPRAVY D-15:
+            # blok s nonce 2**63+5 prošel cestou new_block CELOU validací
+            # konsenzu - target, merkle root, PoW, podpisy všech transakcí,
+            # state root - a padl teprve na zápisu do databáze, tedy bez banu.
+            # Týž blok přes response_blocks skončil na rychlé brance a odesílatel
+            # dostal 24 h ban. Útočník s platným PoW tak uměl opakovaně vynutit
+            # plnou validační práci zadarmo.
+            #
+            # Konsenzus se tím NEMĚNÍ: hodnota nad 2**63-1 je nepřijatelná už
+            # dnes (nikdo takový blok neuloží), jen se odmítne dřív a se
+            # správnou diagnostikou. Je to táž náprava jako OPRAVA N-5
+            # u targetu - obě branky mají o témže objektu říkat totéž.
+            _check_uint(data['timestamp'], 63, "Timestamp bloku")
             ts = data['timestamp']  # _check_uint výše zaručil int (a ne bool)
-            _check_uint(data['index'], 64, "Index bloku")
+            _check_uint(data['index'], 63, "Index bloku")
             nonce = data.get('nonce', 0)
-            _check_uint(nonce, 64, "Nonce bloku")
+            _check_uint(nonce, 63, "Nonce bloku")
             version = data.get('version', BLOCK_VERSION)
             _check_uint(version, 32, "Verze bloku")
             chain_id = data.get('chain_id', CHAIN_ID)
@@ -3271,6 +3342,27 @@ class Blockchain:
         # manipulace obtížnost naopak ZVEDALA (10 % hashrate -> 126 %).
         # Změnu targetu dál omezuje ořez na 4x/0,25x níž a strop FIXED_TARGET.
         # Porovnání variant: t_bug3_variants.py.
+        #
+        # POZNÁMKA U-5 (audit 2. 10. 2026, nález 3): chybějící ořez solve_time je
+        # ZÁMĚRNÁ odchylka od referenční LWMA (zawy), která ho má typicky na 6T.
+        # Zůstává vědomě z důvodu popsaného výše a cena je změřená:
+        #
+        #   N = 144, T = 60 s, všechny targety v okně stejné
+        #   poctivý průběh (rovnoměrně po 60 s)  -> 1,0000x základ
+        #   veškerý čas natlačený na konec okna  -> 1,9698x základ (obtížnost / 1,97)
+        #   maximálně stlačené časy              -> 0,016667x základ (obtížnost x 60)
+        #
+        # Horní mez je teoretická mez váženého součtu 2N/(N+1) = 1,986, naměřená
+        # hodnota je tedy u stropu: útočník, který ovládá pořadí časových razítek
+        # v celém okně, srazí obtížnost nejvýš zhruba na polovinu. Víc nejde -
+        # časy jsou shora vázané get_time() + 600 a zdola klouzavým mediánem
+        # (MTP). Opačný směr je formálně větší (x60), ale ořez 4x ho rozloží
+        # nejméně do tří bloků a LWMA se sama vrací.
+        #
+        # Doplnění ořezu by bylo ZMĚNOU KONSENZU (hard fork) - patří do kódu před
+        # spuštěním sítě, ne po něm, stejně jako OPRAVA A-4, #6b / ZMĚNA 1, #14,
+        # N-3 a AUDIT-10. Pokud se k němu někdy sáhne, musí se znovu proměřit
+        # scénář z OPRAVY N-3, protože ten tuhle variantu právě zamítl.
         predchozi_ts = blocks[0].timestamp
         for i in range(1, N + 1):
             ts = blocks[i].timestamp
@@ -5536,17 +5628,39 @@ class Blockchain:
                             f"{Fore.YELLOW}Výchozí stav pro fork od #{fork_index} nelze sestavit, "
                             f"ověřuji celý řetězec od genesis.{Style.RESET_ALL}")
                     def proposed_chain_iterator():
+                        # OPRAVA V-1 (audit 3. 10. 2026, nález 1): spojení leželo
+                        # mimo try/finally a conn.close() bylo obyčejným řádkem za
+                        # smyčkou. Přeskočily ho DVĚ cesty:
+                        #   - výjimka z json.loads() nebo Block.from_dict() nad
+                        #     poškozeným řádkem vlastní DB,
+                        #   - PŘEDČASNÝ RETURN konzumenta: _is_valid_chain_inner()
+                        #     vrací (False, None) u prvního vadného bloku, takže
+                        #     generátor zůstal viset na yieldu a za něj se kód už
+                        #     nikdy nedostal.
+                        #
+                        # Je to doslova týž nález, který OPRAVA R-2 vyřešila
+                        # v get_iterable() uvnitř _is_valid_chain_inner() - sem se
+                        # tehdy nedostala. Cesta je dosažitelná ze sítě
+                        # (response_blocks -> process_sync_buffer -> replace_chain)
+                        # a spustí se, kdykoli validate_fork() vrátí "nevím".
+                        # Naměřeno: 42 deskriptorů po 20 voláních, tedy 2,1 na
+                        # volání (soubor + WAL); uvolní je až cyklický GC.
                         conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-                        conn.execute("PRAGMA journal_mode=WAL;")
-                        c = conn.cursor()
-                        c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index < ? ORDER BY block_index", (fork_index,))
-                        for row in c:
-                            yield Block.from_dict({
-                                'index': row[0], 'timestamp': row[1], 'transactions': json.loads(row[2]),
-                                'previous_hash': row[3], 'target': row[4], 'nonce': row[5], 'hash': row[6],
-                                'merkle_root': row[7], 'version': row[8], 'chain_id': row[9], 'state_root': row[10]
-                            })
-                        conn.close()
+                        try:
+                            conn.execute("PRAGMA journal_mode=WAL;")
+                            c = conn.cursor()
+                            c.execute("SELECT block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root FROM blocks WHERE block_index < ? ORDER BY block_index", (fork_index,))
+                            for row in c:
+                                yield Block.from_dict({
+                                    'index': row[0], 'timestamp': row[1], 'transactions': json.loads(row[2]),
+                                    'previous_hash': row[3], 'target': row[4], 'nonce': row[5], 'hash': row[6],
+                                    'merkle_root': row[7], 'version': row[8], 'chain_id': row[9], 'state_root': row[10]
+                                })
+                        finally:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
                         for b in new_chain_tail: yield b
                     # OPRAVA A-02: viz větev fork_index == 0 výš. Iterátor
                     # vydá bloky z DB pod forkem a pak celý navrhovaný ocas,
@@ -5897,6 +6011,17 @@ def save_address_book(address_book, password):
         if os.path.exists(ADDRESS_BOOK_FILE + '.tmp'):
             os.remove(ADDRESS_BOOK_FILE + '.tmp')
 
+def normalize_ip_str(ip_str):
+    # OPRAVA T-3 (Nález 3): kanonický tvar IP adresy. Bylo to dosud jen
+    # P2PNode.normalize_ip(), ale potřebuje ho i load_blacklist() - a ta běží
+    # dřív, než P2PNode vůbec vznikne. Druhá kopie téhož výpočtu by byla přesně
+    # ten rozpor, kvůli kterému ban_peer() a is_blacklisted() nefungovaly
+    # dohromady, takže metoda na P2PNode nově volá tuhle funkci.
+    try:
+        return str(ipaddress.ip_address(ip_str))
+    except ValueError:
+        return ip_str
+
 def load_blacklist():
     # OPRAVA #1: blacklist je nově slovník {ip: expirace}, kde None znamená
     # trvalý ban (ten uděluje jen uživatel ručně z menu). Starý formát byl
@@ -5906,14 +6031,33 @@ def load_blacklist():
         try:
             with open(BLACKLIST_FILE, 'r') as f:
                 raw = json.load(f)
+            # OPRAVA T-3 (Nález 3): klíče se normalizují i při NAČÍTÁNÍ. Bez
+            # toho by oprava v ban_peer()/is_blacklisted() uzavřela dosah jen
+            # novým banům a ty už uložené v syrovém tvaru by se staly
+            # nedosažitelnými - tedy přesně ten tichý výpadek, který nález
+            # popisuje, jen obráceně. Týká se hlavně ručních trvalých banů,
+            # protože ty jsou jediné, které mají soubor přežít.
             if isinstance(raw, list):
                 now = time.time()
                 print(f"{Fore.YELLOW}Blacklist ve starém formátu převeden na dočasné bany ({len(raw)} IP).{Style.RESET_ALL}")
-                return {str(ip): now + BAN_DURATION_SECONDS for ip in raw}
+                return {normalize_ip_str(str(ip)): now + BAN_DURATION_SECONDS for ip in raw}
             if isinstance(raw, dict):
                 out = {}
                 for ip, expiry in raw.items():
-                    out[str(ip)] = None if expiry is None else float(expiry)
+                    klic = normalize_ip_str(str(ip))
+                    hodnota = None if expiry is None else float(expiry)
+                    # Normalizace může sloučit dva zápisy téže adresy ('::1'
+                    # a '0:0:0:0:0:0:0:1'). Platí totéž pravidlo jako
+                    # v ban_peer(): trvalý ban vyhrává nad dočasným, jinak
+                    # vyhrává ten delší.
+                    if klic in out:
+                        stary = out[klic]
+                        if stary is None or hodnota is None:
+                            out[klic] = None
+                        else:
+                            out[klic] = max(stary, hodnota)
+                    else:
+                        out[klic] = hodnota
                 return out
         except Exception as e:
             print(f"{Fore.RED}Chyba při načítání blacklistu:{Style.RESET_ALL} {e}")
@@ -6788,9 +6932,19 @@ class PeerConnection:
                 if not P2PNode._json_depth_ok(body):
                     self.node.add_log(f"{Fore.RED}Odpověď od {self.peer} má příliš hluboké vnoření. Zavírám spojení.{Style.RESET_ALL}")
                     break
+                # OPRAVA U-1 (audit 2. 10. 2026, nález 1): json.loads() nevyhodí
+                # vždy JSONDecodeError. Od Pythonu 3.11 je převod desítkového
+                # řetězce na int omezen na sys.get_int_max_str_digits() (4300)
+                # číslic, takže JSON s delším celočíselným literálem vyhodí HOLÝ
+                # ValueError - a ten tenhle except nechytal. Výjimka z
+                # nedůvěryhodných dat tak propadla o vrstvu výš, tedy přesně
+                # vzorec, který řeší OPRAVA #4, #3, D-07, N-6, G-07, R-2 a S-1.
+                #
+                # json.JSONDecodeError JE podtřída ValueError, takže širší tuple
+                # pokrývá obě cesty a nic navíc nepropouští.
                 try:
                     message = json.loads(body.decode('utf-8'))
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                except (ValueError, UnicodeDecodeError):
                     break
                 if not isinstance(message, dict):
                     continue
@@ -7050,7 +7204,9 @@ class P2PNode:
                 self.sync_buffer_bytes = 0
             else:
                 try:
-                    c.execute("SELECT COALESCE(SUM(LENGTH(transactions)), 0) FROM sync_blocks")
+                    # OPRAVA T-1 (Nález 1, 2/2): měří se celý řádek, ne jen
+                    # sloupec transactions - viz SYNC_BUFFER_BYTES_SQL.
+                    c.execute(SYNC_BUFFER_BYTES_SQL)
                     self.sync_buffer_bytes = int(c.fetchone()[0] or 0)
                 except Exception:
                     self.sync_buffer_bytes = 0
@@ -7060,6 +7216,18 @@ class P2PNode:
                     conn.close()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _sync_row_values(bd, tx_json):
+        # OPRAVA T-1 (Nález 1, 2/2): jediné místo, kde se skládá řádek bufferu.
+        # Používá ho INSERT i účtování bajtů - kdyby si každý sestavoval řádek
+        # po svém, strop by se dal obejít v rozdílu mezi nimi (přesně to se
+        # stalo: zapisovalo se 11 sloupců, účtoval se jeden).
+        # Pořadí MUSÍ odpovídat SYNC_BUFFER_COLUMNS i sloupcům v INSERTu.
+        return (bd['index'], bd['timestamp'], tx_json, bd['previous_hash'],
+                bd['target'], bd['nonce'], bd['hash'], bd['merkle_root'],
+                bd.get('version', BLOCK_VERSION), bd.get('chain_id', CHAIN_ID),
+                bd.get('state_root'))
 
     def sync_buffer_tip(self):
         # OPRAVA #6c: (index, hash) posledního bloku v bufferu, nebo None.
@@ -7228,10 +7396,10 @@ class P2PNode:
 
     @staticmethod
     def normalize_ip(ip_str):
-        try:
-            return str(ipaddress.ip_address(ip_str))
-        except ValueError:
-            return ip_str
+        # OPRAVA T-3 (Nález 3): jediná implementace je modulová
+        # normalize_ip_str(); tahle metoda zůstává, protože ji volá přes 15
+        # míst v uzlu.
+        return normalize_ip_str(ip_str)
 
     def _p2p_log_append_locked(self, message):
         # Volat POUZE s drženým self.p2p_log_lock.
@@ -7283,11 +7451,33 @@ class P2PNode:
         # duration=None znamená trvalý ban - ten smí udělit jen uživatel z menu.
         if not ip:
             return
+        # OPRAVA T-3 (Nález 3): blacklist byl JEDINÁ struktura klíčovaná IP
+        # adresou, která ukládala syrový řetězec - peer_listen_ports,
+        # peer_listen_seen i úklid v _prune_listen_ports_locked() chodí přes
+        # normalize_ip(). Adresy ze socket.accept() jsou kanonické, takže
+        # automatické bany fungovaly, ale adresa od UŽIVATELE ne: volba 16 bere
+        # peer_ip syrově ze vstupu, volba 17 pak banuje peer_to_remove[0], tedy
+        # ten syrový tvar ('0:0:0:0:0:0:0:1'). Skutečné spojení z téhož
+        # hostitele se ohlásí kanonicky ('::1') a s uloženým klíčem se
+        # nespárovalo - ruční trvalý ban tiše nefungoval.
+        ip = self.normalize_ip(ip)
         expiry = None if duration is None else time.time() + duration
         with self.blacklist_lock:
             existing = self.blacklist.get(ip, 0)
             if ip in self.blacklist and existing is None:
                 return  # trvalý ban dočasným nepřepisujeme
+            # OPRAVA T-2 (Nález 2): delší ban vyhrává. Zápis byl bezpodmínečný,
+            # takže uzel zabanovaný na 24 h za protokolový přestupek
+            # (BAN_DURATION_PROTOCOL) si ban zkrátil na hodinu tím, že spáchal
+            # LEVNĚJŠÍ prohřešek - stačilo vyčerpat rate limit, což vede na
+            # BAN_DURATION_SECONDS. Trvalý ban proti přepsání chráněný byl,
+            # dočasné bany proti sobě navzájem ne.
+            #
+            # Pro nepřítomnou IP je existing == 0, tedy menší než jakákoli
+            # expirace - nový ban projde. Vypršelý, ale dosud nesklizený záznam
+            # má existing v minulosti, takže ho nový ban přepíše také.
+            if existing is not None and expiry is not None and existing > expiry:
+                return
             self.blacklist[ip] = expiry
             # OPRAVA G-06 (b): dřív se tu volalo save_blacklist(dict(...)),
             # tedy kompletní přepis souboru po KAŽDÉM banu - N banů znamenalo
@@ -7487,6 +7677,11 @@ class P2PNode:
 
     def is_blacklisted(self, addr):
         ip = addr[0] if isinstance(addr, (tuple, list)) else addr
+        if not ip:
+            return False
+        # OPRAVA T-3 (Nález 3): táž normalizace jako v ban_peer(). Obě strany
+        # musí klíčovat stejně, jinak se zápis a čtení minou.
+        ip = self.normalize_ip(ip)
         with self.blacklist_lock:
             if ip not in self.blacklist:
                 return False
@@ -7877,9 +8072,18 @@ class P2PNode:
                         self.ban_peer(addr[0], "příliš hluboce vnořený JSON")
                         return
 
+                    # OPRAVA U-1 (audit 2. 10. 2026, nález 1): totéž co
+                    # v PeerConnection._read_loop(). Celočíselný literál delší
+                    # než sys.get_int_max_str_digits() (4300) vyhodí z
+                    # json.loads() holý ValueError, ne JSONDecodeError. Spojení
+                    # se zavřelo tak či tak, ale až přes obecný
+                    # `except Exception` na konci téhle metody - a do logu se
+                    # psalo "Chyba spojení s ...", což svádí hledat problém
+                    # v síti místo ve vadné zprávě. JSONDecodeError je podtřída
+                    # ValueError, takže širší tuple pokrývá obojí.
                     try:
                         message = json.loads(data_buffer.decode('utf-8'))
-                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    except (ValueError, UnicodeDecodeError) as e:
                         self.add_log(f"{Fore.RED}Chyba dekódování JSON od {addr}: {e}{Style.RESET_ALL}")
                         return
 
@@ -8227,7 +8431,31 @@ class P2PNode:
         # vyhodila OverflowError. Odesílatel za to navíc nedostal ban (spadlo
         # to do obecného except), takže byl útok opakovatelný donekonečna -
         # přesně nesymetrie popsaná v OPRAVĚ D-15.
-        return 0 <= bd['index'] <= (1 << 63) - 1
+        if not 0 <= bd['index'] <= (1 << 63) - 1:
+            return False
+        # OPRAVA T-1 (Nález 1, 1/2): bajtový strop nad SYROVÝM dictem. Tohle
+        # byla JEDINÁ cesta přijímající bloky ze sítě bez kontroly
+        # MAX_BLOCK_SIZE_BYTES - add_block(), add_orphan_block(), mine(),
+        # _validate_fork_inner(), _is_valid_chain_inner() i handler 'new_block'
+        # ji mají, buffer forku ne. To je přímý rozpor s komentářem
+        # v _store_fork_batch_inner(): "dvě síťové cesty přijímající bloky se
+        # nesmějí lišit v tom, co po nich chtějí."
+        #
+        # Měří se stejně jako v handleru 'new_block' (tatáž serializace, tatáž
+        # mez), protože rozdíl v měření mezi dvěma cestami je přesně ten druh
+        # nesouladu, který tenhle nález odhalil.
+        #
+        # Kontrola je ZÁMĚRNĚ až za všemi typovými testy výš: serializace je
+        # tady to nejdražší, co děláme, a za blok se špatným tvarem ji nemá
+        # smysl platit. Naopak proti zbytku cesty je levná - parsování bloku
+        # počítá tx_id každé transakce.
+        try:
+            raw_size = len(json.dumps(bd, separators=(',', ':'), sort_keys=True).encode('utf-8'))
+        except (TypeError, ValueError):
+            # Neserializovatelný dict do SQLite stejně nedojde; tvarová branka
+            # ho má odmítnout tady, ne až výjimkou za stavovým příznakem.
+            return False
+        return raw_size <= MAX_BLOCK_SIZE_BYTES
 
     def _abort_fork_sync(self, addr, reason, ban=True):
         # Společný úklid při zamítnuté dávce. Buffer se maže, protože dávka byla
@@ -8346,6 +8574,12 @@ class P2PNode:
             # ("rychlá validace PoW") - dvě síťové cesty přijímající bloky se
             # nesmějí lišit v tom, co po nich chtějí.
             #
+            # OPRAVA T-1 (Nález 1): druhá polovina téhož pravidla, tedy strop
+            # MAX_BLOCK_SIZE_BYTES, tady dlouho CHYBĚLA. Dnes ho tahle cesta má
+            # taky, jen o kus dřív - v tvarové brance _valid_block_dict(), kudy
+            # vede každé volání _store_fork_batch(). Kdo sem přijde hledat
+            # MAX_BLOCK_SIZE_BYTES, najde ho tam.
+            #
             # Cena je konstantní na blok: hash hlavičky nezávisí na transakcích,
             # takže se nic neparsuje (viz Block.hlavicka_hash_z_dictu).
             if Block.hlavicka_hash_z_dictu(bd, target_val) != bd['hash']:
@@ -8410,12 +8644,17 @@ class P2PNode:
         # OPRAVA A-3 (bajtový strop): drží i tam, kde hloubku spočítat neumíme
         # (fork_start_index není znám), a chrání flash i při plných blocích.
         # Serializace se dělá jednou a použije se pro účtování i pro zápis.
+        # OPRAVA T-1 (Nález 1, 2/2): účtuje se CELÝ řádek, který se zapíše, ne
+        # jen tx_json. Dřív se sem započítal jen sloupec transactions, takže
+        # blok s prázdným seznamem transakcí a 500 kB ve state_root stál podle
+        # účetnictví 12 bajtů a strop se neuplatnil vůbec.
         pripravene = []
         davka_bajtu = 0
         for bd in blocks_data:
             tx_json = json.dumps(bd['transactions'])
-            davka_bajtu += len(tx_json)
-            pripravene.append((bd, tx_json))
+            radek_bajtu = sync_row_bytes(self._sync_row_values(bd, tx_json))
+            davka_bajtu += radek_bajtu
+            pripravene.append((bd, tx_json, radek_bajtu))
 
         buffer_bajtu = getattr(self, 'sync_buffer_bytes', 0)
         if buffer_bajtu + davka_bajtu > MAX_SYNC_BUFFER_BYTES:
@@ -8423,10 +8662,12 @@ class P2PNode:
             # poctivých bloků ho naplní taky. Místo banu se vezme jen tolik
             # bloků, kolik se vejde, a zpracuje se, co v bufferu je.
             vejde_se = []
-            for bd, tx_json in pripravene:
-                if buffer_bajtu + sum(len(t) for _, t in vejde_se) + len(tx_json) > MAX_SYNC_BUFFER_BYTES:
+            vejde_se_bajtu = 0
+            for bd, tx_json, radek_bajtu in pripravene:
+                if buffer_bajtu + vejde_se_bajtu + radek_bajtu > MAX_SYNC_BUFFER_BYTES:
                     break
-                vejde_se.append((bd, tx_json))
+                vejde_se.append((bd, tx_json, radek_bajtu))
+                vejde_se_bajtu += radek_bajtu
             if not vejde_se:
                 if self.sync_buffer_tip() is not None:
                     self.process_sync_buffer()
@@ -8434,8 +8675,8 @@ class P2PNode:
                     self._abort_fork_sync(addr, "Blok forku se nevejde do MAX_SYNC_BUFFER_BYTES. Žádný postih.", ban=False)
                 return
             pripravene = vejde_se
-            davka_bajtu = sum(len(t) for _, t in vejde_se)
-            blocks_data = [bd for bd, _ in vejde_se]
+            davka_bajtu = vejde_se_bajtu
+            blocks_data = [bd for bd, _, _ in vejde_se]
             last_block_data = blocks_data[-1]
             zpracovat_hned = True
 
@@ -8450,12 +8691,12 @@ class P2PNode:
             conn = sqlite3.connect(self.SYNC_BUFFER_DB, timeout=1.0)
             conn.execute("PRAGMA journal_mode=WAL;")
             c = conn.cursor()
-            for bd, tx_json in pripravene:
+            for bd, tx_json, _ in pripravene:
                 c.execute('''
                     INSERT OR REPLACE INTO sync_blocks 
                     (block_index, timestamp, transactions, previous_hash, target_hex, nonce, block_hash, merkle_root, version, chain_id, state_root)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (bd['index'], bd['timestamp'], tx_json, bd['previous_hash'], bd['target'], bd['nonce'], bd['hash'], bd['merkle_root'], bd.get('version', BLOCK_VERSION), bd.get('chain_id', CHAIN_ID), bd.get('state_root')))
+                ''', self._sync_row_values(bd, tx_json))
             # OPRAVA S-2 (Nález 1): zápis je INSERT OR REPLACE podle block_index,
             # takže TÁŽ dávka poslaná znovu v bufferu nic nepřidá - řádky se jen
             # přepíšou. Přičítání davka_bajtu proto účtovalo objem, který v
@@ -8467,7 +8708,13 @@ class P2PNode:
             #
             # Skutečný obsah tabulky je jediný zdroj pravdy. Tabulka má strop
             # ~1000 řádků, takže agregace je levná a dělá se jen jednou na dávku.
-            c.execute("SELECT COALESCE(SUM(LENGTH(transactions)), 0) FROM sync_blocks")
+            #
+            # OPRAVA T-1 (Nález 1, 2/2): agregace sčítá VŠECHNY sloupce řádku.
+            # Měřit jen `transactions` znamenalo měřit tu jedinou část bloku,
+            # kterou útočník nepotřebuje - hlavička má v tvarové brance pouze
+            # isinstance(..., str) a PoW se počítá nad hlavičkou včetně balastu,
+            # takže se celá cena útoku vešla do neúčtovaného sloupce.
+            c.execute(SYNC_BUFFER_BYTES_SQL)
             skutecne_bajtu = int(c.fetchone()[0] or 0)
             conn.commit()
         except Exception:
@@ -9890,6 +10137,21 @@ def is_valid_address(address):
     expected_checksum = hashlib.sha3_256(base.encode()).hexdigest()[:8]
     return address[-8:] == expected_checksum and all(c in '0123456789abcdef' for c in address[3:])
 
+def jen_ascii_cislice(s):
+    """OPRAVA U-4 (audit 2. 10. 2026, nález 5): náhrada za str.isdigit().
+
+    str.isdigit() je pravdivé pro celou řadu unicodových číslic, nejen pro
+    ASCII - '١٢٣' (arabsko-indické) jím projde a Decimal/int ho pak přijme
+    jako 123. Hláška u obou vstupních polí přitom tvrdí "Povolena jsou pouze
+    čísla (0-9)" a branka to nevynucovala. Vstup se navíc choval
+    nekonzistentně: jedna třída unicodových číslic prošla ('١٢٣'), druhá ne
+    ('²' spadlo až na InvalidOperation v Decimal).
+
+    Prázdný řetězec je False, takže ".5" i "5." zůstávají odmítnuté stejně
+    jako dřív (''.isdigit() je rovněž False).
+    """
+    return bool(s) and all(ch in '0123456789' for ch in s)
+
 def show_p2p_log():
     print(f"\n{Fore.YELLOW}--- Log P2P sítě (stiskněte Enter pro návrat) ---{Style.RESET_ALL}")
     # OPRAVA G-05: log je nově kruhový buffer, ne Queue. drain_log() ho
@@ -10145,13 +10407,29 @@ def main():
                 amount_str = input("Zadejte částku: ").strip()
                 amount_str = amount_str.replace(',', '.')
                 parts = amount_str.split('.')
-                if len(parts) > 2 or not parts[0].isdigit() or (len(parts) == 2 and (not parts[1].isdigit() or len(parts[1]) > DECIMALS)):
+                # OPRAVA U-4 (nález 5): .isdigit() nahrazeno jen_ascii_cislice().
+                if len(parts) > 2 or not jen_ascii_cislice(parts[0]) or (len(parts) == 2 and (not jen_ascii_cislice(parts[1]) or len(parts[1]) > DECIMALS)):
                     print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný formát částky. Povolena jsou pouze čísla (0-9), jedna tečka a max. {DECIMALS} desetinných míst.")
                     continue
                     
                 try:
-                    amount_decimal = Decimal(amount_str)
-                    amount_in_decimal = int(amount_decimal * (10 ** DECIMALS))
+                    # OPRAVA U-3 (audit 2. 10. 2026, nález 4): dřív
+                    # `int(Decimal(amount_str) * (10 ** DECIMALS))`. Výchozí
+                    # kontext modulu decimal má prec = 28, takže se násobení
+                    # zaokrouhlilo na 28 platných číslic a delší vstup se TIŠE
+                    # změnil: 12345678901234567890123.45678901 dalo
+                    # ...45679000 místo ...45678901. Prakticky to nevadilo
+                    # (taková částka neprojde kontrolou zůstatku o pár řádků
+                    # níž), ale je to změna uživatelského vstupu v kódu, který
+                    # jinak všude počítá v celých číslech.
+                    #
+                    # Čistě celočíselně: tvarová kontrola výš už zaručuje, že
+                    # obě části jsou ASCII číslice a desetinná má nejvýš
+                    # DECIMALS míst. int() nad řetězcem delším než
+                    # sys.get_int_max_str_digits() vyhodí ValueError, kterou
+                    # zachytí `except Exception` níž.
+                    cela, _, des = amount_str.partition('.')
+                    amount_in_decimal = int(cela + des.ljust(DECIMALS, '0'))
                     if amount_in_decimal < MIN_TX_AMOUNT:
                         print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Částka transakce je příliš malá. Minimální částka je {format(Decimal(MIN_TX_AMOUNT) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}.")
                         continue
@@ -10176,12 +10454,15 @@ def main():
                 else:
                     fee_str = fee_str.replace(',', '.')
                     parts_fee = fee_str.split('.')
-                    if len(parts_fee) > 2 or not parts_fee[0].isdigit() or (len(parts_fee) == 2 and (not parts_fee[1].isdigit() or len(parts_fee[1]) > DECIMALS)):
+                    # OPRAVA U-4 (nález 5): totéž co u částky výš.
+                    if len(parts_fee) > 2 or not jen_ascii_cislice(parts_fee[0]) or (len(parts_fee) == 2 and (not jen_ascii_cislice(parts_fee[1]) or len(parts_fee[1]) > DECIMALS)):
                         print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Neplatný formát poplatku. Povolena jsou pouze čísla (0-9), jedna tečka a max. {DECIMALS} desetinných míst.")
                         continue
                     try:
-                        fee_decimal = Decimal(fee_str)
-                        fee = int(fee_decimal * (10 ** DECIMALS))
+                        # OPRAVA U-3 (nález 4): totéž co u částky výš -
+                        # celočíselně, bez zaokrouhlení na prec = 28.
+                        cela_f, _, des_f = fee_str.partition('.')
+                        fee = int(cela_f + des_f.ljust(DECIMALS, '0'))
                         # ZMĚNA 1: kontroluje se jen dolní mez (fee >= TX_FEE_MIN).
                         if fee < TX_FEE_MIN:
                             print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Poplatek za transakci je nižší než minimum ({format(Decimal(TX_FEE_MIN) / Decimal(10 ** DECIMALS), f'.{DECIMALS}f')} {TICKER}).")
@@ -10898,21 +11179,37 @@ def main():
                         locked_coins = 0
                         unlocked_coins = 0
                         
-                        conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
-                        conn.execute("PRAGMA journal_mode=WAL;")
-                        c = conn.cursor()
-                        c.execute("SELECT block_index, timestamp, transactions FROM blocks ORDER BY block_index ASC")
-                        
+                        # OPRAVA V-2 (audit 3. 10. 2026, nález 2): conn.close()
+                        # tu leželo jako obyčejný řádek za smyčkou, ve které běží
+                        # json.loads() i indexace dictu - tedy přesně vzorec, který
+                        # OPRAVA AUDIT-11 (volba 10, find_transaction_by_id)
+                        # a OPRAVA A-07 (volba 13) odstranily jinde. Volba 14 jako
+                        # jediná adresní obrazovka zůstala bez try/finally.
+                        # Naměřeno nad jediným poškozeným řádkem: 41 deskriptorů
+                        # po 20 voláních, tedy dva na volání (soubor + WAL) -
+                        # shodné s měřením u OPRAVY AUDIT-11.
+                        conn = None
                         coinbase_txs = []
-                        for row in c:
-                            b_idx = row[0]
-                            b_ts = row[1]
-                            b_txs = json.loads(row[2])
-                            if b_txs:
-                                cb_tx = b_txs[0]
-                                if cb_tx['from_address'] == "COINBASE" and cb_tx['to_address'] == miner_addr:
-                                    coinbase_txs.append((b_idx, b_ts, cb_tx))
-                        conn.close()
+                        try:
+                            conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
+                            conn.execute("PRAGMA journal_mode=WAL;")
+                            c = conn.cursor()
+                            c.execute("SELECT block_index, timestamp, transactions FROM blocks ORDER BY block_index ASC")
+
+                            for row in c:
+                                b_idx = row[0]
+                                b_ts = row[1]
+                                b_txs = json.loads(row[2])
+                                if b_txs:
+                                    cb_tx = b_txs[0]
+                                    if cb_tx['from_address'] == "COINBASE" and cb_tx['to_address'] == miner_addr:
+                                        coinbase_txs.append((b_idx, b_ts, cb_tx))
+                        finally:
+                            if conn is not None:
+                                try:
+                                    conn.close()
+                                except Exception:
+                                    pass
                         
                         if not coinbase_txs:
                             print(f"{Fore.CYAN}Žádné coinbase odměny pro tuto adresu.{Style.RESET_ALL}")
