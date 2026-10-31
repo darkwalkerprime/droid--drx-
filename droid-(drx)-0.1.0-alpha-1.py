@@ -305,6 +305,30 @@ SYNC_BUFFER_BYTES_SQL = (
     + "), 0) FROM sync_blocks"
 )
 
+def subsidy_po_halvingu(halvings):
+    """OPRAVA AUDIT-2026-18: BLOCK_REWARD // (2 ** halvings) v konstantním čase.
+
+    `2 ** halvings` je neomezené: block.index smí být až 2**63-1 (viz
+    Block.from_dict), takže halvings dosáhne ~9,2e12 a výsledkem je celé číslo
+    o 9,2e12 bitech, tedy >1 TB paměti. Naměřeno v update_state_with_block():
+    index 2**62 -> MemoryError po 11,4 s, index 10**15 -> 5,3 s a 125 MB.
+
+    Dosažitelné ze sítě to NENÍ - add_block(), _validate_fork_inner() i
+    _is_valid_chain_inner() vynucují návaznost indexů (block.index ==
+    previous.index + 1) JEŠTĚ PŘED tímhle výpočtem, takže halvings je shora
+    omezené skutečnou výškou řetězce. update_state_with_block() je ale veřejná
+    metoda a jediná, která si tu mez nehlídá sama - a spoléhat se na disciplínu
+    volajících je přesně to, co OPRAVA #4 a D-15 zakazují.
+
+    Výsledek je BIT ZA BITEM shodný s původním výrazem, takže konsenzus se
+    nemění: pro halvings >= BLOCK_REWARD.bit_length() je celočíselné dělení
+    nulové tak jako tak (komentář u OPRAVY AUDIT-10 to říká pro halving 33).
+    """
+    if halvings >= BLOCK_REWARD.bit_length():
+        return 0
+    return BLOCK_REWARD >> halvings
+
+
 def sync_row_bytes(hodnoty):
     # Python protějšek SYNC_BUFFER_BYTES_SQL nad týmž řádkem PŘED zápisem.
     # SQLite čísla při CASTu nejdřív vyrenderuje do textu, takže str(v) je
@@ -3216,7 +3240,7 @@ class Blockchain:
         undo_data['cumulative_work_change'] = work
 
         halvings = block.index // HALVING_INTERVAL_BLOCKS
-        subsidy = GENESIS_AMOUNT if block.index == 0 else BLOCK_REWARD // (2 ** halvings)
+        subsidy = GENESIS_AMOUNT if block.index == 0 else subsidy_po_halvingu(halvings)
         subsidy = max(0, min(subsidy, MAX_SUPPLY - target.total_supply))
             
         target.total_supply += subsidy
@@ -4672,7 +4696,7 @@ class Blockchain:
                 return False
 
             halvings = block.index // HALVING_INTERVAL_BLOCKS
-            expected_reward = BLOCK_REWARD // (2 ** halvings) if block.index > 0 else GENESIS_AMOUNT
+            expected_reward = subsidy_po_halvingu(halvings) if block.index > 0 else GENESIS_AMOUNT
             expected_reward = max(0, min(expected_reward, MAX_SUPPLY - base_total_supply))
                 
             total_fees = sum(tx.fee for tx in block.transactions if tx.from_address != "COINBASE")
@@ -5198,7 +5222,7 @@ class Blockchain:
             with self.lock:
                 new_block_index = self.max_block_index + 1
                 halvings = new_block_index // HALVING_INTERVAL_BLOCKS
-                current_reward = BLOCK_REWARD // (2 ** halvings)
+                current_reward = subsidy_po_halvingu(halvings)
                 current_reward = max(0, min(current_reward, MAX_SUPPLY - self.get_total_supply()))
                 
                 mining_reward = Transaction("COINBASE", miner_address, 0, nonce=new_block_index, public_key=None, signature=None, data=None, chain_id=CHAIN_ID)
@@ -5661,7 +5685,7 @@ class Blockchain:
                 return False, None, {}
 
             halvings = current_block.index // HALVING_INTERVAL_BLOCKS
-            expected_reward = BLOCK_REWARD // (2 ** halvings)
+            expected_reward = subsidy_po_halvingu(halvings)
             expected_reward = max(0, min(expected_reward, MAX_SUPPLY - total_supply))
                 
             total_fees = sum(tx.fee for tx in current_block.transactions if tx.from_address != "COINBASE")
@@ -6232,7 +6256,7 @@ class Blockchain:
                 return False, None
 
             halvings = current_block.index // HALVING_INTERVAL_BLOCKS
-            expected_reward = BLOCK_REWARD // (2 ** halvings)
+            expected_reward = subsidy_po_halvingu(halvings)
             expected_reward = max(0, min(expected_reward, MAX_SUPPLY - state.total_supply))
                 
             total_fees = sum(tx.fee for tx in current_block.transactions if tx.from_address != "COINBASE")
@@ -9064,8 +9088,13 @@ class P2PNode:
                 continue
             videne.add(bd_hash)
             try:
+                # OPRAVA AUDIT-2026-17: OverflowError, viz _pow_branka_bloku().
+                # Tady je to druhá linie (PoW branka výš se vrátí dřív), ale
+                # obě místa s týmž výrazem musí mít i týž except tuple.
+                if not isinstance(bd['target'], (str, int)) or isinstance(bd['target'], bool):
+                    return None
                 target = int(bd['target'], 16) if isinstance(bd['target'], str) else int(bd['target'])
-            except (TypeError, ValueError, KeyError):
+            except (TypeError, ValueError, KeyError, OverflowError):
                 return None
             if target <= 0:
                 return None
@@ -11462,9 +11491,33 @@ class P2PNode:
             if klic not in bd:
                 return f"Blok #{zkrat(bd.get('index'))} nemá povinné pole hlavičky '{klic}'."
 
+        # OPRAVA AUDIT-2026-17: OverflowError doplněn do tuple a nečíselné
+        # typy se odmítají JEŠTĚ PŘED int().
+        #
+        # json.loads() přijímá nestandardní literály Infinity / -Infinity / NaN
+        # (parse_constant je ve výchozím stavu zapnutý), takže 'target' mohl
+        # přijít jako float('inf') - a int(inf) vyhodí OverflowError, která NENÍ
+        # podtřídou ValueError. Kontrakt téhle branky ("vrať None, nebo text
+        # důvodu") tím přestal platit a výjimku spolkl až catch-all
+        # v handle_message(). Důsledkem byla ztráta POSTIHU, tedy přesně druhá
+        # polovina nálezu OPRAVY Y-1: blok s targetem 'zz' stál odesílatele
+        # BAN_DURATION_PROTOCOL, týž blok s targetem Infinity byl zdarma a
+        # opakovatelný donekonečna (naměřeno 200 zpráv, žádný ban).
+        #
+        # Dosažitelné to bylo VÝHRADNĚ z handleru 'new_block', který brankou
+        # _valid_block_dict() neprochází. Na cestě 'response_blocks' ta branka
+        # vynucuje isinstance(bd['target'], str), takže se tam nic nemění.
+        #
+        # Konsenzus se NEMĚNÍ: takový blok odmítnou všechny tři validátory tak
+        # jako tak (Block.from_dict vyžaduje kanonický hex řetězec), jen se teď
+        # odmítne se správnou diagnostikou a se stejným postihem jako sesterské
+        # případy. Táž úvaha jako u OPRAV N-5, U-7 a U-8: dvě branky mají
+        # o témže poli říkat totéž.
+        if not isinstance(bd['target'], (str, int)) or isinstance(bd['target'], bool):
+            return f"Blok #{zkrat(bd.get('index'))} má nečitelný target."
         try:
             target_val = int(bd['target'], 16) if isinstance(bd['target'], str) else int(bd['target'])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return f"Blok #{zkrat(bd.get('index'))} má nečitelný target."
 
         if target_val <= 0 or target_val > FIXED_TARGET:
