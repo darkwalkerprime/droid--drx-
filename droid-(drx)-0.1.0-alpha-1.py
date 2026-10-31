@@ -56,7 +56,21 @@ HALVING_INTERVAL_BLOCKS = 1_000_000
 BLOCK_TIME_SECONDS = 60
 COINBASE_MATURITY = 1000
 MAX_REORG_DEPTH = 1000
-TX_FEE_MIN = int(0.00000001 * (10 ** DECIMALS))
+# REFAKTOR (bez změny konsenzu): dřív `int(0.00000001 * (10 ** DECIMALS))`.
+# Hodnota je při DECIMALS = 8 shodná - `1e-08 * 10**8` se v double zaokrouhlí
+# přesně na 1.0, takže `int()` dalo 1. Důvod přepisu je trojí:
+#
+# 1) Byla to jediná konstanta, kde peníze procházely floatem. MAX_SUPPLY
+#    i BLOCK_REWARD násobí celými čísly, tedy přesně, a zbytek kódu počítá
+#    v nedělitelných jednotkách jako int.
+# 2) Při DECIMALS < 8 by `int()` výsledek TIŠE zkrátil na 0 (0.00000001 * 10**6
+#    = 0.01 -> 0). Z konsenzu by bez jediné chybové zprávy zmizela dolní mez
+#    poplatku i částky a povolily by se transakce s nulovým poplatkem.
+# 3) 1 vyjadřuje záměr přesněji: obě konstanty znamenají "jedna nejmenší
+#    nedělitelná jednotka", a to je 1 vždy, nezávisle na DECIMALS.
+#
+# 1 = 0.00000001 DRX při DECIMALS = 8.
+TX_FEE_MIN = 1
 # ZMĚNA 1: horní limit transakčního poplatku (dřívější konstanta TX_FEE_MAX,
 # 0,01 DRX) je odstraněn ÚPLNĚ a nenahrazuje ho žádná jiná konstanta ani jiný
 # maximální limit. Po OPRAVĚ #6b (níže) už platil jen jako mempoolová politika
@@ -88,11 +102,61 @@ TX_FEE_MIN = int(0.00000001 * (10 ** DECIMALS))
 #
 # Tohle je hard fork. Uzel s tímhle kódem přijme blok, který by starý uzel
 # odmítl. Musí být nasazeno před spuštěním sítě, ne po něm.
-MIN_TX_AMOUNT = int(0.00000001 * (10 ** DECIMALS))
+# REFAKTOR (bez změny konsenzu): dřív `int(0.00000001 * (10 ** DECIMALS))`,
+# ze stejných důvodů jako u TX_FEE_MIN výš. 1 = jedna nejmenší nedělitelná
+# jednotka, tedy 0.00000001 DRX při DECIMALS = 8.
+MIN_TX_AMOUNT = 1
 DIFFICULTY_ADJUSTMENT_INTERVAL = 144
 # OPRAVA #15: TARGET_BLOCK_TIME odstraněn - nikde se nepoužíval (LWMA-3 si
 # okno počítá z BLOCK_TIME_SECONDS a N přímo v calculate_expected_target).
-INITIAL_DIFFICULTY_BITS = 20
+# ZMĚNA 6 (HARD FORK): počáteční obtížnost zvýšena z 20 na 22 bitů.
+#
+# INITIAL_DIFFICULTY_BITS NENÍ jen "startovní" hodnota. Je to zároveň PODLAHA
+# obtížnosti pro celou životnost sítě, protože FIXED_TARGET vystupuje ve čtyřech
+# různých rolích:
+#
+#   1) target prvních DIFFICULTY_ADJUSTMENT_INTERVAL + 1 bloků - do té výšky
+#      vrací calculate_expected_target() natvrdo FIXED_TARGET, takže LWMA-3
+#      ještě vůbec nepočítá (prvních 145 bloků, při cílovém čase ~2,4 h),
+#   2) strop targetu v LWMA-3: new_target = max(1, min(new_target, FIXED_TARGET)).
+#      Tohle je ta podstatná role - ať hashrate spadne jakkoli hluboko,
+#      obtížnost se nikdy nedostane pod tuhle mez,
+#   3) povinná vlastnost genesis bloku (_is_valid_chain_inner vyžaduje
+#      current_block.target == FIXED_TARGET),
+#   4) síťové minimum v brankách, které blok platí ještě před plnou validací:
+#      _pow_branka_bloku() (a přes ni cesty 'response_blocks', 'new_block'
+#      i _store_fork_batch_inner()), add_orphan_block() a handler 'new_block'
+#      shodně odmítají target volnější než FIXED_TARGET.
+#
+# Důvod změny je měřený, ne odhadnutý. Na Poco X7 Pro (Dimensity 8400 Ultra)
+# dává uzel v Termuxu ~400 kH/s, takže:
+#
+#   20 bitů = 2^20 = 1 048 576 hashů na blok  -> ~2,6 s
+#   22 bitů = 2^22 = 4 194 304 hashů na blok  -> ~10,5 s
+#
+# Při BLOCK_TIME_SECONDS = 60 je 2,6 s o více než řád vedle. Prvních 145 bloků
+# by se vytěžilo prakticky okamžitě a LWMA-3 by nad nimi startovala z hodnoty,
+# která s realitou sítě nemá nic společného. Druhá polovina problému je role (2):
+# při výpadku nebo nepravidelné těžbě LWMA-3 target zvyšuje, dokud nenarazí na
+# strop - a strop na 20 bitech znamená, že i jediný mobil pak chrlí bloky po
+# pár vteřinách.
+#
+# POZOR, 22 BITŮ CÍL NEŘEŠÍ, JEN ZMENŠUJE ODSTUP: 10,5 s je pořád ~6x pod
+# BLOCK_TIME_SECONDS. Na 60 s při 400 kH/s by bylo potřeba 2,4e7 hashů, tedy
+# log2(400000 * 60) = 24,5 bitu. Hodnota je zvolená jako kompromis - podlaha
+# nemá odpovídat výkonu jednoho konkrétního telefonu, protože pak by se na
+# slabším zařízení nedal vytěžit ani první blok. O skutečný cílový čas se po
+# 145. bloku stará LWMA-3; tohle je jen mez, pod kterou nesmí klesnout.
+#
+# JE TO ZMĚNA KONSENZU (HARD FORK), a to OBOUSMĚRNÁ:
+#   - uzel s tímhle kódem odmítne každý blok vytěžený na 20bitovém targetu
+#     (neprojde ani PoW brankou, ani kontrolou expected_target),
+#   - starý uzel odmítne genesis blok s novým targetem a tím celý řetězec.
+# Patří tedy do kódu PŘED spuštěním sítě, ne po něm - stejně jako OPRAVA A-4,
+# OPRAVA #6b / ZMĚNA 1, OPRAVA #14, OPRAVA N-3 a OPRAVA AUDIT-10.
+#
+# Genesis blok byl kvůli tomu znovu vytěžen, viz GENESIS_NONCE níž.
+INITIAL_DIFFICULTY_BITS = 22
 FIXED_TARGET = (1 << 256) >> INITIAL_DIFFICULTY_BITS
 
 BLOCKCHAIN_DB = 'blockchain.db'
@@ -109,19 +173,33 @@ GENESIS_TIMESTAMP = 1785614400
 # Samotný state_root genesis bloku se dopočítá automaticky v create_genesis_block().
 # Při JAKÉKOLI změně obsahu genesis bloku (adresa, částka, čas, data, target,
 # version, chain_id) je nutné obě hodnoty níže znovu vytěžit a přepsat.
-# OPRAVA A-4 (hard fork): zavedení příznakového bajtu v encode_optional_field()
-# změnilo podepisovaná data, a tím i tx_id genesis transakce a merkle root
-# bloku. Genesis byl proto znovu vytěžen:
-#   tx_id genesis  d28c60c67232023b9eb14e91517a6ef2ba57bf42984cf809b382c89652c5f254
-#   merkle root    1454f46084c0419623620b5b6b3cf07b327d054420f79abc93cb0fa9edf48199
-#   state_root     c6253efc7a5da68207e84ab2d5d238e33c23e9945cf411c0c622cb0adfca380a (beze změny -
-#                  state root stojí na SMT účtů, immature odměně a total_supply, ne na tx_id)
-#   nonce 977525 -> hash 000005313da262cac258328eb23d83cf86a3b16764cc4b00a5f9eaefb5404ff8,
-#   splňuje FIXED_TARGET. verify_genesis_block() i CHECKPOINTS[0] projdou.
-# Předchozí hodnoty (nonce 3622, hash 0000092d03...) platily pro staré kódování
-# a s tímhle kódem by neprošly.
-GENESIS_NONCE = 977525
-GENESIS_BLOCK_EXPECTED_HASH = "000005313da262cac258328eb23d83cf86a3b16764cc4b00a5f9eaefb5404ff8"
+# ZMĚNA 6 (hard fork): zvýšení INITIAL_DIFFICULTY_BITS z 20 na 22 změnilo
+# FIXED_TARGET, a protože target je POLE HLAVIČKY (Block.compute_hash() ho balí
+# do 32 bajtů mezi nonce a previous_hash), změnil se i hash genesis bloku.
+# Genesis byl proto znovu vytěžen na nový target:
+#   tx_id genesis  d28c60c67232023b9eb14e91517a6ef2ba57bf42984cf809b382c89652c5f254 (beze změny)
+#   merkle root    1454f46084c0419623620b5b6b3cf07b327d054420f79abc93cb0fa9edf48199 (beze změny)
+#   state_root     c6253efc7a5da68207e84ab2d5d238e33c23e9945cf411c0c622cb0adfca380a (beze změny)
+#   nonce 1110404 -> hash 000000175a92851df760840381db6b0dbb63d68242f6d6b9d1366e18c776b006
+#
+# Změnil se tedy VÝHRADNĚ nonce a hash. tx_id ani merkle root na targetu
+# nezávisí (ten do get_signing_data() ani do listu Merkle stromu nevstupuje)
+# a state_root stojí na SMT účtů, immature odměně a total_supply, ne na hlavičce.
+#
+# Nonce je NEJNIŽŠÍ, který nový target splňuje - hledalo se postupně od nuly,
+# stejnou konvencí jako u předchozích hodnot.
+#
+# OPRAVA A-4 (hard fork): předtím zavedení příznakového bajtu
+# v encode_optional_field() změnilo podepisovaná data, a tím tx_id genesis
+# transakce i merkle root bloku; tehdy platily nonce 977525 a hash
+# 000005313da262cac258328eb23d83cf86a3b16764cc4b00a5f9eaefb5404ff8 (a před nimi
+# nonce 3622, hash 0000092d03... pro staré kódování). Obojí by s tímhle kódem
+# neprošlo - hodnoty jsou tu jen jako záznam, proč se genesis těžil opakovaně.
+#
+# verify_genesis_block() i CHECKPOINTS[0] projdou (checkpoint se z téhle
+# konstanty odvozuje, takže se nemusí přepisovat zvlášť).
+GENESIS_NONCE = 1110404
+GENESIS_BLOCK_EXPECTED_HASH = "000000175a92851df760840381db6b0dbb63d68242f6d6b9d1366e18c776b006"
 GENESIS_AMOUNT = 50 * (10 ** DECIMALS)
 
 MAX_BLOCK_SIZE_BYTES = 1 * 1024 * 1024
@@ -677,8 +755,9 @@ FORK_SYNC_IDLE_TIMEOUT = 60
 # PŘÍCHODU a nabízená práce se neporovnávala s ničím: kdo poslal první
 # PoW-platný blok, držel slot celých FORK_SYNC_IDLE_TIMEOUT a dávky všech
 # ostatních se zahazovaly ("Dávka od ... ignorována: fork se stahuje z ...").
-# Útočníkovi na to stačil JEDEN blok vytěžený na FIXED_TARGET (~2^20 hashů),
-# znovupoužitelný donekonečna - stačí ho přehrávat s has_more: true. Naměřeno:
+# Útočníkovi na to stačil JEDEN blok vytěžený na FIXED_TARGET (po ZMĚNĚ 6
+# ~2^22 hashů, v době nálezu ~2^20), znovupoužitelný donekonečna - stačí ho
+# přehrávat s has_more: true. Naměřeno:
 # uzel s vrcholem #12 ignoroval těžší větev po #30 v šesti kolech za sebou,
 # bez jediného banu. Prakticky to znamená, že uzel nikdy neprovede hluboký
 # reorg a zůstane na lehčí větvi.
@@ -4841,7 +4920,8 @@ class Blockchain:
         # výš i blok, jehož `transactions` s hlavičkou vůbec nesouvisí: hash je
         # polem HLAVIČKY, takže jedna vytěžená hlavička unesla libovolný obsah.
         #
-        # Ověřeno se skutečným PoW (nonce 657 711 na FIXED_TARGET): hlavičce se
+        # Ověřeno se skutečným PoW (nonce 657 711 na tehdejším 20bitovém
+        # FIXED_TARGET; po ZMĚNĚ 6 by vyšel jiný nonce): hlavičce se
         # beze změny podstrčilo 2 600 vymyšlených transakcí, hash zůstal bit za
         # bitem shodný a add_orphan_block blok PŘIJAL - zatímco add_block ho
         # při příchodu rodiče zaručeně odmítne. Pool tedy držel blok, o kterém
@@ -4881,7 +4961,8 @@ class Blockchain:
             # jednotka ze stejného důvodu jako u EXPENSIVE_BYTES_*: 100 prázdných
             # bloků stojí zlomek toho, co 100 plných, a útočník si vybere ty plné.
             # OPRAVA N-8: vytěsňovalo se FIFO bez ohledu na práci, takže 17 orphanů
-            # s nejsnazším povoleným targetem (~2^20 hashů) vytlačilo i legitimní
+            # s nejsnazším povoleným targetem (po ZMĚNĚ 6 ~2^22 hashů, v době
+            # nálezu ~2^20) vytlačilo i legitimní
             # orphan s plnou síťovou obtížností (test t_bug8_orphans.py). Nově se
             # obětuje orphan s NEJMENŠÍ prací (při shodě nejstarší) a jen tehdy,
             # když nový nese práce víc - levný spam tak nevytlačí dražší bloky.
@@ -8320,6 +8401,22 @@ class P2PNode:
         # ona (MAX_MANUAL_PEERS_TOTAL); uklízí ji _uklid_evidence_peeru_locked()
         # spolu s peer_last_seen a offline_peers.
         self.handshake_sent = {}
+        # OPRAVA AUDIT-2026-15 (audit 27. 10. 2026, nálezy 2 a 5): evidence
+        # nedostupných peerů patří sem, ne do líného `if not hasattr(...)`.
+        #
+        # Líné vytváření bylo samo malým souběhem: dvě odchozí vlákna mohla
+        # obě projít testem hasattr a obě přiřadit čerstvou množinu, takže
+        # zápis jednoho z nich zmizel a hláška "je offline" se pro téhož peera
+        # vypsala dvakrát. Je to táž třída problému jako zbytek nálezu 2, jen
+        # o jednu úroveň výš, a u atributu, který existuje po celou dobu života
+        # uzlu, není pro líné vytváření žádný důvod.
+        #
+        # Množina drží peery, o kterých víme, že jsou nedostupní. Smysl je
+        # jediný: hlásit PŘECHOD stavu, ne každý neúspěšný pokus. Zapisuje se
+        # výhradně přes _oznac_peer_offline() / _oznac_peer_online(), které si
+        # berou peers_lock, protože tutéž množinu prochází
+        # _uklid_evidence_peeru_locked() pod tímtéž zámkem.
+        self.offline_peers = set()
         # OPRAVA W-3 (audit 9. 10. 2026, nález N-3): token bucket místo seznamu
         # časových razítek. Stejná dvojice struktur jako u is_rate_limited():
         # kbelík na burst a počítadlo dlouhodobého překračování, které jediné
@@ -10062,10 +10159,10 @@ class P2PNode:
         zive = set(self.peers)
         for klic in [k for k in self.peer_last_seen if k not in zive]:
             self.peer_last_seen.pop(klic, None)
-        offline = getattr(self, 'offline_peers', None)
-        if offline:
-            for klic in [k for k in offline if k not in zive]:
-                offline.discard(klic)
+        # OPRAVA AUDIT-2026-15 (nálezy 2 a 5): atribut zakládá konstruktor,
+        # takže getattr() s náhradní hodnotou už není potřeba.
+        for klic in [k for k in self.offline_peers if k not in zive]:
+            self.offline_peers.discard(klic)
         # OPRAVA AUDIT-2026-6 (nález N1): evidence odeslaných handshaků patří do
         # stejného úklidu. Vytlačenému peerovi musí značka zmizet - kdyby se
         # vrátil do tabulky, představíme se mu znovu, protože o nás mezitím
@@ -10074,6 +10171,97 @@ class P2PNode:
         if handshaky:
             for klic in [k for k in handshaky if k not in zive]:
                 handshaky.pop(klic, None)
+
+    def _peer_str(self, peer):
+        """Jednotný zápis adresy pro log (IPv6 v hranatých závorkách)."""
+        return f"[{peer[0]}]:{peer[1]}" if ':' in str(peer[0]) else f"{peer[0]}:{peer[1]}"
+
+    @staticmethod
+    def _duvod_spojeni(e):
+        """OPRAVA AUDIT-2026-15 (nález 5): krátký, STABILNÍ popis selhání spojení.
+
+        Text se vypisuje jen v přechodové hlášce, ale musí být stabilní:
+        socket.timeout má prázdný str(), kdežto OSError nese errno a text
+        závislý na jazyku systému. Kdyby se do hlášky dostalo volné str(e),
+        rozpad na varianty by znovu zapnul to, co potlačení v add_log() řeší -
+        a hlavně by se do logu dostal text z prostředí, kde uzel běží.
+        """
+        if isinstance(e, socket.timeout):
+            return "spojení vypršelo"
+        if isinstance(e, ConnectionRefusedError):
+            return "spojení odmítnuto"
+        if isinstance(e, socket.gaierror):
+            return "adresu nelze přeložit"
+        if isinstance(e, OSError) and getattr(e, 'errno', None) is not None:
+            return f"chyba sítě (errno {e.errno})"
+        return type(e).__name__
+
+    def _oznac_peer_offline(self, peer, duvod=None):
+        """OPRAVA AUDIT-2026-15 (audit 27. 10. 2026, nálezy 2 a 5): jediná cesta,
+        kudy se peer označuje za nedostupného.
+
+        Řeší dvě věci najednou, protože mají tutéž příčinu - evidenci
+        dostupnosti si dosud každá cesta vedla sama:
+
+        NÁLEZ 2 (souběh): self.offline_peers se měnila MIMO peers_lock
+        (_send_to_single_peer z odchozích vláken), ale
+        _uklid_evidence_peeru_locked() ji prochází POD ním. Naměřeno nad
+        otevřeným oknem: 151 výjimek, z toho 94x RuntimeError "Set changed size
+        during iteration" a 57x "dictionary changed size during iteration".
+        V ostrém provozu je okno mikrosekundové (evidence má strop ~24 položek),
+        takže dopad byl jedno přeskočené kolo periodické synchronizace - zachytí
+        ho `except` z OPRAVY R-3 - ale je to souběh a patří pod zámek.
+        Zápis do množiny je proto celý pod peers_lock, včetně testu přechodu.
+
+        NÁLEZ 5 (spam v menu): connect_to_peer() hlásila selhání přes print(),
+        takže šla do MENU, ne do P2P logu - a protože se při selhání nenastaví
+        handshake_sent, periodický sync ji zkoušel znovu každých 10 s a hlásil
+        totéž donekonečna ("Chyba při připojování: timed out"). Potlačování
+        opakování v add_log() na to nedosáhne ze dvou důvodů: print() ho obchází
+        úplně, a i kdyby ne, hlášky se v logu střídají s "Synchronizuji
+        blockchain a mempool..." z téhož kola, takže se nikdy neopakují DVĚ
+        STEJNÉ ZA SEBOU, na což je potlačování v add_log() postavené.
+
+        Správná jednotka proto není hláška, ale STAV peera: hlásí se jen
+        PŘECHOD dostupný -> nedostupný, tedy jednou při odpojení a jednou při
+        opětovném připojení (_oznac_peer_online). Přesně tenhle vzorec už
+        _send_to_single_peer() používala, jen si ho vedla lokálně; teď ho má
+        celý uzel na jednom místě.
+
+        Vrací True, pokud šlo o přechod (a hláška se tedy zapsala).
+        """
+        with self.peers_lock:
+            # OPRAVA AUDIT-2026-4 (nález 4): do evidence smí JEN peer, který je
+            # v tabulce. Pro adresu mimo tabulku je to evidence něčeho, co uzel
+            # stejně nesleduje, a množina by neměla strop.
+            if peer not in self.peers:
+                return False
+            if peer in self.offline_peers:
+                return False
+            self.offline_peers.add(peer)
+        # add_log() bere p2p_log_lock, proto se volá až po uvolnění peers_lock:
+        # pořadí zámků se tím nikde nekříží.
+        popis = f" ({duvod})" if duvod else ""
+        self.add_log(f"{Fore.RED}Uzel {self._peer_str(peer)} je offline{popis}{Style.RESET_ALL}")
+        return True
+
+    def _oznac_peer_online(self, peer):
+        """Druhá polovina OPRAVY AUDIT-2026-15 (nálezy 2 a 5): peer se ozval.
+
+        Hláška jde do logu jen tehdy, když jsme ho předtím vedli jako offline -
+        tedy jednou při opětovném připojení, ne při každém úspěšném kole.
+        discard() místo remove(): dvě odchozí vlákna mohou dojít k úspěchu
+        současně a vzorec `if peer in mnozina: mnozina.remove(peer)` mezi testem
+        a odebráním nedržel nic. Vlákno v _spawn_send() navíc žádný except nemá,
+        takže by KeyError skončil tracebackem na stderr - tedy právě v tom
+        terminálu, který nález 5 odhlučňuje.
+        """
+        with self.peers_lock:
+            if peer not in self.offline_peers:
+                return False
+            self.offline_peers.discard(peer)
+        self.add_log(f"{Fore.GREEN}Uzel {self._peer_str(peer)} je opět online{Style.RESET_ALL}")
+        return True
 
     @staticmethod
     def _provisional_node_id(port):
@@ -10955,7 +11143,11 @@ class P2PNode:
         # i oba dotazy po JEDNOM socketu (OPRAVA #1) a odpovědi dorazí
         # reaktivně - stejnou cestou, jakou prokazatelně funguje ruční přidání
         # z menu. Proto se tenhle kruh nedokončuje dialogem, ale skončí tady.
-        if peer not in self.handshake_sent:
+        # OPRAVA AUDIT-2026-15 (nález 2): čtení pod zámkem, aby se test nemíjel
+        # se souběžným úklidem v _uklid_evidence_peeru_locked().
+        with self.peers_lock:
+            predstaveni_chybi = peer not in self.handshake_sent
+        if predstaveni_chybi:
             self.connect_to_peer(peer)
             return
 
@@ -10969,8 +11161,20 @@ class P2PNode:
             # mezitím restartovala a na náš handshake si nepamatuje. Značka se
             # proto zahodí a příští kolo se představíme znovu. Tím se spojení
             # po restartu souseda uzdraví samo, bez zásahu uživatele.
-            self.handshake_sent.pop(peer, None)
+            #
+            # OPRAVA AUDIT-2026-15 (nález 2): pod peers_lock, viz zápis
+            # v connect_to_peer().
+            with self.peers_lock:
+                self.handshake_sent.pop(peer, None)
+            # OPRAVA AUDIT-2026-15 (nález 5): ticho na aplikační dotaz je taky
+            # nedostupnost, i když TCP spojení prošlo. Bez tohohle by se uzel,
+            # který spojení přijímá a pak mlčí, v logu nikdy neobjevil jako
+            # offline - a příští kolo by na něj poslalo connect_to_peer(), jehož
+            # hláška se nově hlásí jen při přechodu. Tady je ten přechod.
+            self._oznac_peer_offline(peer, "neodpovídá na dotazy")
             return
+        # Odpověď přišla, takže peer žije - případný přechod zpět na online.
+        self._oznac_peer_online(peer)
         self.handle_message(resp, peer, driven=True)
 
         # OPRAVA F-04: odpověď se přijme jen tehdy, když jsme si o ni řekli.
@@ -11331,9 +11535,29 @@ class P2PNode:
         _valid_block_dict(). Právě to je ale ten vzorec, který si kód jinde
         výslovně zakazuje (OPRAVA #4, D-15, G-07): branka nesmí spoléhat na to,
         že ji někdo jiný zavolá ve správném pořadí.
+
+        OPRAVA AUDIT-2026-15 (audit 27. 10. 2026, nález 3): dokončení téže
+        myšlenky o jedno pole dál. Předchozí oprava dala isinstance guard celé
+        funkci a `bd['transactions']` schovala do try, ale `bd['merkle_root']`
+        o pár řádků níž zůstal nechráněný - a to je POVINNÉ pole hlavičky,
+        které v dictu chybět může. Nad blokem bez něj funkce vyhodila
+        KeyError('merkle_root'), tedy přesně to, co její kontrakt zakazuje
+        (naměřeno: sesterská _pow_branka_bloku() nad týmž vstupem korektně
+        vrátila text "Blok #1 nemá povinné pole hlavičky 'merkle_root'.").
+
+        Dosažitelné to opět NENÍ - jediný volající pouští PoW branku dřív a ta
+        chybějící 'merkle_root' zachytí - ale je to táž vada druhé linie, jakou
+        řešila AUDIT-2026-14, a platí pro ni tentýž argument: branka se nesmí
+        spoléhat na pořadí volání. Řeší se stejnou technikou jako v PoW brance,
+        tedy explicitní kontrolou přítomnosti pole, aby se vracel SROZUMITELNÝ
+        důvod (text putuje do _abort_fork_sync() jako důvod 24hodinového banu),
+        ne jen obecné "nečitelná data".
         """
         if not isinstance(bd, dict):
             return "Blok není objekt JSON."
+        # Totéž pojmenování chybějícího pole, jaké dává _pow_branka_bloku().
+        if 'merkle_root' not in bd:
+            return "Blok nemá povinné pole hlavičky 'merkle_root'."
         try:
             transakce = [Transaction.from_dict(t) for t in bd['transactions']]
         except (ValueError, KeyError, TypeError) as e:
@@ -11869,6 +12093,29 @@ class P2PNode:
         self.add_log(f"{Fore.YELLOW}{popis} od {ip_port} zahozeno: naslouchací port není znám.{Style.RESET_ALL}")
         return True
 
+    def _je_duplicitni_transakce(self, tx):
+        """OPRAVA AUDIT-2026-16 (audit 28. 10. 2026, nález 1): odliší "tuhle
+        transakci UŽ MÁME" od "ta transakce je VADNÁ".
+
+        add_transaction() vrací False pro obojí, ale pro započtení do
+        MAX_UNAUTHENTICATED_MESSAGES je to rozdíl mezi poctivým sousedem a
+        útočníkem - viz odůvodnění na volajícím místě.
+
+        Volá se VÝHRADNĚ na zamítavé cestě, tedy až když add_transaction()
+        vrátila False. Dotaz do DB tím padá na vzácnou cestu: u transakce, která
+        se do mempoolu přijala, se nekoná vůbec.
+
+        Při nedostupné databázi se vrací True ("považuj za duplicitu"). Je to
+        záměrně shovívavá volba: neumíme-li kvůli VLASTNÍMU problému rozhodnout,
+        nesmí to peera stát spojení. Táž úvaha jako u fail-safe v OPRAVĚ S-4.
+        """
+        if tx.tx_id in self.blockchain.mempool_by_txid:
+            return True
+        try:
+            return self.blockchain.is_tx_id_in_chain(tx.tx_id)
+        except (sqlite3.Error, MissingChainDataError, OSError):
+            return True
+
     # OPRAVA F-06: očekávaný tvar pole 'data' podle typu zprávy. Dřív si každá
     # větev sahala na message['data'] po svém a 12 z 12 testovaných tvarů
     # vyhodilo výjimku ven z handleru (KeyError při chybějícím 'data',
@@ -12185,6 +12432,34 @@ class P2PNode:
         if not isinstance(msg_type, str):
             self.add_log(f"{Fore.RED}Přijata zpráva s nekorektním typem od uzlu {ip_port}. Odmítnuto.{Style.RESET_ALL}")
             return False
+
+        # OPRAVA AUDIT-2026-16 (audit 28. 10. 2026, nález 3): když spojení
+        # identitu nenese, zkusí se identita ze SAMOTNÉ ZPRÁVY.
+        #
+        # src_node_id plní jen handshake na tomtéž spojení. Přeposílání
+        # (OPRAVA W-2) ale často odchází JEDNORÁZOVÝM socketem bez handshaku
+        # (fallback v _send_to_single_peer, když se nedrží perzistentní
+        # spojení), takže u 'new_block' i 'transaction' zůstávalo None -
+        # naměřeno addr=('127.0.0.1', 34034), src_node_id=None. Při dvou uzlech
+        # na jedné IP pak resolve_peer_addr() vrátí None a volající padá na
+        # hrubší klíč nebo žádost vůbec neodešle.
+        #
+        # Stamp přidává preposli_sousedum() do odcházející zprávy. Pro uzly se
+        # starším kódem se nic nemění: pole navíc ignorují (tvarová branka
+        # _data_shape_ok() se dívá jen do 'data') a jeho absence vrací chování
+        # přesně na stav před touto opravou, takže PROTOCOL_VERSION se nemění.
+        #
+        # Podvržení cizího node_id nedává nic navíc: resolve_peer_addr() hledá
+        # klíč (NAŠE IP odesílatele, node_id), takže se dá jmenovat jedině uzel,
+        # který už na TÉŽE IP známe - a tam dnešní kód vynechává celou IP tak
+        # jako tak. Jediný možný následek je, že jeden soused přijde o jedno
+        # přeposlání a dostane totéž nejbližším kolem syncu.
+        if src_node_id is None:
+            nid_ze_zpravy = message.get('node_id')
+            # Táž kontrola typu i délky jako u handshaku (OPRAVA N6): hodnota
+            # se stává částí KLÍČE do peer_listen_ports.
+            if isinstance(nid_ze_zpravy, str) and 0 < len(nid_ze_zpravy) <= MAX_NODE_ID_LEN:
+                src_node_id = nid_ze_zpravy
         # OPRAVA N1 (audit 10. 10. 2026, nález N1): délková mez na 'type'.
         #
         # Kontrolovalo se jen isinstance(..., str), a msg_type se pak
@@ -12277,8 +12552,27 @@ class P2PNode:
         # I po přeposílání (OPRAVA W-2) od jednoho souseda přijde jeden blok za
         # kolo. Zahozená zpráva navíc neznamená ztracený blok - periodický sync
         # ho dotáhne do 10 s.
+        # OPRAVA AUDIT-2026-15 (audit 27. 10. 2026, nález 1): do rozpočtu
+        # přibyla 'response_chain_info', ale JEN jako nevyžádaná.
+        #
+        # Byla to jediná zpráva bez branky očekávání (response_mempool má
+        # consume_mempool_expectation(), response_full_chain
+        # consume_full_chain_expectation(), response_blocks automat forku) a
+        # zároveň jediná, která v tomhle seznamu chyběla - přitom každá vyvolá
+        # get_locator_hashes() (čtení z DB) a odchozí spojení, tedy slot
+        # v GLOBÁLNÍM semaforu MAX_OUTBOUND_SEND_THREADS.
+        #
+        # Vyjímka pro driven je nutná, ne kosmetická: driven=True nastavuje
+        # VÝHRADNĚ náš vlastní kód (_sync_with_peer_inner / sync_blocks_from_peer)
+        # pro odpověď, která přišla na socketu, jejž jsme sami otevřeli na svůj
+        # vlastní dotaz. Útočník si ten příznak nastavit nemůže. Kdyby pod limit
+        # spadla i vyžádaná odpověď, omezil by se počáteční sync - periodické
+        # kolo se ptá každých 10 s, kdežto ostatní zprávy v seznamu jsou
+        # příchozí DOTAZY, které nikdy nechodí s driven=True, takže se pro ně
+        # nic nemění.
         if msg_type in ('request_blocks', 'request_full_chain', 'request_mempool',
-                        'request_chain_info', 'new_block'):
+                        'request_chain_info', 'new_block') or (
+                            msg_type == 'response_chain_info' and not driven):
             if self.is_expensive_rate_limited(addr):
                 self.add_log(f"{Fore.YELLOW}Dotaz {msg_type} od {ip_port} zahozen: vyčerpán limit drahých dotazů.{Style.RESET_ALL}")
                 return True
@@ -12324,11 +12618,53 @@ class P2PNode:
                 # Posílá se tx.to_dict(), ne přijatý tx_data: to_dict() je
                 # kanonický tvar, takže se nešíří případné odchylky vstupu.
                 if self.preposli_sousedum({'type': 'transaction', 'data': tx.to_dict()},
-                                          ('tx', tx.tx_id), addr):
+                                          ('tx', tx.tx_id), addr, src_node_id=src_node_id):
                     self.add_log(f"{Fore.CYAN}Transakce {tx.tx_id} přeposlána ostatním uzlům.{Style.RESET_ALL}")
             else:
+                # OPRAVA AUDIT-2026-16 (audit 28. 10. 2026, nález 1): duplicita
+                # se NEZAPOČÍTÁVÁ do MAX_UNAUTHENTICATED_MESSAGES.
+                #
+                # OPRAVA AUDIT-2026-15 sem správně doplnila `return False` za
+                # VADNOU transakci, ale `add_transaction()` vrací False i za
+                # transakci, kterou UŽ MÁME - a to je v lavinovém šíření
+                # (OPRAVA W-2) úplně běžný stav, ne útok. preposli_sousedum()
+                # posílá všem sousedům kromě přímého odesílatele, takže
+                # v jakékoli topologii s cyklem dostane uzel tutéž transakci
+                # dvakrát ZARUČENĚ: v trojúhelníku A-B-C ji C dostane od A i od
+                # B, oba poctiví.
+                #
+                # Pět takových duplicit za sebou na jednom spojení znamenalo
+                # MAX_UNAUTHENTICATED_MESSAGES a zavření spojení poctivému
+                # sousedovi (naměřeno: 8 duplicit na živých třech uzlech = 1
+                # reálně zavřené TCP spojení). A protože relay i synchronizační
+                # dotazy jedou po TOMTÉŽ PeerConnection, zavření vzalo s sebou
+                # i rozpracované dotazy - send_request() vrátí None a probíhající
+                # kolo sync_blocks_from_peer() skončí "přerušen (bez odpovědi)".
+                # Uzel dohánějící řetězec si tak běžný provoz transakcí
+                # opakovaně shazoval stahování.
+                #
+                # Replay téže transakce donekonečna zdarma není: na tenhle typ
+                # sedí vlastní rychlostní limit is_tx_rate_limited() z OPRAVY
+                # W-3, který zprávu zahodí ještě dřív, než se sem dojde.
+                if self._je_duplicitni_transakce(tx):
+                    self.add_log(f"{Fore.YELLOW}Transakce {tx.tx_id} už ji máme (duplicita z přeposílání), zahozena.{Style.RESET_ALL}")
+                    return True
+
                 self.add_log(f"{Fore.RED}Přijatá transakce je neplatná, odmítnuta.{Style.RESET_ALL}")
-                
+                # OPRAVA AUDIT-2026-15 (audit 27. 10. 2026, nález 4): tahle
+                # cesta OPRAVĚ B-4 unikla. Je to přitom ta nejdostupnější ze
+                # všech odmítavých cest: transakce s rozbitým podpisem projde
+                # from_dict() (podpis do tx_id nevstupuje) a padne teprve na
+                # add_transaction(), takže se sem dá dojít libovolně dlouho
+                # (naměřeno: návrat None, tedy `započte se: False`).
+                #
+                # Čítač se větví `else` výše dokonce VYNULOVAL, takže peer, který
+                # posílá výhradně neplatné transakce, držel vlákno zdarma a
+                # MAX_UNAUTHENTICATED_MESSAGES na něj nedosáhl vůbec. Vlastní
+                # rychlostní limit (is_tx_rate_limited) škodu omezuje, ale
+                # mechanismus nedělal to, co podle komentáře u B-4 dělat má.
+                return False
+
         elif msg_type == 'request_chain_info':
             local_length = self.blockchain.max_block_index + 1
             local_last_hash = self.blockchain.get_last_block().hash
@@ -12363,9 +12699,33 @@ class P2PNode:
                     # odpovědí místo řetězu nevyžádaných zpráv.
                     self.sync_blocks_from_peer(requester_addr)
                 else:
+                    # OPRAVA AUDIT-2026-15 (nález 1), druhá polovina: tahle
+                    # větev je NEVYŽÁDANÁ cesta - zprávu nikdo nežádal, a přesto
+                    # z ní vycházelo čtení z DB (get_locator_hashes) a odchozí
+                    # spojení držící slot globálního semaforu ~10 s.
+                    #
+                    # Naměřený dopad před opravou: 60 zpráv po 199 B (11 940 B
+                    # celkem, bez PoW a bez zůstatku) z JEDNÉ IP, jejíž
+                    # deklarovaný naslouchací port zahazuje SYN, obsadilo
+                    # všech 32/32 slotů - a uzel pak nepřeposlal ani vlastní
+                    # vytěžený blok, ani transakci ("blok doručen poctivému
+                    # peerovi: False"). Sám se dál synchronizoval, protože pull
+                    # jde přes get_connection, takže se navenek tvářil zdravě.
+                    #
+                    # Rozpočet drahých dotazů výše sám nestačí: při 4 dotazech/s
+                    # a desetisekundové držbě slotu vychází 40 souběžných slotů,
+                    # tedy pořád víc než 32. Druhá branka je proto jednorázová
+                    # v okně CHAIN_INFO_REQUEST_COOLDOWN na IP - táž, kterou
+                    # OPRAVA N2 zavřela tutéž páku u 'new_block'. Jedna IP tak
+                    # drží nejvýš jeden slot a periodický sync se ptá sám.
+                    if not self._muze_zadat_chain_info(addr):
+                        self.add_log(f"{Fore.YELLOW}Nevyžádaná informace o řetězci od {ip_port}: "
+                                     f"bloky jsem si od téhle IP vyžádal za poslední "
+                                     f"{int(CHAIN_INFO_REQUEST_COOLDOWN)} s, dotaz neopakuji.{Style.RESET_ALL}")
+                        return
                     request = {'type': 'request_blocks', 'data': {'locator_hashes': self.get_locator_hashes()}}
                     self.send_to_peer(requester_addr, request)
-                    
+
             if remote_cum_work > local_cum_work:
                 self.add_log(f"{Fore.YELLOW}Detekován řetězec s větší prací. Žádám o bloky přes inkrementální sync...{Style.RESET_ALL}")
                 request_blocks_from_sender()
@@ -12662,6 +13022,38 @@ class P2PNode:
             if first_block_index == current_index and first_block_data['previous_hash'] == last_hash and not getattr(self, 'syncing_fork', False):
                 added = False
                 for block_data in blocks_data:
+                    # OPRAVA AUDIT-2026-16 (audit 28. 10. 2026, nález 2): branka
+                    # PoW i na téhle cestě, a to PŘED Block.from_dict().
+                    #
+                    # Tahle větev ("přímé pokračování") byla jediná ze TŘÍ cest,
+                    # kterými blok ze sítě vstupuje, bez branky: forková větev
+                    # téhož handleru ji má od OPRAVY U-19 (volá se v
+                    # _store_fork_batch_inner i na first_block_data), cesta
+                    # 'new_block' od OPRAVY Y-1. Komentář u Y-1 přitom říká
+                    # otevřeně, že "dvě síťové cesty přijímající bloky se nesmějí
+                    # lišit v tom, co po nich chtějí, ani v tom, KDY to chtějí" -
+                    # jenže se to tehdy dopsalo jen do 'new_block'.
+                    #
+                    # Druhá polovina nálezu je POSTIH. Zamítnutí v add_block()
+                    # níž jen logovalo, takže týž podvržený blok, který přes
+                    # 'new_block' stojí BAN_DURATION_PROTOCOL, byl přes
+                    # 'response_blocks' zdarma a opakovatelný donekonečna.
+                    # Naměřeno 7 ze 7 případů (podvržený hash, merkle_root,
+                    # state_root, cizí chain_id, target pod síťovým minimem,
+                    # target 2**63, chybějící state_root): 'new_block' -> 24h,
+                    # 'response_blocks' -> bez banu. Útočník si prostě vybral
+                    # druhou cestu.
+                    #
+                    # Branka je bez vedlejších efektů a konstantně drahá, takže
+                    # ji lze volat nad syrovým dictem; poctivý blok s platným PoW
+                    # žádnou z jejích podmínek porušit nemůže.
+                    duvod_pow = self._pow_branka_bloku(block_data)
+                    if duvod_pow is not None:
+                        self.add_log(f"{Fore.RED}Blok v dávce od {ip_port} zahozen ještě před parsováním: {duvod_pow}{Style.RESET_ALL}")
+                        if addr:
+                            self.ban_peer(addr[0], duvod_pow, BAN_DURATION_PROTOCOL)
+                        break
+
                     # OPRAVA D-02/D-07: from_dict pracuje s nedůvěryhodnými daty
                     # a nově garantuje ValueError i pro target mimo rozsah.
                     # Necháme-li ji propadnout, spadne celé spojení v obecném
@@ -12681,9 +13073,28 @@ class P2PNode:
                         last_hash = block.hash
                         added = True
                     else:
+                        # OPRAVA AUDIT-2026-16 (nález 2): tady se ZÁMĚRNĚ
+                        # NEBANUJE, přesně jako na cestě 'new_block'.
+                        #
+                        # add_block() vrací False i z důvodů, za které peer
+                        # nemůže: vypršení ADD_BLOCK_LOCK_TIMEOUT ("System is
+                        # busy") a MissingChainDataError nad nečitelnou vlastní
+                        # databází. Ban by tedy trestal poctivý uzel za NÁŠ
+                        # lokální problém - a to je přesně ten failure mode,
+                        # proti kterému míří OPRAVY #1, #21 a N-1.
+                        #
+                        # Postih nese branka výš, a to stačí: hlavička, kterou
+                        # hashuje (Block.hlavicka_hash_z_dictu), zahrnuje
+                        # version, chain_id, index, timestamp, nonce, target,
+                        # previous_hash, merkle_root I state_root. Jakákoli
+                        # podvržená hodnota kteréhokoli z nich tedy hash
+                        # hlavičky rozbije a branka ji zachytí s banem - ověřeno
+                        # na všech sedmi případech z nálezu. Co brankou projde,
+                        # za to odesílatel ZAPLATIL platným PoW, takže to není
+                        # zdarma opakovatelné.
                         self.add_log(f"{Fore.RED}Neplatný blok #{block.index}, přerušuji přidávání.{Style.RESET_ALL}")
                         break
-                        
+
                 if added:
                     save_data_z_p2p(self.blockchain, self.peers_snapshot())
                     self.add_log(f"{Fore.GREEN}Nové bloky úspěšně přidány (přímé pokračování).{Style.RESET_ALL}")
@@ -13008,7 +13419,7 @@ class P2PNode:
                 # False). Tím je zároveň vyřešená smyčka: druhý výskyt téhož
                 # bloku už add_block() nepřijme.
                 self.preposli_sousedum({'type': 'new_block', 'data': new_block.to_dict()},
-                                       ('blok', new_block.hash), addr)
+                                       ('blok', new_block.hash), addr, src_node_id=src_node_id)
                 save_data_z_p2p(self.blockchain, self.peers_snapshot())
             else:
                 # OPRAVA L-3: spojení bez try/finally na síťové cestě. json se
@@ -13017,12 +13428,21 @@ class P2PNode:
                 # vedla rovnou k netěsnému spojení.
                 conn = None
                 db_nedostupna = False
+                # OPRAVA AUDIT-2026-15 (audit 27. 10. 2026, nález 4): vedle
+                # rodiče se ptáme i na blok SÁM. Viz odůvodnění u `return False`
+                # na konci téhle větve - potřebujeme odlišit čistý replay bloku,
+                # který už máme, od poctivého konkurenta na stejné výšce.
+                # Jde o tentýž dotaz nad týmž indexem a po témž spojení, takže
+                # to nestojí ani další otevření DB.
+                uz_mame = False
                 try:
                     conn = sqlite3.connect(BLOCKCHAIN_DB, timeout=1.0)
                     conn.execute("PRAGMA journal_mode=WAL;")
                     c = conn.cursor()
                     c.execute("SELECT 1 FROM blocks WHERE block_hash = ?", (new_block.previous_hash,))
                     exists = c.fetchone() is not None
+                    c.execute("SELECT 1 FROM blocks WHERE block_hash = ?", (new_block.hash,))
+                    uz_mame = c.fetchone() is not None
                 except sqlite3.Error as e:
                     # OPRAVA S-4 (Nález 2): OPRAVA L-3 sem doplnila `finally`
                     # kvůli netěsnému spojení, ale `except` ne - a komentář
@@ -13083,7 +13503,41 @@ class P2PNode:
                         requester_addr = self.resolve_peer_addr(addr, src_node_id)
                         if requester_addr and self._muze_zadat_chain_info(addr):
                             self.send_to_peer(requester_addr, {'type': 'request_chain_info'})
-                    
+
+                # OPRAVA AUDIT-2026-16 (audit 28. 10. 2026, nález 1): blok,
+                # který už máme, se NEZAPOČÍTÁVÁ do MAX_UNAUTHENTICATED_MESSAGES.
+                #
+                # OPRAVA AUDIT-2026-15 tady zavedla `return False` s odůvodněním,
+                # že "blok, který už MÁME v databázi, je čistý replay". To ale
+                # platí jen pro útočníka. Pro poctivého souseda je to NORMÁLNÍ
+                # důsledek lavinového šíření z OPRAVY W-2: preposli_sousedum()
+                # rozesílá blok všem kromě přímého odesílatele, takže
+                # v topologii s cyklem dorazí tentýž blok ZARUČENĚ dvakrát -
+                # v trojúhelníku A-B-C ho C dostane od A i od B. Druhý z nich
+                # jsme si přitom sami vyžádali tím, že jsme se k oběma připojili.
+                #
+                # Pět takových duplicit za sebou zavřelo spojení poctivému
+                # uzlu, a protože relay i synchronizační dotazy jedou po témž
+                # PeerConnection, vzalo to s sebou i rozpracovaný sync (viz
+                # podrobné odůvodnění u téže opravy na cestě 'transaction').
+                #
+                # Zdarma opakovatelné to není: 'new_block' patří od OPRAVY N2
+                # mezi drahé dotazy, takže na replay sedí EXPENSIVE_BUCKET
+                # (40 tokenů, obnova 4/s na IP) a zpráva se zahodí dřív, než se
+                # sem dojde.
+                #
+                # Zbytek téhle větve se nezapočítával už dřív a platí to dál:
+                #   - konkurent na stejné výšce, který prohrál tie-break, je
+                #     poctivý blok od poctivého těžaře. Jeho previous_hash míří
+                #     na rodiče našeho vrcholu, takže spadne do téhož `else`,
+                #     ale uzel za něj trestat nesmíme.
+                #   - orphan (neznámý rodič) znamená, že jsme POZADU. Trestat
+                #     peera, který nám posílá platné nové bloky během dohánění,
+                #     by spojení zavřelo přesně v okamžiku, kdy ho potřebujeme.
+                if uz_mame:
+                    self.add_log(f"{Fore.YELLOW}Blok {new_block.hash} už máme (duplicita z přeposílání), zahozen.{Style.RESET_ALL}")
+                    return True
+
         elif msg_type == 'request_mempool':
             # OPRAVA F-04: odpověď je shora omezená počtem i objemem. Dřív se
             # posílal celý mempool, tedy až ~16 700 transakcí v jedné zprávě.
@@ -13615,10 +14069,22 @@ class P2PNode:
 
             self.touch_listen_port(peer_addr[0], peer_addr[1])
 
-            if already_peer:
-                self.add_log(f"{Fore.GREEN}Obnoveno spojení s uzlem {peer_addr} (odeslán handshake).{Style.RESET_ALL}")
-            else:
+            # OPRAVA AUDIT-2026-15 (nález 5), druhá polovina: i ÚSPĚŠNÁ cesta
+            # spamovala, jen do logu místo do menu. Hláška "Obnoveno spojení
+            # s uzlem ... (odeslán handshake)" se psala při každém průchodu, a
+            # ten nastává každých 10 s pro peera, kterému značka handshake_sent
+            # padá dokola - tedy u uzlu, který TCP spojení přijme, ale na
+            # aplikační dotaz neodpoví (_sync_with_peer_inner značku při tichu
+            # zahodí, viz OPRAVA AUDIT-2026-6). Potlačení v add_log() na to
+            # nedosáhne, protože se hlášky v logu střídají s "Synchronizuji
+            # blockchain a mempool..." z téhož kola.
+            #
+            # Přijetí NOVÉHO peera do tabulky je jednorázová událost, takže se
+            # hlásí vždy. Opakovaný handshake známému peerovi je rutina a hlásí
+            # se jen tehdy, když jde o přechod z offline (tj. peer se vrátil).
+            if not already_peer:
                 self.add_log(f"{Fore.GREEN}Úspěšně připojeno k uzlu {peer_addr}{Style.RESET_ALL}")
+            self._oznac_peer_online(peer_addr)
 
             # OPRAVA #1: dřív tohle spálilo 4 spojení naráz (testovací
             # connect výše + tři samostatné send_to_peer), tedy 40 %
@@ -13642,7 +14108,13 @@ class P2PNode:
             # od nás handshake dostal. Periodická synchronizace se podle toho
             # rozhoduje, jestli se má představit, nebo rovnou ptát; značka se
             # zahodí, jakmile peer přestane odpovídat (viz _sync_with_peer_inner).
-            self.handshake_sent[peer_addr] = get_time()
+            #
+            # OPRAVA AUDIT-2026-15 (nález 2): pod peers_lock. Mapu prochází
+            # _uklid_evidence_peeru_locked() pod tímtéž zámkem, takže zápis
+            # z tohohle vlákna mu měnil slovník pod rukama (naměřeno 57x
+            # RuntimeError "dictionary changed size during iteration").
+            with self.peers_lock:
+                self.handshake_sent[peer_addr] = get_time()
 
             # OPRAVA AUDIT-2026-8: zápis se jen označí, na disk ho odnese
             # flush_peers() z periodického kola. Bez téhle podmínky by
@@ -13651,11 +14123,34 @@ class P2PNode:
             if zmena_tabulky:
                 self.mark_peers_dirty()
             return True
-        except ConnectionRefusedError:
-            peer_str = f"[{peer_addr[0]}]:{peer_addr[1]}" if ':' in peer_addr[0] else f"{peer_addr[0]}:{peer_addr[1]}"
-            print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nelze se připojit k uzlu {peer_str}")
         except Exception as e:
-            print(f"{Fore.RED}Chyba při připojování:{Style.RESET_ALL} {e}")
+            # OPRAVA AUDIT-2026-15 (audit 27. 10. 2026, nález 5): dvě původní
+            # větve (ConnectionRefusedError a catch-all) psaly obě přes print(),
+            # tedy do MENU. Tahle metoda ale není jen obsluha volby 16 - volá ji
+            # i _sync_with_peer_inner() pro každého peera bez značky
+            # handshake_sent, tedy každých 10 s. Při selhání se značka
+            # nenastaví, takže příští kolo zkusilo totéž a vypsalo totéž:
+            # nedostupný peer v peers.json zahlcoval menu hláškou
+            # "Chyba při připojování: timed out" donekonečna a uživatel u toho
+            # nemohl pracovat.
+            #
+            # Správné místo je P2P log, a i tam jen PŘECHOD stavu - jednou při
+            # odpojení, jednou při opětovném připojení. Obojí obstará
+            # _oznac_peer_offline() / _oznac_peer_online().
+            #
+            # ConnectionRefusedError je podtřída OSError, takže jedna větev
+            # stačí; na konkrétní text se překládá v _duvod_spojeni().
+            duvod = self._duvod_spojeni(e)
+            if manual:
+                # Uživatel stojí u menu a čeká na odpověď, takže konkrétní důvod
+                # dostane na konzoli - ale JEN on. Volba 16 k tomu vypisuje svou
+                # vlastní hlášku o selhání, tohle je doplnění proč.
+                print(f"{Fore.RED}Chyba:{Style.RESET_ALL} Nelze se připojit k uzlu "
+                      f"{self._peer_str(peer_addr)} - {duvod}.")
+            # Vrací False, pokud o nedostupnosti už víme - pak se nelogovat nic,
+            # a to ani u neočekávané výjimky: ta má typ v `duvod` a v logu je
+            # od prvního výskytu.
+            self._oznac_peer_offline(peer_addr, duvod)
         return False
 
     # OPRAVA T-4 (Nález 2): connect_to_all_peers() odstraněna - mrtvý kód.
@@ -13706,9 +14201,9 @@ class P2PNode:
                 # věřit - útočník si ho nemůže deklarovat sám. Podle něj se
                 # v try_admit_peer() rozhoduje, koho vytlačit.
                 self.note_peer_activity(peer)
-                if hasattr(self, 'offline_peers') and peer in self.offline_peers:
-                    self.offline_peers.remove(peer)
-                    self.add_log(f"{Fore.GREEN}Uzel {peer_str} je online{Style.RESET_ALL}")
+                # OPRAVA AUDIT-2026-15 (nálezy 2 a 5): přes pomocnou metodu,
+                # která evidenci drží pod peers_lock a hlásí jen přechod stavu.
+                self._oznac_peer_online(peer)
                 return
             messages = messages[odeslano:]
 
@@ -13724,10 +14219,8 @@ class P2PNode:
             client_socket.close()
             
             self.note_peer_activity(peer)
-            if hasattr(self, 'offline_peers') and peer in self.offline_peers:
-                self.offline_peers.remove(peer)
-                self.add_log(f"{Fore.GREEN}Uzel {peer_str} je online{Style.RESET_ALL}")
-        except (ConnectionRefusedError, socket.timeout, OSError):
+            self._oznac_peer_online(peer)
+        except (ConnectionRefusedError, socket.timeout, OSError) as e:
             # OPRAVA AUDIT-2026-4 (audit 8. 10. 2026, nález 4): do offline_peers
             # smí jen peer, který JE v tabulce.
             #
@@ -13744,13 +14237,12 @@ class P2PNode:
             # do logu opakovaně. Pro adresu mimo tabulku je to evidence něčeho,
             # co uzel stejně nesleduje. Strop je tím implicitně tentýž jako
             # u self.peers.
-            if not hasattr(self, 'offline_peers'):
-                self.offline_peers = set()
-            with self.peers_lock:
-                v_tabulce = peer in self.peers
-            if v_tabulce and peer not in self.offline_peers:
-                self.offline_peers.add(peer)
-                self.add_log(f"{Fore.RED}Uzel {peer_str} je offline{Style.RESET_ALL}")
+            #
+            # OPRAVA AUDIT-2026-15 (nálezy 2 a 5): test v tabulce, test přechodu
+            # i zápis jsou nově v JEDNÉ kritické sekci uvnitř pomocné metody.
+            # Dřív byl pod peers_lock jen `peer in self.peers` a samotná změna
+            # množiny proběhla až za zámkem.
+            self._oznac_peer_offline(peer, self._duvod_spojeni(e))
         except Exception as e:
             self.add_log(f"{Fore.RED}Neočekávaná chyba u uzlu {peer_str} - {e}{Style.RESET_ALL}")
 
@@ -13805,23 +14297,38 @@ class P2PNode:
         # OPRAVA N2: přes _spawn_send(), tedy pod stropem souběžných vláken.
         self._spawn_send(peer_addr, data)
 
-    def send_data_to_peers(self, data, vynechat_ip=None):
+    def send_data_to_peers(self, data, vynechat_ip=None, vynechat_peer=None):
         # OPRAVA W-2 (audit 9. 10. 2026, nález N-2): vynechat_ip vypustí z
         # rozesílky jednu adresu - toho, od koho data přišla. Posílat blok zpět
         # jeho odesílateli je čistá duplicita: on ho má, jeho add_block() ho
         # odmítne a jen ho to stojí token v rate limiteru.
         #
-        # Vynechává se podle IP, ne podle dvojice (IP, port): u příchozího
-        # spojení známe jen efemérní zdrojový port a resolve_peer_addr() při
-        # dvou uzlech na jedné adrese poctivě přizná "nevím kam" (OPRAVA U-20).
-        # Hrubší klíč tady nevadí - nejhorší následek je, že se druhý uzel na
-        # téže IP dozví blok o jedno kolo syncu později, zatímco přesnější klíč
-        # by znamenal posílat data zpátky tomu, kdo je poslal.
+        # OPRAVA AUDIT-2026-16 (audit 28. 10. 2026, nález 3): přidán PŘESNÝ
+        # klíč vynechat_peer, tedy dvojice (IP, naslouchací port).
+        #
+        # Vynechávalo se výhradně podle IP a komentář to hájil tím, že "nejhorší
+        # následek je, že se druhý uzel na téže IP dozví blok o jedno kolo syncu
+        # později". To ale podhodnocuje cenu: po OPRAVĚ W-2 je přeposílání
+        # HLAVNÍ cesta šíření (periodické kolo bylo právě proto shledáno
+        # nedostatečným) a _uz_preposlano() si položku poznamená, takže druhé
+        # kolo už ji nepřepošle. Dva uzly na jedné adrese - dvě instance na
+        # jednom VPS nebo za jedním NATem, tedy přesně topologie, pro kterou se
+        # dělala OPRAVA U-20 - si tak navzájem nepřeposlaly nikdy nic a byly
+        # odkázané jen na periodický sync.
+        #
+        # Volající (preposli_sousedum) dodá přesný klíč, kdykoli jde odesílatele
+        # jednoznačně určit přes resolve_peer_addr(); když to nejde (víc uzlů na
+        # jedné IP a zpráva bez node_id), padá se zpátky na vynechat_ip, protože
+        # hádat by znamenalo poslat data zpět jejich odesílateli.
         if vynechat_ip:
             vynechat_ip = self.normalize_ip(vynechat_ip)
+        if vynechat_peer:
+            vynechat_peer = (self.normalize_ip(vynechat_peer[0]), vynechat_peer[1])
         with self.peers_lock:
             peers_snapshot = [p for p in self.peers
-                              if vynechat_ip is None or self.normalize_ip(p[0]) != vynechat_ip]
+                              if (vynechat_ip is None or self.normalize_ip(p[0]) != vynechat_ip)
+                              and (vynechat_peer is None
+                                   or (self.normalize_ip(p[0]), p[1]) != vynechat_peer)]
         # OPRAVA N2: i broadcast jde přes _spawn_send(). Právě tahle cesta
         # zesílení násobila - každá přijatá transakce i blok spustily vlákno na
         # každého peera, tedy až MAX_PEERS = 20 vláken naráz.
@@ -13855,7 +14362,7 @@ class P2PNode:
                 self.relay_seen.discard(self.relay_order.popleft())
             return False
 
-    def preposli_sousedum(self, zprava, klic, addr):
+    def preposli_sousedum(self, zprava, klic, addr, src_node_id=None):
         """OPRAVA W-2 (audit 9. 10. 2026, nález N-2): lavinové šíření (gossip relay).
 
         Uzel dosud přeposílal VÝHRADNĚ to, co sám vyrobil: mine() svůj blok
@@ -13870,10 +14377,28 @@ class P2PNode:
         Posílá se všem peerům kromě odesílatele, a jen jednou (viz
         _uz_preposlano). Volá se AŽ PO úspěšném přijetí do řetězce / mempoolu,
         takže se nikdy nešíří nic, co jsme sami nepřijali za platné.
+
+        OPRAVA AUDIT-2026-16 (audit 28. 10. 2026, nález 3): odesílatel se
+        vynechává PŘESNĚ, tedy podle dvojice (IP, naslouchací port), kdykoli ho
+        resolve_peer_addr() umí jednoznačně určit - což u zprávy s node_id platí
+        i tehdy, když je na té IP uzlů víc. Teprve když ho určit nelze, padá se
+        na vynechání celé IP. Zdůvodnění je u send_data_to_peers().
         """
         if self._uz_preposlano(klic):
             return False
-        self.send_data_to_peers(zprava, vynechat_ip=addr[0] if addr else None)
+        # Stamp vlastní identity: příjemce z něj dohledá, od KOHO zpráva je,
+        # i když dorazila jednorázovým socketem bez handshaku. Viz odůvodnění
+        # u fallbacku v _handle_message_inner(). Nepřepisuje se, pokud už
+        # zpráva node_id nese (handshake si ho plní sám).
+        if isinstance(zprava, dict):
+            vlastni_id = getattr(self, 'node_id', None)
+            if isinstance(vlastni_id, str) and 0 < len(vlastni_id) <= MAX_NODE_ID_LEN:
+                zprava.setdefault('node_id', vlastni_id)
+        odesilatel = self.resolve_peer_addr(addr, src_node_id) if addr else None
+        if odesilatel is not None:
+            self.send_data_to_peers(zprava, vynechat_peer=odesilatel)
+        else:
+            self.send_data_to_peers(zprava, vynechat_ip=addr[0] if addr else None)
         return True
 
     def ohlas_noveho_peera(self, novy_peer):
